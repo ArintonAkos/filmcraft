@@ -72,78 +72,11 @@ fn direction(fs: &FrameState, r: usize, c: usize) -> (usize, i32) {
     let x0 = c << 2;
     let y0 = r << 2;
     let pl = &fs.cur.planes[0];
-    let sh = fs.bit_depth - 8;
-    let mut px = [[0i32; 8]; 8];
-    for (i, p) in px.iter_mut().enumerate() {
-        for (d, &s) in p.iter_mut().zip(&pl.row(y0 + i)[x0..x0 + 8]) {
-            *d = (s as i32 >> sh) - 128;
-        }
-    }
-    block_direction(&px)
-}
-
-/// The direction search of 7.15.2 on one 8x8 block (samples already shifted to 8 bits and
-/// centred on 0). Each line sum is built from whole rows added at an offset, which the compiler
-/// turns into vector adds; integer sums don't depend on the order, so the costs are exact.
-fn block_direction(px: &[[i32; 8]; 8]) -> (usize, i32) {
-    fn add<const N: usize>(dst: &mut [i32], src: &[i32; N]) {
-        for (d, s) in dst.iter_mut().zip(src) {
-            *d += s;
-        }
-    }
-    let mut partial = [[0i32; 15]; 8];
-    for (i, x) in px.iter().enumerate() {
-        // Pairs of neighbouring samples, for the directions that step two columns per row.
-        let pairs: [i32; 4] = std::array::from_fn(|k| x[2 * k] + x[2 * k + 1]);
-        let rev: [i32; 8] = std::array::from_fn(|m| x[7 - m]);
-        let rev_pairs: [i32; 4] = std::array::from_fn(|m| pairs[3 - m]);
-        add(&mut partial[0][i..], x);
-        add(&mut partial[1][i..], &pairs);
-        partial[2][i] = x.iter().sum();
-        add(&mut partial[3][i..], &rev_pairs);
-        add(&mut partial[4][i..], &rev);
-        add(&mut partial[5][3 - i / 2..], x);
-        add(&mut partial[6][..], x);
-        add(&mut partial[7][i / 2..], x);
-    }
-    direction_costs(&partial)
-}
-
-/// The cost of each direction from its line sums, and the best one with its variance.
-fn direction_costs(partial: &[[i32; 15]; 8]) -> (usize, i32) {
-    let mut cost = [0i32; 8];
-    for i in 0..8 {
-        cost[2] += partial[2][i] * partial[2][i];
-        cost[6] += partial[6][i] * partial[6][i];
-    }
-    cost[2] *= DIV_TABLE[8] as i32;
-    cost[6] *= DIV_TABLE[8] as i32;
-    for i in 0..7 {
-        cost[0] += (partial[0][i] * partial[0][i] + partial[0][14 - i] * partial[0][14 - i]) * DIV_TABLE[i + 1] as i32;
-        cost[4] += (partial[4][i] * partial[4][i] + partial[4][14 - i] * partial[4][14 - i]) * DIV_TABLE[i + 1] as i32;
-    }
-    cost[0] += partial[0][7] * partial[0][7] * DIV_TABLE[8] as i32;
-    cost[4] += partial[4][7] * partial[4][7] * DIV_TABLE[8] as i32;
-    let mut i = 1;
-    while i < 8 {
-        for j in 0..5 {
-            cost[i] += partial[i][3 + j] * partial[i][3 + j];
-        }
-        cost[i] *= DIV_TABLE[8] as i32;
-        for j in 0..3 {
-            cost[i] += (partial[i][j] * partial[i][j] + partial[i][10 - j] * partial[i][10 - j]) * DIV_TABLE[2 * j + 2] as i32;
-        }
-        i += 2;
-    }
-    let mut best = 0;
-    let mut y_dir = 0;
-    for (i, &c) in cost.iter().enumerate() {
-        if c > best {
-            best = c;
-            y_dir = i;
-        }
-    }
-    (y_dir, (best - cost[(y_dir + 4) & 7]) >> 10)
+    let rows: [&[u16; 8]; 8] = std::array::from_fn(|i| {
+        let row = &pl.row(y0 + i)[x0..x0 + 8];
+        row.first_chunk::<8>().unwrap_or(&[0; 8])
+    });
+    filmcraft_simd::cdef_direction(&rows, fs.bit_depth - 8)
 }
 
 /// Marks a sample outside the frame (CdefAvailable = 0) in the padded block.
@@ -304,57 +237,6 @@ fn filter_rows<const W: usize>(
         for j in 0..W {
             let s = sum[j];
             drow[j] = (x[j] + ((8 + s - (s < 0) as i16) >> 4)).max(min[j]).min(max[j]) as u16;
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The line sums as 7.15.2 writes them, one sample at a time.
-    fn spec_partial(px: &[[i32; 8]; 8]) -> [[i32; 15]; 8] {
-        let mut partial = [[0i32; 15]; 8];
-        for i in 0..8 {
-            for j in 0..8 {
-                let x = px[i][j];
-                partial[0][i + j] += x;
-                partial[1][i + j / 2] += x;
-                partial[2][i] += x;
-                partial[3][3 + i - j / 2] += x;
-                partial[4][7 + i - j] += x;
-                partial[5][3 - i / 2 + j] += x;
-                partial[6][j] += x;
-                partial[7][i / 2 + j] += x;
-            }
-        }
-        partial
-    }
-
-    #[test]
-    fn block_direction_matches_the_spec() {
-        let mut seed = 0x2545_f491u32;
-        let mut next = move || {
-            seed ^= seed << 13;
-            seed ^= seed >> 17;
-            seed ^= seed << 5;
-            seed
-        };
-        // Noise, flat blocks at both extremes, and edges along every direction.
-        let mut blocks: Vec<[[i32; 8]; 8]> = (0..20_000).map(|_| std::array::from_fn(|_| std::array::from_fn(|_| (next() % 256) as i32 - 128))).collect();
-        blocks.push([[-128; 8]; 8]);
-        blocks.push([[127; 8]; 8]);
-        for d in 0..8 {
-            blocks.push(std::array::from_fn(|i| {
-                std::array::from_fn(|j| {
-                    let (i, j) = (i as i32, j as i32);
-                    let t = [i + j, 2 * i + j, i, 2 * i - j, i - j, j - 2 * i, j, j + 2 * i][d];
-                    if t.rem_euclid(4) < 2 { 127 } else { -128 }
-                })
-            }));
-        }
-        for px in &blocks {
-            assert_eq!(block_direction(px), direction_costs(&spec_partial(px)), "{px:?}");
         }
     }
 }

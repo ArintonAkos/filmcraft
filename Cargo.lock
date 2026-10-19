@@ -1776,6 +1776,7 @@ name = "filmcraft-av1"
 version = "0.12.0"
 dependencies = [
  "filmcraft-bitstream",
+ "filmcraft-simd",
  "filmcraft-testkit",
  "rayon",
  "rustix 1.1.5",
@@ -2266,6 +2267,10 @@ dependencies = [
  "serde",
  "serde_json",
 ]
+
+[[package]]
+name = "filmcraft-simd"
+version = "0.12.0"
 
 [[package]]
 name = "filmcraft-speech"
