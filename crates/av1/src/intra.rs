@@ -29,6 +29,22 @@ pub(crate) struct IntraParams {
 }
 
 const EDGE: usize = 32; // offset of index 0 in the edge buffers (they start at index -2 .. -1)
+const EDGE_LEN: usize = 2 * 128 + 2 * EDGE;
+
+/// Edge and prediction buffers kept from block to block: clearing fresh ones (11 KB) cost more
+/// than predicting a small block. A block clears only the part of the edges it can read.
+pub(crate) struct IntraScratch {
+    above: [i32; EDGE_LEN],
+    left: [i32; EDGE_LEN],
+    edge: [i32; EDGE_LEN],
+    pred: [u16; 64 * 64],
+}
+
+impl IntraScratch {
+    pub(crate) fn new() -> Box<IntraScratch> {
+        Box::new(IntraScratch { above: [0; EDGE_LEN], left: [0; EDGE_LEN], edge: [0; EDGE_LEN], pred: [0; 64 * 64] })
+    }
+}
 
 #[inline(always)]
 fn clip1(v: i32, bd: u32) -> u16 {
@@ -40,14 +56,16 @@ pub(crate) fn is_directional_mode(mode: usize) -> bool {
 }
 
 /// Predict the w x h block at (x, y) of `pl` (writes into the plane).
-pub(crate) fn predict_intra(pl: &mut Plane, p: &IntraParams) {
+pub(crate) fn predict_intra(pl: &mut Plane, p: &IntraParams, scratch: &mut IntraScratch) {
     let w = 1usize << p.log2w;
     let h = 1usize << p.log2h;
     let bd = p.bit_depth;
     let (x, y) = (p.x, p.y);
-    // edge arrays with room for index -2 .. 2*(w+h)
-    let mut above = [0i32; 2 * 128 + 2 * EDGE];
-    let mut left = [0i32; 2 * 128 + 2 * EDGE];
+    // Edges are read at index -2 .. 2*(w+h) (upsampled); zero the samples no process writes.
+    let IntraScratch { above, left, edge, pred } = scratch;
+    let used = (EDGE + 2 * (w + h) + 2).min(EDGE_LEN);
+    above[EDGE - 2..used].fill(0);
+    left[EDGE - 2..used].fill(0);
     let n = w + h;
     if !p.have_above && p.have_left {
         let v = pl.at(x - 1, y) as i32;
@@ -86,15 +104,15 @@ pub(crate) fn predict_intra(pl: &mut Plane, p: &IntraParams) {
     above[EDGE - 1] = corner;
     left[EDGE - 1] = corner;
 
-    let mut pred = [0u16; 64 * 64];
+    // Every mode writes all w x h predicted samples before they are read.
     if p.plane == 0 && p.use_filter_intra {
-        recursive_intra(&above, &left, w, h, p.filter_intra_mode, bd, &mut pred);
+        recursive_intra(above, left, w, h, p.filter_intra_mode, bd, pred);
     } else if is_directional_mode(p.mode) {
-        directional(&mut above, &mut left, p, w, h, &mut pred);
+        directional(above, left, edge, p, w, h, pred);
     } else if p.mode == SMOOTH_PRED || p.mode == SMOOTH_V_PRED || p.mode == SMOOTH_H_PRED {
-        smooth(&above, &left, p.mode, p.log2w, p.log2h, w, h, &mut pred);
+        smooth(above, left, p.mode, p.log2w, p.log2h, w, h, pred);
     } else if p.mode == DC_PRED {
-        dc(&above, &left, p.have_left, p.have_above, p.log2w, p.log2h, w, h, bd, &mut pred);
+        dc(above, left, p.have_left, p.have_above, p.log2w, p.log2h, w, h, bd, pred);
     } else {
         // PAETH_PRED
         let tl = above[EDGE - 1];
@@ -282,11 +300,11 @@ fn use_upsample(w: usize, h: usize, filter_type: bool, delta: i32) -> bool {
 }
 
 /// Intra edge filter (7.11.2.12) on buf[-1 .. sz-2] (edge[i] = buf[i - 1]).
-fn edge_filter(buf: &mut [i32], sz: usize, strength: u32) {
+fn edge_filter(buf: &mut [i32], edge: &mut [i32; EDGE_LEN], sz: usize, strength: u32) {
     if strength == 0 {
         return;
     }
-    let mut edge = [0i32; 2 * 128 + 2 * EDGE];
+    // Only edge[..sz] is read.
     for i in 0..sz {
         edge[i] = buf[EDGE + i - 1];
     }
@@ -317,7 +335,7 @@ fn edge_upsample(buf: &mut [i32], num_px: usize, bd: u32) {
     }
 }
 
-fn directional(above: &mut [i32], left: &mut [i32], p: &IntraParams, w: usize, h: usize, pred: &mut [u16]) {
+fn directional(above: &mut [i32], left: &mut [i32], edge: &mut [i32; EDGE_LEN], p: &IntraParams, w: usize, h: usize, pred: &mut [u16]) {
     let p_angle = MODE_TO_ANGLE[p.mode] as i32 + p.angle_delta * ANGLE_STEP as i32;
     let mut upsample_above = 0u32;
     let mut upsample_left = 0u32;
@@ -332,12 +350,12 @@ fn directional(above: &mut [i32], left: &mut [i32], p: &IntraParams, w: usize, h
             if p.have_above {
                 let strength = edge_filter_strength(w, h, p.filter_type, p_angle - 90);
                 let num_px = w.min((p.max_x - p.x as i32 + 1) as usize) + if p_angle < 90 { h } else { 0 } + 1;
-                edge_filter(above, num_px, strength);
+                edge_filter(above, edge, num_px, strength);
             }
             if p.have_left {
                 let strength = edge_filter_strength(w, h, p.filter_type, p_angle - 180);
                 let num_px = h.min((p.max_y - p.y as i32 + 1) as usize) + if p_angle > 180 { w } else { 0 } + 1;
-                edge_filter(left, num_px, strength);
+                edge_filter(left, edge, num_px, strength);
             }
         }
         if use_upsample(w, h, p.filter_type, p_angle - 90) {

@@ -5,7 +5,7 @@ use crate::Result;
 use crate::cdf::Cdfs;
 use crate::frame::{MiInfo, Mv};
 use crate::header::{FrameHeader, NONE, SequenceHeader};
-use crate::intra::{IntraParams, is_directional_mode, predict_intra, round2_signed};
+use crate::intra::{IntraParams, IntraScratch, is_directional_mode, predict_intra, round2_signed};
 use crate::spec_tables::*;
 use crate::state::{FrameShared, TileState};
 use crate::symbol::SymbolDecoder;
@@ -98,6 +98,7 @@ pub(crate) struct TileDecoder<'a, 'f> {
     pub mask: Vec<i32>,
     /// Intermediate rows of the sub-pixel filters (up to 2 x 128 + 8 rows of 128 with 2:1 scaled references).
     pub mc_tmp: Vec<i32>,
+    intra: Box<IntraScratch>,
     /// Coefficient levels of the current transform block, padded (see TX_PAD).
     levels: Vec<u8>,
 }
@@ -145,6 +146,7 @@ impl<'a, 'f> TileDecoder<'a, 'f> {
             pred_buf: [vec![0; 128 * 128], vec![0; 128 * 128]],
             mask: vec![0; 128 * 128],
             mc_tmp: vec![0; (2 * 128 + 8) * 128],
+            intra: IntraScratch::new(),
             levels: vec![0; (32 + TX_PAD) * (32 + TX_PAD)],
         }
     }
@@ -1191,7 +1193,7 @@ impl<'a, 'f> TileDecoder<'a, 'f> {
                     enable_intra_edge_filter: self.fs.seq.enable_intra_edge_filter,
                     filter_type: if is_directional_mode(mode) && self.fs.seq.enable_intra_edge_filter { self.get_filter_type(plane) } else { false },
                 };
-                predict_intra(&mut self.t.cur.planes[plane], &params);
+                predict_intra(&mut self.t.cur.planes[plane], &params, &mut self.intra);
             }
             let mut pred_w = block_width(self.b.mi_size) >> sub_x;
             let mut pred_h = block_height(self.b.mi_size) >> sub_y;
@@ -1378,7 +1380,7 @@ impl<'a, 'f> TileDecoder<'a, 'f> {
                     enable_intra_edge_filter: self.fs.seq.enable_intra_edge_filter,
                     filter_type,
                 };
-                predict_intra(&mut self.t.cur.planes[plane], &params);
+                predict_intra(&mut self.t.cur.planes[plane], &params, &mut self.intra);
                 if is_cfl {
                     self.predict_cfl(plane, start_x, start_y, tx_sz);
                 }
