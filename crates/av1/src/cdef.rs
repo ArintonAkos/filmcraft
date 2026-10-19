@@ -69,26 +69,49 @@ fn cdef_block(fs: &FrameState, out: &mut [RowBand; 3], r: usize, c: usize, idx: 
 }
 
 fn direction(fs: &FrameState, r: usize, c: usize) -> (usize, i32) {
-    let mut cost = [0i32; 8];
-    let mut partial = [[0i32; 15]; 8];
     let x0 = c << 2;
     let y0 = r << 2;
     let pl = &fs.cur.planes[0];
     let sh = fs.bit_depth - 8;
-    for i in 0..8 {
-        let row = pl.row(y0 + i);
-        for j in 0..8 {
-            let x = (row[x0 + j] as i32 >> sh) - 128;
-            partial[0][i + j] += x;
-            partial[1][i + j / 2] += x;
-            partial[2][i] += x;
-            partial[3][3 + i - j / 2] += x;
-            partial[4][7 + i - j] += x;
-            partial[5][3 - i / 2 + j] += x;
-            partial[6][j] += x;
-            partial[7][i / 2 + j] += x;
+    let mut px = [[0i32; 8]; 8];
+    for (i, p) in px.iter_mut().enumerate() {
+        for (d, &s) in p.iter_mut().zip(&pl.row(y0 + i)[x0..x0 + 8]) {
+            *d = (s as i32 >> sh) - 128;
         }
     }
+    block_direction(&px)
+}
+
+/// The direction search of 7.15.2 on one 8x8 block (samples already shifted to 8 bits and
+/// centred on 0). Each line sum is built from whole rows added at an offset, which the compiler
+/// turns into vector adds; integer sums don't depend on the order, so the costs are exact.
+fn block_direction(px: &[[i32; 8]; 8]) -> (usize, i32) {
+    fn add<const N: usize>(dst: &mut [i32], src: &[i32; N]) {
+        for (d, s) in dst.iter_mut().zip(src) {
+            *d += s;
+        }
+    }
+    let mut partial = [[0i32; 15]; 8];
+    for (i, x) in px.iter().enumerate() {
+        // Pairs of neighbouring samples, for the directions that step two columns per row.
+        let pairs: [i32; 4] = std::array::from_fn(|k| x[2 * k] + x[2 * k + 1]);
+        let rev: [i32; 8] = std::array::from_fn(|m| x[7 - m]);
+        let rev_pairs: [i32; 4] = std::array::from_fn(|m| pairs[3 - m]);
+        add(&mut partial[0][i..], x);
+        add(&mut partial[1][i..], &pairs);
+        partial[2][i] = x.iter().sum();
+        add(&mut partial[3][i..], &rev_pairs);
+        add(&mut partial[4][i..], &rev);
+        add(&mut partial[5][3 - i / 2..], x);
+        add(&mut partial[6][..], x);
+        add(&mut partial[7][i / 2..], x);
+    }
+    direction_costs(&partial)
+}
+
+/// The cost of each direction from its line sums, and the best one with its variance.
+fn direction_costs(partial: &[[i32; 15]; 8]) -> (usize, i32) {
+    let mut cost = [0i32; 8];
     for i in 0..8 {
         cost[2] += partial[2][i] * partial[2][i];
         cost[6] += partial[6][i] * partial[6][i];
@@ -148,27 +171,6 @@ fn filter(fs: &FrameState, out: &mut [RowBand; 3], plane: usize, r: usize, c: us
     let h = 8 >> sub_y;
     let src = &fs.cur.planes[plane];
     let (mi_rows, mi_cols) = (fs.fh.mi_rows as isize, fs.fh.mi_cols as isize);
-    // CdefAvailable per sample: its 4x4 block is inside the frame.
-    let mut buf = [CDEF_NA; PAD_STRIDE * PAD_STRIDE];
-    let mut all_avail = true;
-    for i in 0..h + 4 {
-        let y = (y0 + i) as isize - 2;
-        let cand_r = (y << sub_y) >> 2;
-        if y < 0 || cand_r >= mi_rows {
-            all_avail = false;
-            continue;
-        }
-        let row = src.row(y as usize);
-        for j in 0..w + 4 {
-            let x = (x0 + j) as isize - 2;
-            let cand_c = (x << sub_x) >> 2;
-            if x >= 0 && cand_c < mi_cols {
-                buf[i * PAD_STRIDE + j] = row[x as usize] as i32;
-            } else {
-                all_avail = false;
-            }
-        }
-    }
     let pri_tap = ((pri >> coeff_shift) & 1) as usize;
     let off = |d: usize, k: usize| CDEF_DIRECTIONS[d][k][0] as isize * PAD_STRIDE as isize + CDEF_DIRECTIONS[d][k][1] as isize;
     let pri_off = [off(dir, 0), off(dir, 1)];
@@ -180,8 +182,22 @@ fn filter(fs: &FrameState, out: &mut [RowBand; 3], plane: usize, r: usize, c: us
     let adj = |t: i32| if t == 0 { 0 } else { (damping - (31 - (t as u32).leading_zeros()) as i32).max(0) as u32 };
     let (pri_adj, sec_adj) = (adj(pri), adj(sec));
     let dst = &mut out[plane];
-    if all_avail {
+    // CdefAvailable per sample: its 4x4 block is inside the frame. The padded block lies inside
+    // when its first and last rows and columns do.
+    let inside = |v: isize, sub: usize, mi: isize| v >= 0 && (v << sub) >> 2 < mi;
+    let (top, left) = (y0 as isize - 2, x0 as isize - 2);
+    if inside(top, sub_y, mi_rows)
+        && inside(top + h as isize + 3, sub_y, mi_rows)
+        && inside(left, sub_x, mi_cols)
+        && inside(left + w as isize + 3, sub_x, mi_cols)
+    {
         // Every tap is available: whole rows at a time (constrain() with threshold 0 is 0).
+        let mut buf = [0i16; PAD_STRIDE * PAD_STRIDE];
+        for (i, d) in buf.as_chunks_mut::<PAD_STRIDE>().0.iter_mut().take(h + 4).enumerate() {
+            for (d, &s) in d.iter_mut().zip(&src.row(y0 + i - 2)[x0 - 2..x0 + w + 2]) {
+                *d = s as i16;
+            }
+        }
         let mut taps = [(0isize, 0i32, 0i32, 0u32); 12];
         let mut n = 0;
         for k in 0..2 {
@@ -198,6 +214,20 @@ fn filter(fs: &FrameState, out: &mut [RowBand; 3], plane: usize, r: usize, c: us
             _ => filter_rows::<4>(&buf, &taps, dst, rows),
         }
         return;
+    }
+    let mut buf = [CDEF_NA; PAD_STRIDE * PAD_STRIDE];
+    for i in 0..h + 4 {
+        let y = top + i as isize;
+        if !inside(y, sub_y, mi_rows) {
+            continue;
+        }
+        let row = src.row(y as usize);
+        for j in 0..w + 4 {
+            let x = left + j as isize;
+            if inside(x, sub_x, mi_cols) {
+                buf[i * PAD_STRIDE + j] = row[x as usize] as i32;
+            }
+        }
     }
     for i in 0..h {
         // The centre sample is read even where CdefAvailable is 0 (8x8 blocks straddling an odd
@@ -241,15 +271,11 @@ fn filter(fs: &FrameState, out: &mut [RowBand; 3], plane: usize, r: usize, c: us
 /// bits), differences and the weighted tap sum all fit in i16, which doubles the SIMD width.
 #[inline(always)]
 fn filter_rows<const W: usize>(
-    buf: &[i32; PAD_STRIDE * PAD_STRIDE],
+    b16: &[i16; PAD_STRIDE * PAD_STRIDE],
     taps: &[(isize, i32, i32, u32); 12],
     dst: &mut RowBand,
     (y0, x0, h): (usize, usize, usize),
 ) {
-    let mut b16 = [0i16; PAD_STRIDE * PAD_STRIDE];
-    for (d, &s) in b16.iter_mut().zip(buf.iter()) {
-        *d = s as i16;
-    }
     for i in 0..h {
         let ci = ((i + 2) * PAD_STRIDE + 2) as isize;
         let Some(&x) = b16.get(ci as usize..).and_then(|r| r.first_chunk::<W>()) else {
@@ -278,6 +304,57 @@ fn filter_rows<const W: usize>(
         for j in 0..W {
             let s = sum[j];
             drow[j] = (x[j] + ((8 + s - (s < 0) as i16) >> 4)).max(min[j]).min(max[j]) as u16;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The line sums as 7.15.2 writes them, one sample at a time.
+    fn spec_partial(px: &[[i32; 8]; 8]) -> [[i32; 15]; 8] {
+        let mut partial = [[0i32; 15]; 8];
+        for i in 0..8 {
+            for j in 0..8 {
+                let x = px[i][j];
+                partial[0][i + j] += x;
+                partial[1][i + j / 2] += x;
+                partial[2][i] += x;
+                partial[3][3 + i - j / 2] += x;
+                partial[4][7 + i - j] += x;
+                partial[5][3 - i / 2 + j] += x;
+                partial[6][j] += x;
+                partial[7][i / 2 + j] += x;
+            }
+        }
+        partial
+    }
+
+    #[test]
+    fn block_direction_matches_the_spec() {
+        let mut seed = 0x2545_f491u32;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        // Noise, flat blocks at both extremes, and edges along every direction.
+        let mut blocks: Vec<[[i32; 8]; 8]> = (0..20_000).map(|_| std::array::from_fn(|_| std::array::from_fn(|_| (next() % 256) as i32 - 128))).collect();
+        blocks.push([[-128; 8]; 8]);
+        blocks.push([[127; 8]; 8]);
+        for d in 0..8 {
+            blocks.push(std::array::from_fn(|i| {
+                std::array::from_fn(|j| {
+                    let (i, j) = (i as i32, j as i32);
+                    let t = [i + j, 2 * i + j, i, 2 * i - j, i - j, j - 2 * i, j, j + 2 * i][d];
+                    if t.rem_euclid(4) < 2 { 127 } else { -128 }
+                })
+            }));
+        }
+        for px in &blocks {
+            assert_eq!(block_direction(px), direction_costs(&spec_partial(px)), "{px:?}");
         }
     }
 }
