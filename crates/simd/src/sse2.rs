@@ -80,3 +80,130 @@ fn cdef_direction_sse2(rows: &[&[u16; 8]; 8], shift: u32) -> (usize, i32) {
     });
     cdef_pick(&cost)
 }
+
+// ---------------------------------------------------------------------------------------------
+// Loop filter
+
+/// 8 lanes of i16; the deblocking kernels use the first four.
+type V = __m128i;
+
+/// 4 lines across a horizontal edge (see [`crate::deblock_horizontal`]); `false` when the
+/// samples aren't all in `d`.
+pub(crate) fn deblock_horizontal(d: &mut [u16], base: usize, stride: usize, size: LfSize, t: &LfThresh) -> bool {
+    // SAFETY: SSE2 is part of the x86_64 baseline: every core this build runs on has it.
+    unsafe { horizontal(d, base, stride, size, t) }
+}
+
+/// 4 lines across a vertical edge (see [`crate::deblock_vertical`]); `false` when the samples
+/// aren't all in `d`.
+pub(crate) fn deblock_vertical(d: &mut [u16], base: usize, stride: usize, size: LfSize, t: &LfThresh) -> bool {
+    // SAFETY: SSE2 is part of the x86_64 baseline: every core this build runs on has it.
+    unsafe { vertical(d, base, stride, size, t) }
+}
+
+crate::deblock::deblock_kernels!("sse2");
+
+#[target_feature(enable = "sse2")]
+fn splat(v: i32) -> V {
+    _mm_set1_epi16(v as i16)
+}
+#[target_feature(enable = "sse2")]
+fn add(a: V, b: V) -> V {
+    _mm_add_epi16(a, b)
+}
+#[target_feature(enable = "sse2")]
+fn sub(a: V, b: V) -> V {
+    _mm_sub_epi16(a, b)
+}
+/// |a - b| of non-negative lanes: one of the saturating unsigned differences is zero.
+#[target_feature(enable = "sse2")]
+fn abd(a: V, b: V) -> V {
+    _mm_or_si128(_mm_subs_epu16(a, b), _mm_subs_epu16(b, a))
+}
+#[target_feature(enable = "sse2")]
+fn gt(a: V, b: V) -> V {
+    _mm_cmpgt_epi16(a, b)
+}
+#[target_feature(enable = "sse2")]
+fn and(a: V, b: V) -> V {
+    _mm_and_si128(a, b)
+}
+#[target_feature(enable = "sse2")]
+fn or(a: V, b: V) -> V {
+    _mm_or_si128(a, b)
+}
+#[target_feature(enable = "sse2")]
+fn andnot(a: V, b: V) -> V {
+    _mm_andnot_si128(a, b)
+}
+#[target_feature(enable = "sse2")]
+fn sel(m: V, a: V, b: V) -> V {
+    _mm_or_si128(_mm_and_si128(m, a), _mm_andnot_si128(m, b))
+}
+#[target_feature(enable = "sse2")]
+fn min(a: V, b: V) -> V {
+    _mm_min_epi16(a, b)
+}
+#[target_feature(enable = "sse2")]
+fn max(a: V, b: V) -> V {
+    _mm_max_epi16(a, b)
+}
+#[target_feature(enable = "sse2")]
+fn sra<const N: i32>(a: V) -> V {
+    _mm_srai_epi16::<N>(a)
+}
+#[target_feature(enable = "sse2")]
+fn srl<const N: i32>(a: V) -> V {
+    _mm_srli_epi16::<N>(a)
+}
+#[target_feature(enable = "sse2")]
+fn any(m: V) -> bool {
+    _mm_movemask_epi8(m) != 0
+}
+#[target_feature(enable = "sse2")]
+fn lanes4() -> V {
+    _mm_set_epi64x(0, -1)
+}
+#[target_feature(enable = "sse2")]
+fn load4(s: &[u16; 4]) -> V {
+    // SAFETY: `s` is 4 u16, the 8 bytes `_mm_loadl_epi64` reads (unaligned load).
+    unsafe { _mm_loadl_epi64(s.as_ptr().cast()) }
+}
+#[target_feature(enable = "sse2")]
+fn store4(v: V, s: &mut [u16; 4]) {
+    // SAFETY: `s` is 4 u16, the 8 bytes `_mm_storel_epi64` writes (unaligned store).
+    unsafe { _mm_storel_epi64(s.as_mut_ptr().cast(), v) }
+}
+#[target_feature(enable = "sse2")]
+fn load8(s: &[u16; 8]) -> V {
+    // SAFETY: `s` is 8 u16, the 16 bytes `_mm_loadu_si128` reads (unaligned load).
+    unsafe { _mm_loadu_si128(s.as_ptr().cast()) }
+}
+#[target_feature(enable = "sse2")]
+fn store8(v: V, s: &mut [u16; 8]) {
+    // SAFETY: `s` is 8 u16, the 16 bytes `_mm_storeu_si128` writes (unaligned store).
+    unsafe { _mm_storeu_si128(s.as_mut_ptr().cast(), v) }
+}
+/// 4 rows of 8 to 8 columns (in the first four lanes; the others hold the next column).
+#[target_feature(enable = "sse2")]
+fn transpose([r0, r1, r2, r3]: [V; 4]) -> [V; 8] {
+    let (a, b) = (_mm_unpacklo_epi16(r0, r1), _mm_unpackhi_epi16(r0, r1));
+    let (c, d) = (_mm_unpacklo_epi16(r2, r3), _mm_unpackhi_epi16(r2, r3));
+    // c01: columns 0 and 1, c23, c45, c67.
+    let (c01, c23) = (_mm_unpacklo_epi32(a, c), _mm_unpackhi_epi32(a, c));
+    let (c45, c67) = (_mm_unpacklo_epi32(b, d), _mm_unpackhi_epi32(b, d));
+    let up = |c: V| _mm_unpackhi_epi64(c, c);
+    [c01, up(c01), c23, up(c23), c45, up(c45), c67, up(c67)]
+}
+/// 8 columns (in the first four lanes) back to 4 rows of 8.
+#[target_feature(enable = "sse2")]
+fn untranspose(c: [V; 8]) -> [V; 4] {
+    let rows = |a: V, b: V| {
+        // a: columns k, k + 1 of rows 0..4; b: columns k + 2, k + 3.
+        let (x, y) = (_mm_unpacklo_epi16(a, b), _mm_unpackhi_epi16(a, b));
+        (_mm_unpacklo_epi16(x, y), _mm_unpackhi_epi16(x, y))
+    };
+    let (r01l, r23l) = rows(_mm_unpacklo_epi64(c[0], c[1]), _mm_unpacklo_epi64(c[2], c[3]));
+    let (r01h, r23h) = rows(_mm_unpacklo_epi64(c[4], c[5]), _mm_unpacklo_epi64(c[6], c[7]));
+    [_mm_unpacklo_epi64(r01l, r01h), _mm_unpackhi_epi64(r01l, r01h), _mm_unpacklo_epi64(r23l, r23h), _mm_unpackhi_epi64(r23l, r23h)]
+}

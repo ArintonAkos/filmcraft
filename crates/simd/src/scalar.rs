@@ -1,6 +1,7 @@
 //! The scalar kernels: the reference every vector version must match, and the code wasm and
 //! other targets run.
 
+use crate::deblock::{LfSize, LfThresh};
 use crate::{CDEF_COST_WEIGHTS, cdef_pick};
 
 /// Each line sum takes whole rows added at an offset; integer sums don't depend on the order.
@@ -27,4 +28,93 @@ pub(crate) fn cdef_direction(rows: &[&[u16; 8]; 8], shift: u32) -> (usize, i32) 
         add(&mut partial[7][i / 2..], &x);
     }
     cdef_pick(&std::array::from_fn(|d| partial[d].iter().zip(&CDEF_COST_WEIGHTS[d]).map(|(&p, &w)| p * p * w).sum()))
+}
+
+/// Sample filtering process (7.14.6) for one line across a loop filter edge: `base` indexes q0
+/// and `step` is the distance between samples across the edge.
+#[inline(always)]
+pub(crate) fn deblock_line(d: &mut [u16], base: usize, step: usize, size: LfSize, t: &LfThresh) {
+    let at = |d: &[u16], k: isize| -> i32 { d[(base as isize + k * step as isize) as usize] as i32 };
+    let (q0, q1, p0, p1) = (at(d, 0), at(d, 1), at(d, -1), at(d, -2));
+    let lim = t.limit;
+    // filter mask (7.14.6.2)
+    if (p1 - p0).abs() > lim || (q1 - q0).abs() > lim || (p0 - q0).abs() * 2 + (p1 - q1).abs() / 2 > t.blimit {
+        return;
+    }
+    let hev = (p1 - p0).abs() > t.thresh || (q1 - q0).abs() > t.thresh;
+    let mut flat = false;
+    if size != LfSize::Four {
+        let (q2, p2) = (at(d, 2), at(d, -3));
+        if (p2 - p1).abs() > lim || (q2 - q1).abs() > lim {
+            return;
+        }
+        let tf = t.flat;
+        flat = (p1 - p0).abs() <= tf && (q1 - q0).abs() <= tf && (p2 - p0).abs() <= tf && (q2 - q0).abs() <= tf;
+        if size != LfSize::Six {
+            // filterLen >= 8
+            let (q3, p3) = (at(d, 3), at(d, -4));
+            if (p3 - p2).abs() > lim || (q3 - q2).abs() > lim {
+                return;
+            }
+            flat = flat && (p3 - p0).abs() <= tf && (q3 - q0).abs() <= tf;
+        }
+    }
+    if !flat {
+        // narrow filter (7.14.6.3)
+        let c = |v: i32| v.clamp(-t.half, t.half - 1);
+        let off = t.off;
+        let (ps1, ps0, qs0, qs1) = (p1 - off, p0 - off, q0 - off, q1 - off);
+        let mut filter = if hev { c(ps1 - qs1) } else { 0 };
+        filter = c(filter + 3 * (qs0 - ps0));
+        let filter1 = c(filter + 4) >> 3;
+        let filter2 = c(filter + 3) >> 3;
+        d[base] = (c(qs0 - filter1) + off) as u16;
+        d[base - step] = (c(ps0 + filter2) + off) as u16;
+        if !hev {
+            let f = (filter1 + 1) >> 1;
+            d[base + step] = (c(qs1 - f) + off) as u16;
+            d[base - 2 * step] = (c(ps1 + f) + off) as u16;
+        }
+        return;
+    }
+    match size {
+        LfSize::Four => {}
+        LfSize::Six => wide::<2, 1, 3>(d, base, step),
+        LfSize::Eight => wide::<3, 0, 3>(d, base, step),
+        LfSize::Sixteen => {
+            let tf = t.flat;
+            let flat2 = (4..7).all(|k| (at(d, k) - q0).abs() <= tf && (at(d, -k - 1) - p0).abs() <= tf);
+            if flat2 { wide::<6, 1, 4>(d, base, step) } else { wide::<3, 0, 3>(d, base, step) }
+        }
+    }
+}
+
+/// Wide filter process (7.14.6.4) with n = N, the 2-weight taps |j| <= N2 and log2Size = LOG2.
+#[inline(always)]
+fn wide<const N: usize, const N2: usize, const LOG2: u32>(d: &mut [u16], base: usize, step: usize) {
+    // v[k] = sample at offset k - (N + 1) from q0, k in 0 .. 2N + 2
+    let mut v = [0i32; 14];
+    let first = base - (N + 1) * step;
+    for (k, x) in v[..2 * N + 2].iter_mut().enumerate() {
+        *x = d[first + k * step] as i32;
+    }
+    // e[m] = v[clamp(m - N, 0, 2N + 1)]: the clamped tap positions as one array, so
+    // F[i] = sum_{jj = 0}^{2N} e[i + 1 + jj] * (2 if |jj - N| <= N2 else 1), a sliding window.
+    let mut e = [0i32; 25];
+    for (m, x) in e[..4 * N + 1].iter_mut().enumerate() {
+        *x = v[m.saturating_sub(N).min(2 * N + 1)];
+    }
+    let mut f = [0i32; 12];
+    let mut win: i32 = e[1..2 * N + 2].iter().sum();
+    for i in 0..2 * N {
+        if i > 0 {
+            win += e[i + 1 + 2 * N] - e[i];
+        }
+        let centre: i32 = e[i + 1 + N - N2..=i + 1 + N + N2].iter().sum();
+        f[i] = (win + centre + (1 << (LOG2 - 1))) >> LOG2;
+    }
+    let out = base - N * step;
+    for i in 0..2 * N {
+        d[out + i * step] = f[i] as u16;
+    }
 }

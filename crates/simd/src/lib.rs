@@ -12,10 +12,13 @@
 //! (to compare speed, or to rule the vector code out when chasing a bug).
 //!
 //! `unsafe` is confined to the architecture modules: entering a kernel compiled for the target's
-//! baseline vector set, and vector loads and stores of fixed-size arrays.
+//! baseline vector set, and vector loads and stores of fixed-size arrays. Kernels that are long
+//! enough to share between architectures (the loop filter) are written once as a macro over a
+//! handful of vector operations each module defines.
 
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable))]
 
+mod deblock;
 mod scalar;
 
 #[cfg(target_arch = "aarch64")]
@@ -27,6 +30,8 @@ mod neon;
 mod sse2;
 
 use std::sync::OnceLock;
+
+pub use deblock::{LfSize, LfThresh};
 
 /// The instruction set a kernel runs on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -72,6 +77,58 @@ pub fn cdef_direction_at(level: Level, rows: &[&[u16; 8]; 8], shift: u32) -> (us
         #[cfg(target_arch = "x86_64")]
         Level::Sse2 => sse2::cdef_direction(rows, shift),
         _ => scalar::cdef_direction(rows, shift),
+    }
+}
+
+/// AV1 loop filter (7.14.6) of one line across an edge: `d[base]` is q0 and `step` the distance
+/// between samples across the edge. Scalar on every level (it filters lines the vector kernels
+/// can't reach, such as those copied out across a band edge).
+pub fn deblock_line(d: &mut [u16], base: usize, step: usize, size: LfSize, t: &LfThresh) {
+    scalar::deblock_line(d, base, step, size, t);
+}
+
+/// AV1 loop filter (7.14.6) of the 4 lines across a vertical edge: `d[base]` is q0 of the
+/// first line, and each next line starts `stride` further.
+pub fn deblock_vertical(d: &mut [u16], base: usize, stride: usize, size: LfSize, t: &LfThresh) {
+    deblock_vertical_at(level(), d, base, stride, size, t);
+}
+
+/// [`deblock_vertical`] on a given level.
+pub fn deblock_vertical_at(level: Level, d: &mut [u16], base: usize, stride: usize, size: LfSize, t: &LfThresh) {
+    let done = match level {
+        #[cfg(target_arch = "aarch64")]
+        Level::Neon => neon::deblock_vertical(d, base, stride, size, t),
+        #[cfg(target_arch = "x86_64")]
+        Level::Sse2 => sse2::deblock_vertical(d, base, stride, size, t),
+        _ => false,
+    };
+    // Scalar, or a vector kernel's 8-sample rows don't all fit in `d`.
+    if !done {
+        for i in 0..4 {
+            scalar::deblock_line(d, base + i * stride, 1, size, t);
+        }
+    }
+}
+
+/// AV1 loop filter (7.14.6) of the 4 lines across a horizontal edge: `d[base]` is q0 of the
+/// first line, the next three follow it, and `stride` is the distance between rows.
+pub fn deblock_horizontal(d: &mut [u16], base: usize, stride: usize, size: LfSize, t: &LfThresh) {
+    deblock_horizontal_at(level(), d, base, stride, size, t);
+}
+
+/// [`deblock_horizontal`] on a given level.
+pub fn deblock_horizontal_at(level: Level, d: &mut [u16], base: usize, stride: usize, size: LfSize, t: &LfThresh) {
+    let done = match level {
+        #[cfg(target_arch = "aarch64")]
+        Level::Neon => neon::deblock_horizontal(d, base, stride, size, t),
+        #[cfg(target_arch = "x86_64")]
+        Level::Sse2 => sse2::deblock_horizontal(d, base, stride, size, t),
+        _ => false,
+    };
+    if !done {
+        for i in 0..4 {
+            scalar::deblock_line(d, base + i, stride, size, t);
+        }
     }
 }
 
