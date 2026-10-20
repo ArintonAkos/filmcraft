@@ -1769,15 +1769,19 @@ impl<'a, 'f> TileDecoder<'a, 'f> {
                 let pos = pos as usize;
                 let sign = if pos == 0 {
                     let ctx = self.dc_sign_ctx(plane, x4, y4, w4, h4);
-                    self.sd.read_symbol(&mut self.cdf.dc_sign[ptype][ctx]) == 1
+                    self.sd.read_symbol(&mut self.cdf.dc_sign[ptype][ctx]) as i32
                 } else {
-                    self.sd.read_literal(1) == 1
+                    self.sd.read_bool() as i32
                 };
-                if self.quant[pos] > (NUM_BASE_LEVELS + COEFF_BASE_RANGE) as i32 {
+                let Some(q) = self.quant.get_mut(pos) else {
+                    continue;
+                };
+                let mut v = *q;
+                if v > (NUM_BASE_LEVELS + COEFF_BASE_RANGE) as i32 {
                     let mut length = 0;
                     loop {
                         length += 1;
-                        if self.sd.read_literal(1) == 1 {
+                        if self.sd.read_bool() == 1 {
                             break;
                         }
                         if length > 32 {
@@ -1786,18 +1790,17 @@ impl<'a, 'f> TileDecoder<'a, 'f> {
                     }
                     let mut x: u32 = 1;
                     for _ in (0..length - 1).rev() {
-                        x = (x << 1) | self.sd.read_literal(1);
+                        x = (x << 1) | self.sd.read_bool();
                     }
-                    self.quant[pos] = (x as i64 + COEFF_BASE_RANGE as i64 + NUM_BASE_LEVELS as i64).min(i32::MAX as i64) as i32;
+                    v = (x as i64 + COEFF_BASE_RANGE as i64 + NUM_BASE_LEVELS as i64).min(i32::MAX as i64) as i32;
                 }
-                if pos == 0 && self.quant[pos] > 0 {
-                    dc_category = if sign { 1 } else { 2 };
+                if pos == 0 && v > 0 {
+                    dc_category = 2 - sign as u8;
                 }
-                self.quant[pos] &= 0xFFFFF;
-                cul_level += self.quant[pos] as u32;
-                if sign {
-                    self.quant[pos] = -self.quant[pos];
-                }
+                v &= 0xFFFFF;
+                cul_level += v as u32;
+                // The sign applied without a branch: signs are close to random.
+                *q = (v ^ -sign) + sign;
             }
             self.nonzero = nonzero;
             cul_level = cul_level.min(63);
