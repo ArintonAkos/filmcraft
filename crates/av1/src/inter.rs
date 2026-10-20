@@ -407,7 +407,11 @@ impl TileDecoder<'_, '_> {
         }
         let mut preds = [std::mem::take(&mut self.pred_buf[0]), std::mem::take(&mut self.pred_buf[1])];
         let mut tmp = std::mem::take(&mut self.mc_tmp);
-        let fh = &self.fs.fh;
+        let fs = self.fs;
+        let fh = &fs.fh;
+        let is_inter_intra = self.b.is_inter && self.b.ref_frame[1] == INTRA_FRAME as i8;
+        // The prediction went straight into the frame (`copy_whole_samples`).
+        let mut direct = false;
         for ref_list in 0..1 + is_compound as usize {
             let ref_frame = cand_refs[ref_list];
             let ym = self.b.y_mode;
@@ -433,7 +437,17 @@ impl TileDecoder<'_, '_> {
                 }
             } else {
                 let (sx, sy, stx, sty) = self.mv_scaling(plane, ref_idx, x as i32, y as i32, mv);
-                self.block_inter_prediction(plane, ref_idx, sx, sy, stx, sty, w, h, filters, rnd, &mut preds[ref_list], &mut tmp);
+                let unit = 1 << SCALE_SUBPEL_BITS;
+                let phase = |p: i32| (p >> 6) & SUBPEL_MASK as i32;
+                let whole = stx == unit && sty == unit && phase(sx) == 0 && phase(sy) == 0;
+                let reference = usize::try_from(ref_idx).ok().and_then(|i| fs.refs.get(i)).and_then(|r| r.as_ref());
+                if let Some(r) = reference.filter(|_| whole && !is_compound && !is_inter_intra) {
+                    let (last_x, last_y) = self.ref_plane_dims(ref_idx, plane);
+                    copy_whole_samples(&r.buf.planes[plane], last_x, last_y, sx >> 10, sy >> 10, w, h, &mut self.t.cur.planes[plane], x, y);
+                    direct = true;
+                } else {
+                    self.block_inter_prediction(plane, ref_idx, sx, sy, stx, sty, w, h, filters, rnd, &mut preds[ref_list], &mut tmp);
+                }
             }
         }
         let ct = self.b.compound_type;
@@ -473,8 +487,9 @@ impl TileDecoder<'_, '_> {
         }
         let (fwd, bck) = if ct == COMPOUND_DISTANCE { self.distance_weights(cand_refs) } else { (0, 0) };
         let max = (1i32 << bd) - 1;
-        let is_inter_intra = self.b.is_inter && self.b.ref_frame[1] == INTRA_FRAME as i8;
-        if !is_compound && !is_inter_intra {
+        if direct {
+            // `copy_whole_samples` already wrote the prediction.
+        } else if !is_compound && !is_inter_intra {
             let pl = &mut self.t.cur.planes[plane];
             for (i, p) in preds[0].chunks(PRED_STRIDE).take(h).enumerate() {
                 for (o, &p) in pl.row_from_mut(y + i, x)[..w].iter_mut().zip(&p[..w]) {
@@ -664,6 +679,52 @@ impl TileDecoder<'_, '_> {
 
 const IDENTITY_TAPS: [i16; 8] = [0, 0, 0, 128, 0, 0, 0, 0];
 
+/// The w x h reference samples at whole-sample position (x0, y0), edges clamped, into `dst` at
+/// (dx, dy): block inter prediction (7.11.3.4) of an unscaled single prediction whose filter
+/// phases are both 0. Phase 0 of every filter is the identity, and InterRound0 + InterRound1
+/// = 2 * FILTER_BITS for a single prediction (InterPostRound 0), so the prediction is the
+/// reference sample itself.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn copy_whole_samples(refp: &Plane, last_x: i32, last_y: i32, x0: i32, y0: i32, w: usize, h: usize, dst: &mut Plane, dx: usize, dy: usize) {
+    if x0 < 0 || x0 + w as i32 > last_x + 1 {
+        for r in 0..h {
+            let row = refp.row((y0 + r as i32).clamp(0, last_y) as usize);
+            for (k, o) in dst.row_from_mut(dy + r, dx)[..w].iter_mut().enumerate() {
+                *o = row[(x0 + k as i32).clamp(0, last_x) as usize];
+            }
+        }
+        return;
+    }
+    let x0 = x0 as usize;
+    match w {
+        2 => copy_rows::<2>(refp, last_y, x0, y0, h, dst, dx, dy),
+        4 => copy_rows::<4>(refp, last_y, x0, y0, h, dst, dx, dy),
+        8 => copy_rows::<8>(refp, last_y, x0, y0, h, dst, dx, dy),
+        16 => copy_rows::<16>(refp, last_y, x0, y0, h, dst, dx, dy),
+        32 => copy_rows::<32>(refp, last_y, x0, y0, h, dst, dx, dy),
+        64 => copy_rows::<64>(refp, last_y, x0, y0, h, dst, dx, dy),
+        128 => copy_rows::<128>(refp, last_y, x0, y0, h, dst, dx, dy),
+        _ => {
+            for r in 0..h {
+                let row = refp.row((y0 + r as i32).clamp(0, last_y) as usize);
+                dst.row_from_mut(dy + r, dx)[..w].copy_from_slice(&row[x0..x0 + w]);
+            }
+        }
+    }
+}
+
+/// [`copy_whole_samples`] of `W`-wide rows inside the reference: copies of a fixed length (a
+/// call to memmove per row otherwise).
+#[allow(clippy::too_many_arguments)]
+fn copy_rows<const W: usize>(refp: &Plane, last_y: i32, x0: usize, y0: i32, h: usize, dst: &mut Plane, dx: usize, dy: usize) {
+    for r in 0..h {
+        let src = refp.row((y0 + r as i32).clamp(0, last_y) as usize).get(x0..).and_then(|s| s.first_chunk::<W>());
+        if let (Some(src), Some(d)) = (src, dst.row_from_mut(dy + r, dx).first_chunk_mut::<W>()) {
+            *d = *src;
+        }
+    }
+}
+
 /// Block inter prediction without reference scaling: every column / row uses the same filter
 /// phase, so the filters run over whole rows (bit-identical to the per-sample process).
 #[allow(clippy::too_many_arguments)]
@@ -749,6 +810,35 @@ mod tests {
                 assert!((hi + half) >> r0 <= i16::MAX as i32 && (lo + half) >> r0 >= i16::MIN as i32, "bd {bd} taps {taps:?}");
             }
             assert!(max << (7 - r0) <= i16::MAX as i32);
+        }
+    }
+
+    /// A whole-sample single prediction copied straight into the frame equals the filter path's
+    /// (phase 0 is the identity for every filter), inside the reference and past every edge.
+    #[test]
+    fn whole_sample_copies_match_the_filter_path() {
+        assert!(SUBPEL_FILTERS.iter().all(|f| f[0] == IDENTITY_TAPS));
+        let (rw, rh) = (40usize, 24usize);
+        let mut refp = Plane::new(rw, rh);
+        for (i, v) in refp.data.iter_mut().enumerate() {
+            *v = (((i as u64 * 2_654_435_761) >> 7) & 1023) as u16;
+        }
+        let (last_x, last_y) = (rw as i32 - 1, rh as i32 - 1);
+        let rnd = rounding(false, 10);
+        for (w, h) in [(2, 2), (4, 4), (8, 4), (16, 8), (32, 16), (12, 4)] {
+            for x0 in [-40, -9, -1, 0, 3, 24, 38, 50] {
+                for y0 in [-30, -2, 0, 5, 20, 30] {
+                    let mut pred = vec![0i32; PRED_STRIDE * h];
+                    let mut tmp = vec![0i16; w * (h + 7)];
+                    mc_unscaled(&refp, last_x, last_y, x0 << 10, y0 << 10, w, h, &IDENTITY_TAPS, &IDENTITY_TAPS, rnd, &mut pred, &mut tmp);
+                    let mut dst = Plane::new(64, 32);
+                    copy_whole_samples(&refp, last_x, last_y, x0, y0, w, h, &mut dst, 3, 2);
+                    for r in 0..h {
+                        let want: Vec<u16> = pred[r * PRED_STRIDE..][..w].iter().map(|&p| p as u16).collect();
+                        assert_eq!(&dst.row(2 + r)[3..3 + w], &want[..], "{w}x{h} at ({x0}, {y0}) row {r}");
+                    }
+                }
+            }
         }
     }
 }
