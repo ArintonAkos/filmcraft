@@ -1757,19 +1757,21 @@ impl<'a, 'f> TileDecoder<'a, 'f> {
                 }
                 self.quant[pos] = level;
                 lev[li] = level as u8;
+                if level != 0 {
+                    self.nonzero.push(pos as u16);
+                }
             }
             self.levels = lev;
-            for c in 0..eob {
-                let pos = scan[c] as usize;
-                let sign = if self.quant[pos] != 0 {
-                    if c == 0 {
-                        let ctx = self.dc_sign_ctx(plane, x4, y4, w4, h4);
-                        self.sd.read_symbol(&mut self.cdf.dc_sign[ptype][ctx]) == 1
-                    } else {
-                        self.sd.read_literal(1) == 1
-                    }
+            // Signs and Golomb remainders of the nonzero coefficients, in scan order (the
+            // reverse of the level pass's); zero ones have neither. The scans start at 0.
+            let nonzero = std::mem::take(&mut self.nonzero);
+            for &pos in nonzero.iter().rev() {
+                let pos = pos as usize;
+                let sign = if pos == 0 {
+                    let ctx = self.dc_sign_ctx(plane, x4, y4, w4, h4);
+                    self.sd.read_symbol(&mut self.cdf.dc_sign[ptype][ctx]) == 1
                 } else {
-                    false
+                    self.sd.read_literal(1) == 1
                 };
                 if self.quant[pos] > (NUM_BASE_LEVELS + COEFF_BASE_RANGE) as i32 {
                     let mut length = 0;
@@ -1796,10 +1798,8 @@ impl<'a, 'f> TileDecoder<'a, 'f> {
                 if sign {
                     self.quant[pos] = -self.quant[pos];
                 }
-                if self.quant[pos] != 0 {
-                    self.nonzero.push(pos as u16);
-                }
             }
+            self.nonzero = nonzero;
             cul_level = cul_level.min(63);
         }
         for i in 0..w4 {
