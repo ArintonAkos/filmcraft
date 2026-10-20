@@ -134,8 +134,22 @@ pub(crate) fn predict_intra(pl: &mut Plane, p: &IntraParams, scratch: &mut Intra
             }
         }
     }
-    for i in 0..h {
-        pl.row_from_mut(y + i, x)[..w].copy_from_slice(&pred[i * w..i * w + w]);
+    match w {
+        4 => put_rows::<4>(pl, x, y, h, pred),
+        8 => put_rows::<8>(pl, x, y, h, pred),
+        16 => put_rows::<16>(pl, x, y, h, pred),
+        32 => put_rows::<32>(pl, x, y, h, pred),
+        _ => put_rows::<64>(pl, x, y, h, pred),
+    }
+}
+
+/// The `W`-wide prediction rows into the plane at (`x`, `y`): copies of a fixed length (a call
+/// to memmove per row otherwise).
+fn put_rows<const W: usize>(pl: &mut Plane, x: usize, y: usize, h: usize, pred: &[u16]) {
+    for (i, src) in pred.as_chunks::<W>().0.iter().take(h).enumerate() {
+        if let Some(d) = pl.row_from_mut(y + i, x).first_chunk_mut::<W>() {
+            *d = *src;
+        }
     }
 }
 
