@@ -122,24 +122,19 @@ impl<const L: usize> Lane for [i32; L] {
     }
 }
 
+/// The low `num_bits` bits of `x` in reverse order.
+#[inline(always)]
 fn brev(num_bits: u32, x: usize) -> usize {
-    let mut t = 0;
-    for i in 0..num_bits {
-        let bit = (x >> i) & 1;
-        t += bit << (num_bits - 1 - i);
-    }
-    t
+    x.reverse_bits().checked_shr(usize::BITS - num_bits).unwrap_or(0)
 }
 
 /// Butterfly rotation B( a, b, angle, flip ).
 #[inline(always)]
 fn bf<T: Lane>(t: &mut [T], a: usize, b: usize, angle: i32, flip: bool) {
     let (x, y) = T::rotate(t[a], t[b], cos128(angle) as i32, sin128(angle) as i32);
+    let (a, b) = if flip { (b, a) } else { (a, b) };
     t[a] = x;
     t[b] = y;
-    if flip {
-        t.swap(a, b);
-    }
 }
 
 /// Hadamard rotation H( a, b, flip, r ).
@@ -155,12 +150,12 @@ fn hd<T: Lane>(t: &mut [T], a: usize, b: usize, flip: bool, r: u32) {
 
 /// Inverse DCT of length 2^n (7.13.2.3), in place.
 pub(crate) fn inverse_dct<T: Lane>(t: &mut [T], n: u32, r: u32) {
-    // 7.13.2.2 permutation
-    let len = 1usize << n;
-    let mut copy = [T::ZERO; 64];
-    copy[..len].copy_from_slice(&t[..len]);
-    for i in 0..len {
-        t[i] = copy[brev(n, i)];
+    // 7.13.2.2 permutation: bit reversal is its own inverse, so it is a set of swaps.
+    for i in 0..1usize << n {
+        let j = brev(n, i);
+        if i < j {
+            t.swap(i, j);
+        }
     }
     if n == 6 {
         for i in 0..16 {
@@ -516,8 +511,9 @@ fn col_kind(tx_type: usize) -> Kind1d {
 }
 
 /// 2D inverse transform (7.13.3). `dequant` is 64x64 (row stride 64, only the top-left 32x32
-/// may be non-zero); the residual is written to `residual` with row stride `w`.
-pub(crate) fn inverse_transform_2d(dequant: &[i32], residual: &mut [i32], tx_sz: usize, tx_type: usize, lossless: bool, bit_depth: u32) {
+/// may be non-zero, and only `dequant[0]` when `dc_only`); the residual is written to
+/// `residual` with row stride `w`.
+pub(crate) fn inverse_transform_2d(dequant: &[i32], residual: &mut [i32], tx_sz: usize, tx_type: usize, lossless: bool, bit_depth: u32, dc_only: bool) {
     let log2w = TX_WIDTH_LOG2[tx_sz] as u32;
     let log2h = TX_HEIGHT_LOG2[tx_sz] as u32;
     let w = 1usize << log2w;
@@ -530,6 +526,17 @@ pub(crate) fn inverse_transform_2d(dequant: &[i32], residual: &mut [i32], tx_sz:
     let ck = col_kind(tx_type);
     let mut t = [0i32; 64];
     let rect2 = log2w.abs_diff(log2h) == 1;
+    if dc_only && !lossless && tx_type == DCT_DCT {
+        // The DCT of [x, 0, 0, ...] is flat: its first butterfly makes x * cos(pi / 4) of both
+        // its outputs, every other butterfly rotates zeros, and every Hadamard step adds or
+        // subtracts a zero (clamping alike). Rows past the first are zero, so the column pass
+        // sees the same in every column.
+        let flat = |x: i32, r: u32| round2_64(x as i64 * 2896, 12).clamp(-(1 << (r - 1)), (1 << (r - 1)) - 1);
+        let x = if rect2 { round2_64(dequant[0] as i64 * 2896, 12) } else { dequant[0] };
+        let row = round2(flat(x, row_clamp), row_shift).clamp(-(1 << (col_clamp - 1)), (1 << (col_clamp - 1)) - 1);
+        residual[..w * h].fill(round2(flat(row, col_clamp), col_shift));
+        return;
+    }
     if !lossless && bit_depth <= 10 {
         let p = Tx2d { w, h, log2w, log2h, row_shift, col_shift, row_clamp, col_clamp, rk, ck, rect2 };
         if w >= 8 && h >= 8 {
@@ -665,6 +672,28 @@ fn transform_lanes<const L: usize>(dequant: &[i32], residual: &mut [i32], p: &Tx
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The flat DC-only shortcut gives the bits of the full transform, from tiny to clamped
+    /// coefficients, at every size and bit depth.
+    #[test]
+    fn dc_only_matches_the_full_transform() {
+        let mut dequant = vec![0i32; 64 * 64];
+        for bd in [8, 10, 12] {
+            let lim = 1i32 << (7 + bd);
+            for tx_sz in 0..TX_WIDTH_LOG2.len() {
+                let w = 1usize << TX_WIDTH_LOG2[tx_sz];
+                let h = 1usize << TX_HEIGHT_LOG2[tx_sz];
+                for dc in [1, -1, 7, -9, 100, -555, 4096, -30000, lim / 3, lim - 1, -lim] {
+                    dequant[0] = dc;
+                    let mut want = vec![0i32; w * h];
+                    let mut got = vec![1i32; w * h];
+                    inverse_transform_2d(&dequant, &mut want, tx_sz, DCT_DCT, false, bd, false);
+                    inverse_transform_2d(&dequant, &mut got, tx_sz, DCT_DCT, false, bd, true);
+                    assert_eq!(got, want, "bd {bd} tx_sz {tx_sz} dc {dc}");
+                }
+            }
+        }
+    }
 
     /// The DCT step list must implement an orthogonal transform: a DC-only input gives a flat
     /// output equal to DC * cos(pi/4) (in the 2^12 fixed-point scale).

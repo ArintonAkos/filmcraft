@@ -1966,7 +1966,8 @@ impl<'a, 'f> TileDecoder<'a, 'f> {
             self.dequant[i * 64 + j] = dq2.clamp(-lim, lim - 1) as i32;
         }
         let lossless = self.b.lossless;
-        inverse_transform_2d(&self.dequant, &mut self.residual, tx_sz, t, lossless, bd);
+        let dc_only = self.nonzero.as_slice() == [0];
+        inverse_transform_2d(&self.dequant, &mut self.residual, tx_sz, t, lossless, bd, dc_only);
         for &pos in &self.nonzero {
             self.dequant[pos as usize / tw * 64 + pos as usize % tw] = 0;
         }
