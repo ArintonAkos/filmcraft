@@ -89,6 +89,8 @@ pub(crate) struct TileDecoder<'a, 'f> {
     pub nb: crate::inter_info::Neighbours,
     /// Quant[] for the current transform block (raster order, stride per Adjusted size).
     quant: Vec<i32>,
+    /// Positions (in `quant`) of the nonzero coefficients the last coeffs( ) read.
+    nonzero: Vec<u16>,
     dequant: Vec<i32>,
     residual: Vec<i32>,
     color_map_y: Vec<u8>,
@@ -138,6 +140,7 @@ impl<'a, 'f> TileDecoder<'a, 'f> {
             mvs: Default::default(),
             nb: Default::default(),
             quant: vec![0; 1024],
+            nonzero: Vec::with_capacity(1024),
             dequant: vec![0; 64 * 64],
             residual: vec![0; 64 * 64],
             color_map_y: vec![0; 64 * 64],
@@ -1198,7 +1201,10 @@ impl<'a, 'f> TileDecoder<'a, 'f> {
             let mut pred_w = block_width(self.b.mi_size) >> sub_x;
             let mut pred_h = block_height(self.b.mi_size) >> sub_y;
             let mut some_use_intra = false;
-            for r in 0..(n4h << sub_y) {
+            // The candidates are this (inter) block's own positions unless the chroma
+            // prediction of a small block reaches back into the blocks before it.
+            let own = cand_row == self.b.mi_row && cand_col == self.b.mi_col && (n4h << sub_y) <= self.b.bh4 && (n4w << sub_x) <= self.b.bw4;
+            for r in 0..if own { 0 } else { n4h << sub_y } {
                 for c in 0..(n4w << sub_x) {
                     let (rr, cc) = (cand_row + r, cand_col + c);
                     if rr < self.t.mi.rows && cc < self.t.mi.cols && self.t.mi.ref_frame[self.t.mi.idx(rr, cc)][0] == INTRA_FRAME as i8 {
@@ -1661,8 +1667,8 @@ impl<'a, 'f> TileDecoder<'a, 'f> {
         let h4 = TX_HEIGHT[tx_sz] as usize >> 2;
         let tx_sz_ctx = (TX_SIZE_SQR[tx_sz] as usize + TX_SIZE_SQR_UP[tx_sz] as usize + 1) >> 1;
         let ptype = (plane > 0) as usize;
-        let seg_eob = if tx_sz == TX_16X64 || tx_sz == TX_64X16 { 512 } else { 1024.min(TX_WIDTH[tx_sz] as usize * TX_HEIGHT[tx_sz] as usize) };
-        self.quant[..seg_eob].iter_mut().for_each(|q| *q = 0);
+        // Every position below eob is written before it is read: `quant` needs no clearing.
+        self.nonzero.clear();
         let mut eob = 0usize;
         let mut cul_level = 0u32;
         let mut dc_category = 0u8;
@@ -1787,6 +1793,9 @@ impl<'a, 'f> TileDecoder<'a, 'f> {
                 cul_level += self.quant[pos] as u32;
                 if sign {
                     self.quant[pos] = -self.quant[pos];
+                }
+                if self.quant[pos] != 0 {
+                    self.nonzero.push(pos as u16);
                 }
             }
             cul_level = cul_level.min(63);
@@ -1919,7 +1928,6 @@ impl<'a, 'f> TileDecoder<'a, 'f> {
         let w = 1usize << log2w;
         let h = 1usize << log2h;
         let tw = w.min(32);
-        let th = h.min(32);
         let t = self.plane_tx_type;
         let flip_ud = matches!(t, FLIPADST_DCT | FLIPADST_ADST | V_FLIPADST | FLIPADST_FLIPADST);
         let flip_lr = matches!(t, DCT_FLIPADST | ADST_FLIPADST | H_FLIPADST | FLIPADST_FLIPADST);
@@ -1937,31 +1945,29 @@ impl<'a, 'f> TileDecoder<'a, 'f> {
         let qm_level = if fh.quant.using_qmatrix { fh.seg_qm_level[plane][self.b.segment_id] } else { 15 };
         let use_qm = fh.quant.using_qmatrix && t < IDTX && qm_level < 15;
         let lim = 1i64 << (7 + bd);
-        // inverse_transform_2d reads only the top-left tw x th coefficients (stride 64)
-        for i in 0..th {
-            self.dequant[i * 64..i * 64 + tw].fill(0);
-        }
-        for i in 0..th {
-            for j in 0..tw {
-                let qv = self.quant[i * tw + j];
-                if qv == 0 {
-                    continue;
-                }
-                let q = if i == 0 && j == 0 { dc_q } else { ac_q };
-                let q2 = if use_qm {
-                    let m = QUANTIZER_MATRIX[qm_level as usize][(plane > 0) as usize][QM_OFFSET[tx_sz] as usize + i * tw + j] as i64;
-                    (q * m + 16) >> 5
-                } else {
-                    q
-                };
-                let dq = qv as i64 * q2;
-                let mag = (dq.abs() & 0xFFFFFF) / dq_denom;
-                let dq2 = if dq < 0 { -mag } else { mag };
-                self.dequant[i * 64 + j] = dq2.clamp(-lim, lim - 1) as i32;
-            }
+        // inverse_transform_2d reads only the top-left 32x32 coefficients (stride 64).
+        // `dequant` is all zero between blocks: only the nonzero coefficients are written,
+        // and cleared again after the transform.
+        for &pos in &self.nonzero {
+            let (i, j) = (pos as usize / tw, pos as usize % tw);
+            let qv = self.quant[pos as usize];
+            let q = if i == 0 && j == 0 { dc_q } else { ac_q };
+            let q2 = if use_qm {
+                let m = QUANTIZER_MATRIX[qm_level as usize][(plane > 0) as usize][QM_OFFSET[tx_sz] as usize + i * tw + j] as i64;
+                (q * m + 16) >> 5
+            } else {
+                q
+            };
+            let dq = qv as i64 * q2;
+            let mag = (dq.abs() & 0xFFFFFF) / dq_denom;
+            let dq2 = if dq < 0 { -mag } else { mag };
+            self.dequant[i * 64 + j] = dq2.clamp(-lim, lim - 1) as i32;
         }
         let lossless = self.b.lossless;
         inverse_transform_2d(&self.dequant, &mut self.residual, tx_sz, t, lossless, bd);
+        for &pos in &self.nonzero {
+            self.dequant[pos as usize / tw * 64 + pos as usize % tw] = 0;
+        }
         let pl = &mut self.t.cur.planes[plane];
         let max = (1i32 << bd) - 1;
         for i in 0..h {

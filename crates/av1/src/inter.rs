@@ -476,28 +476,23 @@ impl TileDecoder<'_, '_> {
         let is_inter_intra = self.b.is_inter && self.b.ref_frame[1] == INTRA_FRAME as i8;
         if !is_compound && !is_inter_intra {
             let pl = &mut self.t.cur.planes[plane];
-            for i in 0..h {
-                let row = &mut pl.row_from_mut(y + i, x)[..w];
-                for j in 0..w {
-                    row[j] = preds[0][i * PRED_STRIDE + j].clamp(0, max) as u16;
+            for (i, p) in preds[0].chunks(PRED_STRIDE).take(h).enumerate() {
+                for (o, &p) in pl.row_from_mut(y + i, x)[..w].iter_mut().zip(&p[..w]) {
+                    *o = p.clamp(0, max) as u16;
                 }
             }
         } else if ct == COMPOUND_AVERAGE {
             let pl = &mut self.t.cur.planes[plane];
-            for i in 0..h {
-                let row = &mut pl.row_from_mut(y + i, x)[..w];
-                for j in 0..w {
-                    let k = i * PRED_STRIDE + j;
-                    row[j] = round2(preds[0][k] + preds[1][k], 1 + rnd.2).clamp(0, max) as u16;
+            for (i, (p0, p1)) in preds[0].chunks(PRED_STRIDE).zip(preds[1].chunks(PRED_STRIDE)).take(h).enumerate() {
+                for (o, (&a, &b)) in pl.row_from_mut(y + i, x)[..w].iter_mut().zip(p0[..w].iter().zip(&p1[..w])) {
+                    *o = round2(a + b, 1 + rnd.2).clamp(0, max) as u16;
                 }
             }
         } else if ct == COMPOUND_DISTANCE {
             let pl = &mut self.t.cur.planes[plane];
-            for i in 0..h {
-                let row = &mut pl.row_from_mut(y + i, x)[..w];
-                for j in 0..w {
-                    let k = i * PRED_STRIDE + j;
-                    row[j] = round2(fwd * preds[0][k] + bck * preds[1][k], 4 + rnd.2).clamp(0, max) as u16;
+            for (i, (p0, p1)) in preds[0].chunks(PRED_STRIDE).zip(preds[1].chunks(PRED_STRIDE)).take(h).enumerate() {
+                for (o, (&a, &b)) in pl.row_from_mut(y + i, x)[..w].iter_mut().zip(p0[..w].iter().zip(&p1[..w])) {
+                    *o = round2(fwd * a + bck * b, 4 + rnd.2).clamp(0, max) as u16;
                 }
             }
         } else {
