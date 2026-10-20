@@ -90,6 +90,17 @@ impl<T: Clone> Slot<T> {
             g = self.cv.wait(g).unwrap_or_else(|e| e.into_inner());
         }
     }
+
+    /// [`Slot::wait`] for the one consumer of a value: moves it out instead of cloning it.
+    fn take(&self) -> Result<T> {
+        let mut g = self.value.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if let Some(v) = g.take() {
+                return v;
+            }
+            g = self.cv.wait(g).unwrap_or_else(|e| e.into_inner());
+        }
+    }
 }
 
 type FrameSlot = Slot<Arc<RefFrame>>;
@@ -140,7 +151,8 @@ impl Output {
 
     fn take(self) -> Result<Picture> {
         match self {
-            Output::Decoded(s) => s.wait().map(|p| Arc::try_unwrap(p).unwrap_or_else(|p| (*p).clone())),
+            // The output is the picture slot's only reader: taking it leaves the Arc unshared.
+            Output::Decoded(s) => s.take().map(|p| Arc::try_unwrap(p).unwrap_or_else(|p| (*p).clone())),
             Output::Existing { slot, seq, width, height, grain, apply_film_grain, pts } => {
                 let rf = slot.wait()?;
                 Ok(output_picture(&seq, &rf, width, height, &grain, apply_film_grain, pts))
