@@ -4,7 +4,7 @@
 
 use core::arch::aarch64::*;
 
-use crate::{CDEF_COST_WEIGHTS, cdef_pick};
+use crate::{CDEF_COST_WEIGHTS, CDEF_STRIDE, CdefTap, cdef_pick};
 
 /// 16-bit lanes; each line sum is two vectors (lanes 0..8 and 8..16), and a row is added at its
 /// offset with `ext`, a fixed shift of lanes across two registers.
@@ -296,4 +296,78 @@ fn subpel_v_neon(rows: &[i16], stride: usize, taps: &[i16; 8], out: &mut [i32], 
     if let (Some(r), Some(o)) = (rows.get(j..), out.get_mut(j..)) {
         crate::scalar::subpel_v(r, stride, taps, o, shift);
     }
+}
+
+/// See [`crate::cdef_filter`]: 8-wide blocks a row per vector, 4-wide ones two rows; `false`
+/// when a tap is outside `buf`.
+pub(crate) fn cdef_filter(buf: &[u16; CDEF_STRIDE * CDEF_STRIDE], w: usize, h: usize, taps: &[CdefTap], clamp: bool, out: &mut [u16; 64]) -> bool {
+    // SAFETY: NEON is part of the aarch64 baseline: every core this build runs on has it.
+    unsafe {
+        match (w, h) {
+            (8, 8) => cdef_filter_neon::<8, 8>(buf, taps, clamp, out),
+            (8, 4) => cdef_filter_neon::<8, 4>(buf, taps, clamp, out),
+            (4, 8) => cdef_filter_neon::<4, 4>(buf, taps, clamp, out),
+            (4, 4) => cdef_filter_neon::<4, 2>(buf, taps, clamp, out),
+            _ => false,
+        }
+    }
+}
+
+/// The 8 samples from `start`: one row of 8, or 4 and the 4 below them.
+#[target_feature(enable = "neon")]
+fn cdef_rows<const W: usize>(buf: &[u16; CDEF_STRIDE * CDEF_STRIDE], start: usize) -> Option<V> {
+    if W == 8 {
+        return Some(load8(buf.get(start..)?.first_chunk::<8>()?));
+    }
+    let a = buf.get(start..)?.first_chunk::<4>()?;
+    let b = buf.get(start + CDEF_STRIDE..)?.first_chunk::<4>()?;
+    // SAFETY: `a` and `b` are 4 u16 each, the 8 bytes each `vld1_u16` reads.
+    let (a, b) = unsafe { (vld1_u16(a.as_ptr()), vld1_u16(b.as_ptr())) };
+    Some(vreinterpretq_s16_u16(vcombine_u16(a, b)))
+}
+
+/// `N` vectors of `W`-wide rows; each tap's constants are set up once for all of them.
+#[target_feature(enable = "neon")]
+fn cdef_filter_neon<const W: usize, const N: usize>(buf: &[u16; CDEF_STRIDE * CDEF_STRIDE], taps: &[CdefTap], clamp: bool, out: &mut [u16; 64]) -> bool {
+    let zero = vdupq_n_s16(0);
+    // Vector k starts at row 2 + k * 8 / W, column 2.
+    let at = |k: usize| (2 + k * (8 / W)) * CDEF_STRIDE + 2;
+    let mut x = [zero; N];
+    for (k, x) in x.iter_mut().enumerate() {
+        let Some(v) = cdef_rows::<W>(buf, at(k)) else {
+            return false;
+        };
+        *x = v;
+    }
+    let (mut sum, mut mx, mut mn) = ([zero; N], x, x);
+    for t in taps {
+        let (weight, strength, shift) = (vdupq_n_s16(t.weight), vdupq_n_s16(t.strength), vdupq_n_s16(-(t.shift.min(15) as i16)));
+        for k in 0..N {
+            let Some(p) = at(k).checked_add_signed(t.off).and_then(|s| cdef_rows::<W>(buf, s)) else {
+                return false;
+            };
+            let d = vsubq_s16(p, x[k]);
+            let ad = vabsq_s16(d);
+            let mag = vminq_s16(vmaxq_s16(vsubq_s16(strength, vshlq_s16(ad, shift)), zero), ad);
+            let sign = vshrq_n_s16::<15>(d);
+            sum[k] = vmlaq_s16(sum[k], vsubq_s16(veorq_s16(mag, sign), sign), weight);
+            if clamp {
+                mx[k] = vmaxq_s16(mx[k], p);
+                mn[k] = vminq_s16(mn[k], p);
+            }
+        }
+    }
+    for k in 0..N {
+        // x + ((8 + sum - (sum < 0)) >> 4)
+        let r = vaddq_s16(sum[k], vaddq_s16(vdupq_n_s16(8), vshrq_n_s16::<15>(sum[k])));
+        let mut v = vaddq_s16(x[k], vshrq_n_s16::<4>(r));
+        if clamp {
+            v = vminq_s16(vmaxq_s16(v, mn[k]), mx[k]);
+        }
+        let Some(o) = out.get_mut(8 * k..).and_then(|o| o.first_chunk_mut::<8>()) else {
+            return false;
+        };
+        store8(v, o);
+    }
+    true
 }

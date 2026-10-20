@@ -2,7 +2,7 @@
 //! other targets run.
 
 use crate::deblock::{LfSize, LfThresh};
-use crate::{CDEF_COST_WEIGHTS, cdef_pick};
+use crate::{CDEF_COST_WEIGHTS, CDEF_STRIDE, CdefTap, cdef_pick};
 
 /// Each line sum takes whole rows added at an offset; integer sums don't depend on the order.
 pub(crate) fn cdef_direction(rows: &[&[u16; 8]; 8], shift: u32) -> (usize, i32) {
@@ -134,5 +134,27 @@ pub(crate) fn subpel_v(rows: &[i16], stride: usize, taps: &[i16; 8], out: &mut [
     for (j, o) in out.iter_mut().enumerate() {
         let v: i32 = taps.iter().enumerate().map(|(t, &f)| f as i32 * rows.get(t * stride + j).copied().unwrap_or(0) as i32).sum();
         *o = (v + half) >> shift;
+    }
+}
+
+pub(crate) fn cdef_filter(buf: &[u16; CDEF_STRIDE * CDEF_STRIDE], w: usize, h: usize, taps: &[CdefTap], clamp: bool, out: &mut [u16; 64]) {
+    for (i, row) in out.chunks_exact_mut(w.max(1)).take(h).enumerate() {
+        for (j, o) in row.iter_mut().enumerate() {
+            let ci = (i + 2) * CDEF_STRIDE + j + 2;
+            let Some(&x) = buf.get(ci) else {
+                return;
+            };
+            let x = x as i32;
+            let (mut sum, mut max, mut min) = (0, x, x);
+            for t in taps {
+                let p = ci.checked_add_signed(t.off).and_then(|k| buf.get(k)).map_or(x, |&p| p as i32);
+                let (d, strength) = (p - x, t.strength as i32);
+                let mag = (strength - (d.abs() >> t.shift.min(31))).max(0).min(d.abs());
+                sum += t.weight as i32 * if d < 0 { -mag } else { mag };
+                (max, min) = (max.max(p), min.min(p));
+            }
+            let v = x + ((8 + sum - (sum < 0) as i32) >> 4);
+            *o = if clamp { v.max(min).min(max) } else { v } as u16;
+        }
     }
 }

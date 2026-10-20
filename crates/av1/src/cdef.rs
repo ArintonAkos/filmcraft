@@ -5,6 +5,7 @@ use crate::par::Pool;
 use crate::postfilter::bands;
 use crate::spec_tables::*;
 use crate::state::FrameState;
+use filmcraft_simd::CdefTap;
 
 /// Run CDEF on `fs.cur`; returns the CdefFrame, or None when no block is filtered (CdefFrame
 /// equals CurrFrame). Bands of 64 luma rows (whole 8x8 blocks) are filtered in parallel: every
@@ -82,7 +83,7 @@ fn direction(fs: &FrameState, r: usize, c: usize) -> (usize, i32) {
 /// Marks a sample outside the frame (CdefAvailable = 0) in the padded block.
 const CDEF_NA: i32 = i32::MIN;
 /// Padded block: 8x8 plus 2 samples on every side, row stride 12.
-const PAD_STRIDE: usize = 12;
+const PAD_STRIDE: usize = filmcraft_simd::CDEF_STRIDE;
 
 #[inline(always)]
 fn constrain(diff: i32, threshold: i32, adj: u32) -> i32 {
@@ -125,10 +126,16 @@ fn filter(fs: &FrameState, out: &mut [RowBand; 3], plane: usize, r: usize, c: us
         && inside(left + w as isize + 3, sub_x, mi_cols)
     {
         // Every tap is available: whole rows at a time (constrain() with threshold 0 is 0).
-        let mut buf = [0i16; PAD_STRIDE * PAD_STRIDE];
+        let mut buf = [0u16; PAD_STRIDE * PAD_STRIDE];
         for (i, d) in buf.as_chunks_mut::<PAD_STRIDE>().0.iter_mut().take(h + 4).enumerate() {
-            for (d, &s) in d.iter_mut().zip(&src.row(y0 + i - 2)[x0 - 2..x0 + w + 2]) {
-                *d = s as i16;
+            let s = src.row(y0 + i - 2).get(x0 - 2..).unwrap_or(&[]);
+            // Whole rows of a fixed length (a call to memcpy otherwise).
+            if w == 8 {
+                if let Some(s) = s.first_chunk::<12>() {
+                    *d = *s;
+                }
+            } else if let (Some(s), Some(d)) = (s.first_chunk::<8>(), d.first_chunk_mut::<8>()) {
+                *d = *s;
             }
         }
         let t = Taps { pri_off, sec_off, pri_taps, sec_taps, pri, sec, pri_adj, sec_adj };
@@ -200,76 +207,40 @@ struct Taps {
 }
 
 /// CDEF of a `w` x `h` block whose taps are all available, from its padded samples `buf`.
-fn filter_inside(buf: &[i16; PAD_STRIDE * PAD_STRIDE], t: &Taps, dst: &mut RowBand, rows: (usize, usize, usize), w: usize) {
+fn filter_inside(buf: &[u16; PAD_STRIDE * PAD_STRIDE], t: &Taps, dst: &mut RowBand, (y0, x0, h): (usize, usize, usize), w: usize) {
     // Taps of a zero strength add 0. With one strength the tap weights sum to 12 < 16, so the
     // result stays between the centre and its farthest tap and the clamp to the taps' range
     // changes nothing (libaom and dav1d skip it too).
-    let mut taps = [(0isize, 0i32, 0i32, 0u32); 12];
+    let tap = |off: isize, weight: i32, strength: i32, shift: u32| CdefTap { off, weight: weight as i16, strength: strength as i16, shift };
+    let mut taps = [CdefTap::default(); 12];
     let mut n = 0;
     for k in 0..2 {
         for sign in [-1isize, 1] {
             if t.pri != 0 {
-                taps[n] = (sign * t.pri_off[k], t.pri_taps[k], t.pri, t.pri_adj);
+                taps[n] = tap(sign * t.pri_off[k], t.pri_taps[k], t.pri, t.pri_adj);
                 n += 1;
             }
             if t.sec != 0 {
-                taps[n] = (sign * t.sec_off[k][0], t.sec_taps[k], t.sec, t.sec_adj);
-                taps[n + 1] = (sign * t.sec_off[k][1], t.sec_taps[k], t.sec, t.sec_adj);
+                taps[n] = tap(sign * t.sec_off[k][0], t.sec_taps[k], t.sec, t.sec_adj);
+                taps[n + 1] = tap(sign * t.sec_off[k][1], t.sec_taps[k], t.sec, t.sec_adj);
                 n += 2;
             }
         }
     }
-    let taps = &taps[..n];
-    match (w, t.pri != 0 && t.sec != 0) {
-        (8, true) => filter_rows::<8, true>(buf, taps, dst, rows),
-        (8, false) => filter_rows::<8, false>(buf, taps, dst, rows),
-        (_, true) => filter_rows::<4, true>(buf, taps, dst, rows),
-        (_, false) => filter_rows::<4, false>(buf, taps, dst, rows),
-    }
-}
-
-/// CDEF of a block whose taps are all available, `W` samples per row, clamped to the taps'
-/// range when `CLAMP`. Samples (at most 12 bits), differences and the weighted tap sum all
-/// fit in i16, which doubles the SIMD width.
-#[inline(always)]
-fn filter_rows<const W: usize, const CLAMP: bool>(
-    b16: &[i16; PAD_STRIDE * PAD_STRIDE],
-    taps: &[(isize, i32, i32, u32)],
-    dst: &mut RowBand,
-    (y0, x0, h): (usize, usize, usize),
-) {
-    for i in 0..h {
-        let ci = ((i + 2) * PAD_STRIDE + 2) as isize;
-        let Some(&x) = b16.get(ci as usize..).and_then(|r| r.first_chunk::<W>()) else {
-            return;
-        };
-        let (mut sum, mut max, mut min) = ([0i16; W], x, x);
-        for &(off, weight, thr, adj) in taps {
-            let (weight, thr) = (weight as i16, thr as i16);
-            let start = (ci + off) as usize;
-            let Some(p) = b16.get(start..).and_then(|r| r.first_chunk::<W>()) else {
-                return;
-            };
-            for j in 0..W {
-                // constrain(): .max / .min instead of clamp (whose bound check panics), and
-                // the sign applied branch-free, so the loop vectorises.
-                let d = p[j] - x[j];
-                let ad = d.abs();
-                let mag = (thr - (ad >> adj)).max(0).min(ad);
-                let sign = d >> 15;
-                sum[j] += weight * ((mag ^ sign) - sign);
-                if CLAMP {
-                    max[j] = max[j].max(p[j]);
-                    min[j] = min[j].min(p[j]);
-                }
+    let mut out = [0u16; 64];
+    filmcraft_simd::cdef_filter(buf, w, h, &taps[..n], t.pri != 0 && t.sec != 0, &mut out);
+    // Rows of a fixed length (a call to memmove otherwise).
+    fn put<const W: usize>(out: &[u16; 64], dst: &mut RowBand, (y0, x0, h): (usize, usize, usize)) {
+        for (i, o) in out.as_chunks::<W>().0.iter().take(h).enumerate() {
+            if let Some(d) = dst.row_mut(y0 + i).get_mut(x0..).and_then(|d| d.first_chunk_mut::<W>()) {
+                *d = *o;
             }
         }
-        let drow = &mut dst.row_mut(y0 + i)[x0..x0 + W];
-        for j in 0..W {
-            let s = sum[j];
-            let v = x[j] + ((8 + s - (s < 0) as i16) >> 4);
-            drow[j] = if CLAMP { v.max(min[j]).min(max[j]) } else { v } as u16;
-        }
+    }
+    if w == 8 {
+        put::<8>(&out, dst, (y0, x0, h));
+    } else {
+        put::<4>(&out, dst, (y0, x0, h));
     }
 }
 
@@ -279,7 +250,7 @@ mod tests {
     use crate::frame::Plane;
 
     /// 7.15.3 as the spec writes it: all twelve taps, then the clamp to their range.
-    fn spec_filter(buf: &[i16; PAD_STRIDE * PAD_STRIDE], t: &Taps, w: usize, h: usize) -> Vec<u16> {
+    fn spec_filter(buf: &[u16; PAD_STRIDE * PAD_STRIDE], t: &Taps, w: usize, h: usize) -> Vec<u16> {
         let mut out = Vec::new();
         for i in 0..h {
             for j in 0..w {
@@ -324,7 +295,7 @@ mod tests {
             let (w, h) = [(8, 8), (4, 4), (4, 8)][next() as usize % 3];
             let base = (next() % (max as u32 + 1)) as i32;
             let spread = [2, 8, 40, 300, 4096][next() as usize % 5].min(max + 1);
-            let buf: [i16; PAD_STRIDE * PAD_STRIDE] = std::array::from_fn(|_| (base + (next() % spread as u32) as i32 - spread / 2).clamp(0, max) as i16);
+            let buf: [u16; PAD_STRIDE * PAD_STRIDE] = std::array::from_fn(|_| (base + (next() % spread as u32) as i32 - spread / 2).clamp(0, max) as u16);
             let pri = [0, 1, 2, 3, 5, 8, 15][next() as usize % 7] << shift;
             let sec = [0, 1, 2, 4][next() as usize % 4] << shift;
             if pri == 0 && sec == 0 {

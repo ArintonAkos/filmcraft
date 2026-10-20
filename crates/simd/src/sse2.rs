@@ -4,7 +4,7 @@
 
 use core::arch::x86_64::*;
 
-use crate::{CDEF_COST_WEIGHTS, cdef_pick};
+use crate::{CDEF_COST_WEIGHTS, CDEF_STRIDE, CdefTap, cdef_pick};
 
 /// 16-bit lanes; each line sum is two vectors (lanes 0..8 and 8..16), and a row is added at its
 /// offset with byte shifts that move it up across the two registers.
@@ -313,4 +313,76 @@ fn load8_i16(s: &[i16; 8]) -> V {
 fn load4_i16(s: &[i16; 4]) -> V {
     // SAFETY: `s` is 4 i16, the 8 bytes `_mm_loadl_epi64` reads (unaligned load).
     unsafe { _mm_loadl_epi64(s.as_ptr().cast()) }
+}
+
+/// See [`crate::cdef_filter`]: 8-wide blocks a row per vector, 4-wide ones two rows; `false`
+/// when a tap is outside `buf`.
+pub(crate) fn cdef_filter(buf: &[u16; CDEF_STRIDE * CDEF_STRIDE], w: usize, h: usize, taps: &[CdefTap], clamp: bool, out: &mut [u16; 64]) -> bool {
+    // SAFETY: SSE2 is part of the x86_64 baseline: every core this build runs on has it.
+    unsafe {
+        match (w, h) {
+            (8, 8) => cdef_filter_sse2::<8, 8>(buf, taps, clamp, out),
+            (8, 4) => cdef_filter_sse2::<8, 4>(buf, taps, clamp, out),
+            (4, 8) => cdef_filter_sse2::<4, 4>(buf, taps, clamp, out),
+            (4, 4) => cdef_filter_sse2::<4, 2>(buf, taps, clamp, out),
+            _ => false,
+        }
+    }
+}
+
+/// The 8 samples from `start`: one row of 8, or 4 and the 4 below them.
+#[target_feature(enable = "sse2")]
+fn cdef_rows<const W: usize>(buf: &[u16; CDEF_STRIDE * CDEF_STRIDE], start: usize) -> Option<V> {
+    if W == 8 {
+        return Some(load8(buf.get(start..)?.first_chunk::<8>()?));
+    }
+    let a = buf.get(start..)?.first_chunk::<4>()?;
+    let b = buf.get(start + CDEF_STRIDE..)?.first_chunk::<4>()?;
+    Some(_mm_unpacklo_epi64(load4(a), load4(b)))
+}
+
+/// `N` vectors of `W`-wide rows; each tap's constants are set up once for all of them.
+#[target_feature(enable = "sse2")]
+fn cdef_filter_sse2<const W: usize, const N: usize>(buf: &[u16; CDEF_STRIDE * CDEF_STRIDE], taps: &[CdefTap], clamp: bool, out: &mut [u16; 64]) -> bool {
+    let zero = _mm_setzero_si128();
+    // Vector k starts at row 2 + k * 8 / W, column 2.
+    let at = |k: usize| (2 + k * (8 / W)) * CDEF_STRIDE + 2;
+    let mut x = [zero; N];
+    for (k, x) in x.iter_mut().enumerate() {
+        let Some(v) = cdef_rows::<W>(buf, at(k)) else {
+            return false;
+        };
+        *x = v;
+    }
+    let (mut sum, mut mx, mut mn) = ([zero; N], x, x);
+    for t in taps {
+        let (weight, strength, shift) = (_mm_set1_epi16(t.weight), _mm_set1_epi16(t.strength), _mm_cvtsi32_si128(t.shift.min(15) as i32));
+        for k in 0..N {
+            let Some(p) = at(k).checked_add_signed(t.off).and_then(|s| cdef_rows::<W>(buf, s)) else {
+                return false;
+            };
+            let d = _mm_sub_epi16(p, x[k]);
+            let ad = _mm_max_epi16(d, _mm_sub_epi16(zero, d));
+            let mag = _mm_min_epi16(_mm_max_epi16(_mm_sub_epi16(strength, _mm_sra_epi16(ad, shift)), zero), ad);
+            let sign = _mm_srai_epi16::<15>(d);
+            sum[k] = _mm_add_epi16(sum[k], _mm_mullo_epi16(_mm_sub_epi16(_mm_xor_si128(mag, sign), sign), weight));
+            if clamp {
+                mx[k] = _mm_max_epi16(mx[k], p);
+                mn[k] = _mm_min_epi16(mn[k], p);
+            }
+        }
+    }
+    for k in 0..N {
+        // x + ((8 + sum - (sum < 0)) >> 4)
+        let r = _mm_add_epi16(sum[k], _mm_add_epi16(_mm_set1_epi16(8), _mm_srai_epi16::<15>(sum[k])));
+        let mut v = _mm_add_epi16(x[k], _mm_srai_epi16::<4>(r));
+        if clamp {
+            v = _mm_min_epi16(_mm_max_epi16(v, mn[k]), mx[k]);
+        }
+        let Some(o) = out.get_mut(8 * k..).and_then(|o| o.first_chunk_mut::<8>()) else {
+            return false;
+        };
+        store8(v, o);
+    }
+    true
 }

@@ -264,3 +264,54 @@ fn every_level_matches_the_scalar_subpel_filters() {
         }
     }
 }
+
+#[test]
+fn every_level_matches_the_scalar_cdef_filter() {
+    let mut seed = 0x0c0f_fee5u32;
+    let mut next = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        seed
+    };
+    for case in 0..30_000 {
+        let shift = [0, 2, 4][case % 3];
+        let max = (256u32 << shift) - 1;
+        let (w, h) = [(8, 8), (4, 4), (4, 8), (8, 4), (4, 2)][next() as usize % 5];
+        let base = next() % (max + 1);
+        let spread = [2, 16, 200, 8192][next() as usize % 4];
+        let buf: [u16; CDEF_STRIDE * CDEF_STRIDE] = std::array::from_fn(|_| (base + next() % spread).saturating_sub(spread / 2).min(max) as u16);
+        // AV1's taps: 2 rows and columns around the sample at most, weights up to 4.
+        let n = 1 + next() as usize % 12;
+        let taps: Vec<CdefTap> = (0..n)
+            .map(|_| CdefTap {
+                off: (next() % 5) as isize * CDEF_STRIDE as isize + (next() % 5) as isize - 2 * CDEF_STRIDE as isize - 2,
+                weight: 1 + (next() % 4) as i16,
+                strength: ((next() % 16) << shift) as i16,
+                shift: next() % 11,
+            })
+            .collect();
+        let clamp = next() % 2 == 0;
+        let mut want = [0u16; 64];
+        cdef_filter_at(Level::Scalar, &buf, w, h, &taps, clamp, &mut want);
+        for &level in levels() {
+            let mut got = [0u16; 64];
+            cdef_filter_at(level, &buf, w, h, &taps, clamp, &mut got);
+            assert_eq!(got, want, "{level:?} {w}x{h} clamp {clamp} taps {taps:?}");
+        }
+    }
+}
+
+#[test]
+fn cdef_filter_falls_back_when_a_tap_leaves_the_buffer() {
+    let buf: [u16; CDEF_STRIDE * CDEF_STRIDE] = std::array::from_fn(|i| (i * 7 % 50) as u16 + 100);
+    // Three rows below the bottom row of an 8x8 block: past the end of the padded block.
+    let taps = [CdefTap { off: 3 * CDEF_STRIDE as isize, weight: 4, strength: 12, shift: 1 }, CdefTap { off: -1, weight: 2, strength: 12, shift: 1 }];
+    let mut want = [0u16; 64];
+    cdef_filter_at(Level::Scalar, &buf, 8, 8, &taps, true, &mut want);
+    for &level in levels() {
+        let mut got = [0u16; 64];
+        cdef_filter_at(level, &buf, 8, 8, &taps, true, &mut got);
+        assert_eq!(got, want, "{level:?}");
+    }
+}

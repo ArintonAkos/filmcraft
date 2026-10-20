@@ -150,6 +150,47 @@ fn deblock_lines(lines: usize, mut chunk: impl FnMut(usize, usize)) {
     }
 }
 
+/// Row stride of the padded block CDEF filters from: a block of at most 8x8 samples with 2
+/// more on every side.
+pub const CDEF_STRIDE: usize = 12;
+
+/// One CDEF tap (7.15.3): where its sample is (the offset from the filtered sample in the
+/// padded block), its weight, its strength and its damping shift.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CdefTap {
+    pub off: isize,
+    pub weight: i16,
+    pub strength: i16,
+    pub shift: u32,
+}
+
+/// CDEF (7.15.3) of the `w` x `h` block at row 2, column 2 of the padded block `buf`, with
+/// every tap available: `x + Round(sum of weight * constrain(tap - x, strength, shift) / 16)`,
+/// clamped to the range of `x` and its taps when `clamp`. `out` gets the samples row after
+/// row (stride `w`). Samples are at most 12 bits and the weighted strengths of all taps sum
+/// to less than 2^15 (AV1's reach 11520). A tap outside `buf` counts as `x`. The vector
+/// kernels take AV1's 8x8, 8x4, 4x8 and 4x4 blocks (4-wide ones two rows to a vector).
+pub fn cdef_filter(buf: &[u16; CDEF_STRIDE * CDEF_STRIDE], w: usize, h: usize, taps: &[CdefTap], clamp: bool, out: &mut [u16; 64]) {
+    cdef_filter_at(level(), buf, w, h, taps, clamp, out);
+}
+
+/// [`cdef_filter`] on a given level.
+pub fn cdef_filter_at(level: Level, buf: &[u16; CDEF_STRIDE * CDEF_STRIDE], w: usize, h: usize, taps: &[CdefTap], clamp: bool, out: &mut [u16; 64]) {
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    let vector = matches!((w, h), (8, 8) | (8, 4) | (4, 8) | (4, 4));
+    let done = match level {
+        #[cfg(target_arch = "aarch64")]
+        Level::Neon if vector => neon::cdef_filter(buf, w, h, taps, clamp, out),
+        #[cfg(target_arch = "x86_64")]
+        Level::Sse2 if vector => sse2::cdef_filter(buf, w, h, taps, clamp, out),
+        _ => false,
+    };
+    // Scalar, or a vector kernel found a tap outside `buf`.
+    if !done {
+        scalar::cdef_filter(buf, w, h, taps, clamp, out);
+    }
+}
+
 /// One row of the AV1 subpel filter's horizontal pass (7.11.3.4):
 /// `out[j] = Round2(sum of taps[t] * src[j + t], shift)`, for as many `j` as `out` holds and
 /// `src` has 7 more samples for. Samples are at most 12 bits, and the results must fit an i16
