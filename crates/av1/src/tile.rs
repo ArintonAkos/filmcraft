@@ -99,7 +99,9 @@ pub(crate) struct TileDecoder<'a, 'f> {
     pub pred_buf: [Vec<i32>; 2],
     pub mask: Vec<i32>,
     /// Intermediate rows of the sub-pixel filters (up to 2 x 128 + 8 rows of 128 with 2:1 scaled references).
-    pub mc_tmp: Vec<i32>,
+    /// Rows of the horizontal subpel filter before the vertical one: 16 bits hold them at
+    /// every bit depth (see `inter::tests::subpel_intermediates_fit_16_bits`).
+    pub mc_tmp: Vec<i16>,
     intra: Box<IntraScratch>,
     /// Coefficient levels of the current transform block, padded (see TX_PAD).
     levels: Vec<u8>,

@@ -118,3 +118,21 @@ fn wide<const N: usize, const N2: usize, const LOG2: u32>(d: &mut [u16], base: u
         d[out + i * step] = f[i] as u16;
     }
 }
+
+/// One row of the AV1 subpel filter's horizontal pass (7.11.3.4).
+pub(crate) fn subpel_h(src: &[u16], taps: &[i16; 8], out: &mut [i16], shift: u32) {
+    let half = (1 << shift) >> 1;
+    for (o, s) in out.iter_mut().zip(src.windows(8)) {
+        let v: i32 = s.iter().zip(taps).map(|(&p, &t)| p as i32 * t as i32).sum();
+        *o = ((v + half) >> shift) as i16;
+    }
+}
+
+/// One row of the AV1 subpel filter's vertical pass (7.11.3.4).
+pub(crate) fn subpel_v(rows: &[i16], stride: usize, taps: &[i16; 8], out: &mut [i32], shift: u32) {
+    let half = (1 << shift) >> 1;
+    for (j, o) in out.iter_mut().enumerate() {
+        let v: i32 = taps.iter().enumerate().map(|(t, &f)| f as i32 * rows.get(t * stride + j).copied().unwrap_or(0) as i32).sum();
+        *o = (v + half) >> shift;
+    }
+}

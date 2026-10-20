@@ -223,3 +223,44 @@ fn loop_filter_clamps_a_zigzag_at_full_strength() {
         }
     }
 }
+
+#[test]
+fn every_level_matches_the_scalar_subpel_filters() {
+    let mut seed = 0x51ed_270bu32;
+    let mut next = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        seed
+    };
+    // AV1's filter shapes: taps summing to 128 with small negative side lobes.
+    for case in 0..20_000 {
+        let bd = [8, 10, 12][case % 3];
+        let max = (1u32 << bd) - 1;
+        let mut taps = [0i16; 8];
+        for t in &mut taps {
+            *t = (next() % 25) as i16 - 12;
+        }
+        taps[3] = 128 - taps.iter().enumerate().filter(|&(i, _)| i != 3).map(|(_, &t)| t).sum::<i16>();
+        let w = [1, 2, 3, 4, 5, 8, 12, 16, 20, 32, 64, 128][next() as usize % 12];
+        let shift = if bd == 12 { 5 } else { 3 };
+        let src: Vec<u16> = (0..w + 7).map(|_| if next() % 4 == 0 { max as u16 } else { (next() % (max + 1)) as u16 }).collect();
+        let mut want = vec![0i16; w];
+        subpel_h_at(Level::Scalar, &src, &taps, &mut want, shift);
+        for &level in levels() {
+            let mut got = vec![0i16; w];
+            subpel_h_at(level, &src, &taps, &mut got, shift);
+            assert_eq!(got, want, "{level:?} h w {w} bd {bd} taps {taps:?}");
+        }
+        let stride = w + (next() % 3) as usize;
+        let rows: Vec<i16> = (0..7 * stride + w).map(|_| ((next() % 51_000) as i32 - 25_500) as i16).collect();
+        let vshift = [7, 9, 11][next() as usize % 3];
+        let mut want = vec![0i32; w];
+        subpel_v_at(Level::Scalar, &rows, stride, &taps, &mut want, vshift);
+        for &level in levels() {
+            let mut got = vec![0i32; w];
+            subpel_v_at(level, &rows, stride, &taps, &mut got, vshift);
+            assert_eq!(got, want, "{level:?} v w {w} stride {stride} taps {taps:?}");
+        }
+    }
+}

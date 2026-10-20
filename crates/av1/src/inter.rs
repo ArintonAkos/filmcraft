@@ -203,7 +203,7 @@ impl TileDecoder<'_, '_> {
         filters: [u8; 2],
         rnd: (u32, u32, u32),
         pred: &mut [i32],
-        tmp: &mut [i32],
+        tmp: &mut [i16],
     ) {
         let refp = self.ref_plane(ref_idx, plane);
         let (last_x, last_y) = self.ref_plane_dims(ref_idx, plane);
@@ -253,7 +253,7 @@ impl TileDecoder<'_, '_> {
                 for t in 0..8 {
                     s += filt[t] as i32 * row[(bx + t as i32).clamp(0, last_x) as usize] as i32;
                 }
-                tmp[r * w + c] = round2(s, rnd.0);
+                tmp[r * w + c] = round2(s, rnd.0) as i16;
             }
         }
         for r in 0..h {
@@ -263,7 +263,7 @@ impl TileDecoder<'_, '_> {
                 let base = (p >> 10) as usize;
                 let mut s = 0i32;
                 for t in 0..8 {
-                    s += filt[t] as i32 * tmp[(base + t) * w + c];
+                    s += filt[t] as i32 * tmp[(base + t) * w + c] as i32;
                 }
                 pred[r * PRED_STRIDE + c] = round2(s, rnd.1);
             }
@@ -664,49 +664,6 @@ impl TileDecoder<'_, '_> {
 
 const IDENTITY_TAPS: [i16; 8] = [0, 0, 0, 128, 0, 0, 0, 0];
 
-/// Horizontal pass of one row for a block `W` wide: taps outer, columns inner, fixed width so
-/// the row stays in registers.
-#[inline(always)]
-fn hpass<const W: usize>(src: &[u16], hf: &[i16; 8], out: &mut [i32], half: i32, sh: u32) {
-    let mut acc = [half; W];
-    for t in 0..8 {
-        let f = hf[t] as i32;
-        let Some(p) = src.get(t..).and_then(|s| s.first_chunk::<W>()) else {
-            return;
-        };
-        for j in 0..W {
-            acc[j] += f * p[j] as i32;
-        }
-    }
-    let Some(o) = out.first_chunk_mut::<W>() else {
-        return;
-    };
-    for j in 0..W {
-        o[j] = acc[j] >> sh;
-    }
-}
-
-/// Vertical pass of one output row from 8 intermediate rows (`rows`, stride `W`).
-#[inline(always)]
-fn vpass<const W: usize>(rows: &[i32], vf: &[i16; 8], out: &mut [i32], half: i32, sh: u32) {
-    let mut acc = [half; W];
-    for t in 0..8 {
-        let f = vf[t] as i32;
-        let Some(p) = rows.get(t * W..).and_then(|s| s.first_chunk::<W>()) else {
-            return;
-        };
-        for j in 0..W {
-            acc[j] += f * p[j];
-        }
-    }
-    let Some(o) = out.first_chunk_mut::<W>() else {
-        return;
-    };
-    for j in 0..W {
-        o[j] = acc[j] >> sh;
-    }
-}
-
 /// Block inter prediction without reference scaling: every column / row uses the same filter
 /// phase, so the filters run over whole rows (bit-identical to the per-sample process).
 #[allow(clippy::too_many_arguments)]
@@ -722,7 +679,7 @@ fn mc_unscaled(
     vf: &[i16; 8],
     rnd: (u32, u32, u32),
     pred: &mut [i32],
-    tmp: &mut [i32],
+    tmp: &mut [i16],
 ) {
     let x0 = (x >> 10) - 3;
     let y0 = (y >> 10) - 3;
@@ -732,79 +689,66 @@ fn mc_unscaled(
     let (r_lo, r_hi) = if v_copy { (3, 3 + h) } else { (0, h + 7) };
     let inside = x0 >= 0 && x0 + w as i32 + 7 <= last_x + 1;
     let mut edge = [0u16; 128 + 8];
-    let mut acc = [0i32; 128];
     let (r0, r1) = (rnd.0, rnd.1);
-    let (half0, half1) = (1i32 << (r0 - 1), 1i32 << (r1 - 1));
+    let half1 = 1i32 << (r1 - 1);
     for r in r_lo..r_hi {
         let ry = (y0 + r as i32).clamp(0, last_y) as usize;
         let row = refp.row(ry);
         let src: &[u16] = if inside {
             &row[x0 as usize..x0 as usize + w + 7]
         } else {
-            for (k, e) in edge[..w + 7].iter_mut().enumerate() {
-                *e = row[(x0 + k as i32).clamp(0, last_x) as usize];
+            // Sample k is row[clamp(x0 + k, 0, last_x)]: the left edge sample repeated, the
+            // samples inside, the right edge sample repeated.
+            let n = w + 7;
+            let lo = (-x0).clamp(0, n as i32) as usize;
+            let hi = (last_x + 1 - x0).clamp(lo as i32, n as i32) as usize;
+            edge[..lo].fill(row[0]);
+            if lo < hi {
+                edge[lo..hi].copy_from_slice(&row[(x0 + lo as i32) as usize..(x0 + hi as i32) as usize]);
             }
-            &edge[..w + 7]
+            edge[hi..n].fill(row[last_x as usize]);
+            &edge[..n]
         };
         let out = &mut tmp[r * w..r * w + w];
         if h_copy {
             // Round2(128 * v, InterRound0) is exact.
             for (o, &v) in out.iter_mut().zip(&src[3..3 + w]) {
-                *o = (v as i32) << (7 - r0);
+                *o = ((v as i32) << (7 - r0)) as i16;
             }
         } else {
-            match w {
-                2 => hpass::<2>(src, hf, out, half0, r0),
-                4 => hpass::<4>(src, hf, out, half0, r0),
-                8 => hpass::<8>(src, hf, out, half0, r0),
-                16 => hpass::<16>(src, hf, out, half0, r0),
-                32 => hpass::<32>(src, hf, out, half0, r0),
-                64 => hpass::<64>(src, hf, out, half0, r0),
-                _ => {
-                    let acc = &mut acc[..w];
-                    acc.fill(0);
-                    for t in 0..8 {
-                        let f = hf[t] as i32;
-                        for (a, &v) in acc.iter_mut().zip(&src[t..t + w]) {
-                            *a += f * v as i32;
-                        }
-                    }
-                    for (o, &a) in out.iter_mut().zip(acc.iter()) {
-                        *o = (a + half0) >> r0;
-                    }
-                }
-            }
+            filmcraft_simd::subpel_h(src, hf, out, r0);
         }
     }
     for r in 0..h {
         let out = &mut pred[r * PRED_STRIDE..r * PRED_STRIDE + w];
         if v_copy {
             for (o, &v) in out.iter_mut().zip(&tmp[(r + 3) * w..(r + 4) * w]) {
-                *o = (128 * v + half1) >> r1;
+                *o = (128 * v as i32 + half1) >> r1;
             }
         } else {
-            let rows = &tmp[r * w..(r + 8) * w];
-            match w {
-                2 => vpass::<2>(rows, vf, out, half1, r1),
-                4 => vpass::<4>(rows, vf, out, half1, r1),
-                8 => vpass::<8>(rows, vf, out, half1, r1),
-                16 => vpass::<16>(rows, vf, out, half1, r1),
-                32 => vpass::<32>(rows, vf, out, half1, r1),
-                64 => vpass::<64>(rows, vf, out, half1, r1),
-                _ => {
-                    let acc = &mut acc[..w];
-                    acc.fill(0);
-                    for t in 0..8 {
-                        let f = vf[t] as i32;
-                        for (a, &v) in acc.iter_mut().zip(&tmp[(r + t) * w..(r + t + 1) * w]) {
-                            *a += f * v;
-                        }
-                    }
-                    for (o, &a) in out.iter_mut().zip(acc.iter()) {
-                        *o = (a + half1) >> r1;
-                    }
-                }
+            filmcraft_simd::subpel_v(&tmp[r * w..(r + 8) * w], w, vf, out, r1);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The horizontal subpel pass, rounded by InterRound0, stays within 16 bits for every
+    /// filter phase at every bit depth, so the intermediate rows can be i16.
+    #[test]
+    fn subpel_intermediates_fit_16_bits() {
+        for bd in [8, 10, 12] {
+            let (r0, _, _) = rounding(false, bd);
+            let max = (1i32 << bd) - 1;
+            for taps in SUBPEL_FILTERS.iter().flatten() {
+                let hi: i32 = taps.iter().map(|&t| (t as i32).max(0) * max).sum();
+                let lo: i32 = taps.iter().map(|&t| (t as i32).min(0) * max).sum();
+                let half = 1 << (r0 - 1);
+                assert!((hi + half) >> r0 <= i16::MAX as i32 && (lo + half) >> r0 >= i16::MIN as i32, "bd {bd} taps {taps:?}");
             }
+            assert!(max << (7 - r0) <= i16::MAX as i32);
         }
     }
 }

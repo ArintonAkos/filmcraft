@@ -194,3 +194,123 @@ fn transpose(r: [V; 8]) -> [V; 8] {
     let b = [b(0, 2, false), b(0, 2, true), b(1, 3, false), b(1, 3, true), b(4, 6, false), b(4, 6, true), b(5, 7, false), b(5, 7, true)];
     std::array::from_fn(|c| if c % 2 == 0 { _mm_unpacklo_epi64(b[c / 2], b[c / 2 + 4]) } else { _mm_unpackhi_epi64(b[c / 2], b[c / 2 + 4]) })
 }
+
+// ---------------------------------------------------------------------------------------------
+// Subpel filters (motion compensation)
+
+/// Taps `2k` and `2k + 1` as the i16 pair `pmaddwd` multiplies interleaved samples by.
+#[target_feature(enable = "sse2")]
+fn tap_pairs(taps: &[i16; 8]) -> [V; 4] {
+    std::array::from_fn(|k| _mm_set1_epi32(((taps[2 * k + 1] as u16 as i32) << 16) | taps[2 * k] as u16 as i32))
+}
+
+/// See [`crate::subpel_h`]; `src` holds `out.len() + 7` samples.
+pub(crate) fn subpel_h(src: &[u16], taps: &[i16; 8], out: &mut [i16], shift: u32) {
+    // SAFETY: SSE2 is part of the x86_64 baseline: every core this build runs on has it.
+    unsafe { subpel_h_sse2(src, taps, out, shift) }
+}
+
+/// 8 (then 4) columns at a time: the samples under taps 2k and 2k + 1 interleaved, so one
+/// `pmaddwd` applies both taps and sums in 32 bits.
+#[target_feature(enable = "sse2")]
+fn subpel_h_sse2(src: &[u16], taps: &[i16; 8], out: &mut [i16], shift: u32) {
+    let c = tap_pairs(taps);
+    let half = _mm_set1_epi32((1 << shift) >> 1);
+    let cnt = _mm_cvtsi32_si128(shift as i32);
+    let n = out.len();
+    let mut j = 0;
+    while j + 8 <= n {
+        let (mut lo, mut hi) = (half, half);
+        for (k, &ck) in c.iter().enumerate() {
+            let at = |o: usize| src.get(j + 2 * k + o..).and_then(|s| s.first_chunk::<8>());
+            let (Some(a), Some(b)) = (at(0), at(1)) else {
+                return;
+            };
+            let (a, b) = (load8(a), load8(b));
+            lo = _mm_add_epi32(lo, _mm_madd_epi16(_mm_unpacklo_epi16(a, b), ck));
+            hi = _mm_add_epi32(hi, _mm_madd_epi16(_mm_unpackhi_epi16(a, b), ck));
+        }
+        if let Some(o) = out.get_mut(j..).and_then(|o| o.first_chunk_mut::<8>()) {
+            let r = _mm_packs_epi32(_mm_sra_epi32(lo, cnt), _mm_sra_epi32(hi, cnt));
+            // SAFETY: `o` is 8 i16, the 16 bytes `_mm_storeu_si128` writes (unaligned store).
+            unsafe { _mm_storeu_si128(o.as_mut_ptr().cast(), r) };
+        }
+        j += 8;
+    }
+    if j + 4 <= n {
+        let mut lo = half;
+        for (k, &ck) in c.iter().enumerate() {
+            let at = |o: usize| src.get(j + 2 * k + o..).and_then(|s| s.first_chunk::<4>());
+            let (Some(a), Some(b)) = (at(0), at(1)) else {
+                return;
+            };
+            lo = _mm_add_epi32(lo, _mm_madd_epi16(_mm_unpacklo_epi16(load4(a), load4(b)), ck));
+        }
+        if let Some(o) = out.get_mut(j..).and_then(|o| o.first_chunk_mut::<4>()) {
+            let r = _mm_packs_epi32(_mm_sra_epi32(lo, cnt), lo);
+            // SAFETY: `o` is 4 i16, the 8 bytes `_mm_storel_epi64` writes (unaligned store).
+            unsafe { _mm_storel_epi64(o.as_mut_ptr().cast(), r) };
+        }
+        j += 4;
+    }
+    if let (Some(s), Some(o)) = (src.get(j..), out.get_mut(j..)) {
+        crate::scalar::subpel_h(s, taps, o, shift);
+    }
+}
+
+/// See [`crate::subpel_v`]; `rows` holds 8 rows of `stride >= out.len()`.
+pub(crate) fn subpel_v(rows: &[i16], stride: usize, taps: &[i16; 8], out: &mut [i32], shift: u32) {
+    // SAFETY: SSE2 is part of the x86_64 baseline: every core this build runs on has it.
+    unsafe { subpel_v_sse2(rows, stride, taps, out, shift) }
+}
+
+#[target_feature(enable = "sse2")]
+fn subpel_v_sse2(rows: &[i16], stride: usize, taps: &[i16; 8], out: &mut [i32], shift: u32) {
+    let c = tap_pairs(taps);
+    let half = _mm_set1_epi32((1 << shift) >> 1);
+    let cnt = _mm_cvtsi32_si128(shift as i32);
+    let n = out.len();
+    let mut j = 0;
+    while j + 4 <= n {
+        let wide = j + 8 <= n;
+        let (mut lo, mut hi) = (half, half);
+        for (k, &ck) in c.iter().enumerate() {
+            let at = |t: usize| rows.get(t * stride + j..);
+            let (Some(a), Some(b)) = (at(2 * k), at(2 * k + 1)) else {
+                return;
+            };
+            let (a, b) = match (a.first_chunk::<8>().filter(|_| wide), b.first_chunk::<8>().filter(|_| wide), a.first_chunk::<4>(), b.first_chunk::<4>()) {
+                (Some(a), Some(b), _, _) => (load8_i16(a), load8_i16(b)),
+                (_, _, Some(a), Some(b)) => (load4_i16(a), load4_i16(b)),
+                _ => return,
+            };
+            lo = _mm_add_epi32(lo, _mm_madd_epi16(_mm_unpacklo_epi16(a, b), ck));
+            hi = _mm_add_epi32(hi, _mm_madd_epi16(_mm_unpackhi_epi16(a, b), ck));
+        }
+        let Some(o) = out.get_mut(j..).and_then(|o| o.first_chunk_mut::<4>()) else {
+            return;
+        };
+        // SAFETY: `o` is 4 i32, the 16 bytes `_mm_storeu_si128` writes (unaligned store).
+        unsafe { _mm_storeu_si128(o.as_mut_ptr().cast(), _mm_sra_epi32(lo, cnt)) };
+        if wide && let Some(o) = out.get_mut(j + 4..).and_then(|o| o.first_chunk_mut::<4>()) {
+            // SAFETY: as above, the next 4 i32.
+            unsafe { _mm_storeu_si128(o.as_mut_ptr().cast(), _mm_sra_epi32(hi, cnt)) };
+        }
+        j += if wide { 8 } else { 4 };
+    }
+    if let (Some(r), Some(o)) = (rows.get(j..), out.get_mut(j..)) {
+        crate::scalar::subpel_v(r, stride, taps, o, shift);
+    }
+}
+
+#[target_feature(enable = "sse2")]
+fn load8_i16(s: &[i16; 8]) -> V {
+    // SAFETY: `s` is 8 i16, the 16 bytes `_mm_loadu_si128` reads (unaligned load).
+    unsafe { _mm_loadu_si128(s.as_ptr().cast()) }
+}
+
+#[target_feature(enable = "sse2")]
+fn load4_i16(s: &[i16; 4]) -> V {
+    // SAFETY: `s` is 4 i16, the 8 bytes `_mm_loadl_epi64` reads (unaligned load).
+    unsafe { _mm_loadl_epi64(s.as_ptr().cast()) }
+}

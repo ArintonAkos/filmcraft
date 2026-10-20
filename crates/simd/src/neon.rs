@@ -192,3 +192,108 @@ fn transpose(r: [V; 8]) -> [V; 8] {
     let u = [u(0, 2, false), u(1, 3, false), u(0, 2, true), u(1, 3, true), u(4, 6, false), u(5, 7, false), u(4, 6, true), u(5, 7, true)];
     std::array::from_fn(|c| if c < 4 { s(vtrn1q_s64(l(u[c]), l(u[c + 4]))) } else { s(vtrn2q_s64(l(u[c - 4]), l(u[c]))) })
 }
+
+// ---------------------------------------------------------------------------------------------
+// Subpel filters (motion compensation)
+
+/// See [`crate::subpel_h`]; `src` holds `out.len() + 7` samples.
+pub(crate) fn subpel_h(src: &[u16], taps: &[i16; 8], out: &mut [i16], shift: u32) {
+    // SAFETY: NEON is part of the aarch64 baseline: every core this build runs on has it.
+    unsafe { subpel_h_neon(src, taps, out, shift) }
+}
+
+/// 8 (then 4) columns at a time: each tap multiplies the source shifted by it and accumulates
+/// in 32 bits.
+#[target_feature(enable = "neon")]
+fn subpel_h_neon(src: &[u16], taps: &[i16; 8], out: &mut [i16], shift: u32) {
+    let sh = vdupq_n_s32(-(shift as i32));
+    let n = out.len();
+    let mut j = 0;
+    while j + 8 <= n {
+        let (mut lo, mut hi) = (vdupq_n_s32(0), vdupq_n_s32(0));
+        for (t, &f) in taps.iter().enumerate() {
+            let Some(s) = src.get(j + t..).and_then(|s| s.first_chunk::<8>()) else {
+                return;
+            };
+            // SAFETY: `s` is 8 u16, the 16 bytes `vld1q_u16` reads.
+            let v = vreinterpretq_s16_u16(unsafe { vld1q_u16(s.as_ptr()) });
+            lo = vmlal_n_s16(lo, vget_low_s16(v), f);
+            hi = vmlal_high_n_s16(hi, v, f);
+        }
+        let r = vcombine_s16(vmovn_s32(vrshlq_s32(lo, sh)), vmovn_s32(vrshlq_s32(hi, sh)));
+        if let Some(o) = out.get_mut(j..).and_then(|o| o.first_chunk_mut::<8>()) {
+            // SAFETY: `o` is 8 i16, the 16 bytes `vst1q_s16` writes.
+            unsafe { vst1q_s16(o.as_mut_ptr(), r) };
+        }
+        j += 8;
+    }
+    if j + 4 <= n {
+        let mut lo = vdupq_n_s32(0);
+        for (t, &f) in taps.iter().enumerate() {
+            let Some(s) = src.get(j + t..).and_then(|s| s.first_chunk::<4>()) else {
+                return;
+            };
+            // SAFETY: `s` is 4 u16, the 8 bytes `vld1_u16` reads.
+            lo = vmlal_n_s16(lo, vreinterpret_s16_u16(unsafe { vld1_u16(s.as_ptr()) }), f);
+        }
+        if let Some(o) = out.get_mut(j..).and_then(|o| o.first_chunk_mut::<4>()) {
+            // SAFETY: `o` is 4 i16, the 8 bytes `vst1_s16` writes.
+            unsafe { vst1_s16(o.as_mut_ptr(), vmovn_s32(vrshlq_s32(lo, sh))) };
+        }
+        j += 4;
+    }
+    if let (Some(s), Some(o)) = (src.get(j..), out.get_mut(j..)) {
+        crate::scalar::subpel_h(s, taps, o, shift);
+    }
+}
+
+/// See [`crate::subpel_v`]; `rows` holds 8 rows of `stride >= out.len()`.
+pub(crate) fn subpel_v(rows: &[i16], stride: usize, taps: &[i16; 8], out: &mut [i32], shift: u32) {
+    // SAFETY: NEON is part of the aarch64 baseline: every core this build runs on has it.
+    unsafe { subpel_v_neon(rows, stride, taps, out, shift) }
+}
+
+#[target_feature(enable = "neon")]
+fn subpel_v_neon(rows: &[i16], stride: usize, taps: &[i16; 8], out: &mut [i32], shift: u32) {
+    let sh = vdupq_n_s32(-(shift as i32));
+    let n = out.len();
+    let mut j = 0;
+    while j + 8 <= n {
+        let (mut lo, mut hi) = (vdupq_n_s32(0), vdupq_n_s32(0));
+        for (t, &f) in taps.iter().enumerate() {
+            let Some(s) = rows.get(t * stride + j..).and_then(|s| s.first_chunk::<8>()) else {
+                return;
+            };
+            // SAFETY: `s` is 8 i16, the 16 bytes `vld1q_s16` reads.
+            let v = unsafe { vld1q_s16(s.as_ptr()) };
+            lo = vmlal_n_s16(lo, vget_low_s16(v), f);
+            hi = vmlal_high_n_s16(hi, v, f);
+        }
+        if let Some(o) = out.get_mut(j..).and_then(|o| o.first_chunk_mut::<8>()) {
+            // SAFETY: `o` is 8 i32; the stores write its first and last 4 (16 bytes each).
+            unsafe {
+                vst1q_s32(o.as_mut_ptr(), vrshlq_s32(lo, sh));
+                vst1q_s32(o.as_mut_ptr().add(4), vrshlq_s32(hi, sh));
+            }
+        }
+        j += 8;
+    }
+    if j + 4 <= n {
+        let mut lo = vdupq_n_s32(0);
+        for (t, &f) in taps.iter().enumerate() {
+            let Some(s) = rows.get(t * stride + j..).and_then(|s| s.first_chunk::<4>()) else {
+                return;
+            };
+            // SAFETY: `s` is 4 i16, the 8 bytes `vld1_s16` reads.
+            lo = vmlal_n_s16(lo, unsafe { vld1_s16(s.as_ptr()) }, f);
+        }
+        if let Some(o) = out.get_mut(j..).and_then(|o| o.first_chunk_mut::<4>()) {
+            // SAFETY: `o` is 4 i32, the 16 bytes `vst1q_s32` writes.
+            unsafe { vst1q_s32(o.as_mut_ptr(), vrshlq_s32(lo, sh)) };
+        }
+        j += 4;
+    }
+    if let (Some(r), Some(o)) = (rows.get(j..), out.get_mut(j..)) {
+        crate::scalar::subpel_v(r, stride, taps, o, shift);
+    }
+}

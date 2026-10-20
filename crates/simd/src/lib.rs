@@ -150,6 +150,55 @@ fn deblock_lines(lines: usize, mut chunk: impl FnMut(usize, usize)) {
     }
 }
 
+/// One row of the AV1 subpel filter's horizontal pass (7.11.3.4):
+/// `out[j] = Round2(sum of taps[t] * src[j + t], shift)`, for as many `j` as `out` holds and
+/// `src` has 7 more samples for. Samples are at most 12 bits, and the results must fit an i16
+/// (true of AV1's filters after InterRound0).
+pub fn subpel_h(src: &[u16], taps: &[i16; 8], out: &mut [i16], shift: u32) {
+    subpel_h_at(level(), src, taps, out, shift);
+}
+
+/// [`subpel_h`] on a given level.
+pub fn subpel_h_at(level: Level, src: &[u16], taps: &[i16; 8], out: &mut [i16], shift: u32) {
+    // The kernels may then rely on `src` having `out.len() + 7` samples.
+    let n = out.len().min(src.len().saturating_sub(7));
+    let (Some(src), Some(out)) = (src.get(..(n + 7).min(src.len())), out.get_mut(..n)) else {
+        return;
+    };
+    match level {
+        #[cfg(target_arch = "aarch64")]
+        Level::Neon => neon::subpel_h(src, taps, out, shift),
+        #[cfg(target_arch = "x86_64")]
+        Level::Sse2 => sse2::subpel_h(src, taps, out, shift),
+        _ => scalar::subpel_h(src, taps, out, shift),
+    }
+}
+
+/// One row of the AV1 subpel filter's vertical pass (7.11.3.4):
+/// `out[j] = Round2(sum of taps[t] * rows[t * stride + j], shift)`; rows past the end of `rows`
+/// count as zero.
+pub fn subpel_v(rows: &[i16], stride: usize, taps: &[i16; 8], out: &mut [i32], shift: u32) {
+    subpel_v_at(level(), rows, stride, taps, out, shift);
+}
+
+/// Whether `rows` holds 8 rows of `n` samples `stride` apart: the vector kernels need them all
+/// (the scalar one reads missing rows as zero).
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+fn whole_rows(rows: &[i16], stride: usize, n: usize) -> bool {
+    n <= stride && stride.checked_mul(7).and_then(|s| s.checked_add(n)).is_some_and(|end| end <= rows.len())
+}
+
+/// [`subpel_v`] on a given level.
+pub fn subpel_v_at(level: Level, rows: &[i16], stride: usize, taps: &[i16; 8], out: &mut [i32], shift: u32) {
+    match level {
+        #[cfg(target_arch = "aarch64")]
+        Level::Neon if whole_rows(rows, stride, out.len()) => neon::subpel_v(rows, stride, taps, out, shift),
+        #[cfg(target_arch = "x86_64")]
+        Level::Sse2 if whole_rows(rows, stride, out.len()) => sse2::subpel_v(rows, stride, taps, out, shift),
+        _ => scalar::subpel_v(rows, stride, taps, out, shift),
+    }
+}
+
 /// Weight of each line sum's square in its direction's cost (7.15.2), lane by lane: 840 / n for
 /// a line of n samples (`DIV_TABLE`), zero past the direction's last line.
 const fn cdef_cost_weights() -> [[i32; 16]; 8] {
