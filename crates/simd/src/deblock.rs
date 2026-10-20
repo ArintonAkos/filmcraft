@@ -67,17 +67,17 @@ impl LfThresh {
     }
 }
 
-/// The vector kernels over 8 lanes of i16, of which the first 4 carry the 4 lines of an edge.
-/// Samples (at most 12 bits) fit an i16; the wide filters' weighted sums (at most
-/// 16 * 4095 + 8) fit 16 bits unsigned, so they add with wrapping and shift right logically.
+/// The vector kernels over 8 lanes of i16, one line across the edge per lane (8 lines, or 4 in
+/// the first lanes). Samples (at most 12 bits) fit an i16; the wide filters' weighted sums (at
+/// most 16 * 4095 + 8) fit 16 bits unsigned, so they add with wrapping and shift right
+/// logically.
 ///
 /// The expanding module provides the type `V`, the target feature `$feature`, and these
 /// functions, all compiled with that feature: `splat`, `add`, `sub` (wrapping), `abd` (absolute
 /// difference of non-negative lanes), `gt` (all ones where a > b), `and`, `or`, `andnot`
 /// (!a & b), `sel` (m ? a : b), `min`, `max`, `sra::<N>`, `srl::<N>`, `any` (a lane set),
 /// `lanes4` (the first four lanes set), `load4`/`store4` (4 samples into the first lanes),
-/// `load8`/`store8`, and `transpose`/`untranspose` (4 rows of 8 samples to 8 columns in the
-/// first four lanes, and back).
+/// `load8`/`store8`, and `transpose` (8 rows of 8 samples to 8 columns: its own inverse).
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 macro_rules! deblock_kernels {
     ($feature:literal) => {
@@ -88,53 +88,60 @@ macro_rules! deblock_kernels {
             base.checked_add(k.checked_mul(step)?)?.checked_sub(step.checked_mul(8)?)
         }
 
-        /// 4 lines across a horizontal edge: q0 of the first at `d[base]`, the next 3 after it,
-        /// `stride` between rows. `false` (nothing changed) when the samples it reads aren't
-        /// all in `d`.
+        /// `n` (4 or 8) lines across a horizontal edge: q0 of the first at `d[base]`, the
+        /// others after it, `stride` between rows. `false` (nothing changed) when the samples
+        /// it reads aren't all in `d`.
         #[target_feature(enable = $feature)]
-        fn horizontal(d: &mut [u16], base: usize, stride: usize, size: LfSize, t: &LfThresh) -> bool {
+        fn horizontal(d: &mut [u16], base: usize, stride: usize, n: usize, size: LfSize, t: &LfThresh) -> bool {
             let (r, w) = (size.reach(), size.changes());
             let mut x = [splat(0); 16];
             for k in 8 - r..8 + r {
-                let Some(row) = tap(base, k, stride).and_then(|i| d.get(i..)).and_then(|s| s.first_chunk::<4>()) else {
+                let Some(row) = tap(base, k, stride).and_then(|i| d.get(i..i.checked_add(n)?)) else {
                     return false;
                 };
-                x[k] = load4(row);
+                x[k] = match (row.first_chunk::<8>(), row.first_chunk::<4>()) {
+                    (Some(row), _) => load8(row),
+                    (None, Some(row)) => load4(row),
+                    _ => return false,
+                };
             }
-            filter(&mut x, size, t);
+            filter(&mut x, size, t, if n == 8 { splat(-1) } else { lanes4() });
             for k in 8 - w..8 + w {
-                if let Some(row) = tap(base, k, stride).and_then(|i| d.get_mut(i..)).and_then(|s| s.first_chunk_mut::<4>()) {
+                let mut row = tap(base, k, stride).and_then(|i| d.get_mut(i..i.checked_add(n)?));
+                if let Some(row) = row.as_deref_mut().and_then(|s| s.first_chunk_mut::<8>()) {
+                    store8(x[k], row);
+                } else if let Some(row) = row.and_then(|s| s.first_chunk_mut::<4>()) {
                     store4(x[k], row);
                 }
             }
             true
         }
 
-        /// 4 lines across a vertical edge: q0 of the first at `d[base]`, the next 3 one
-        /// `stride` below each other. Reads and writes 8 samples per line (16 for the 16-wide
-        /// filter) centred on the edge; `false` (nothing changed) when they aren't all in `d`.
+        /// `n` (4 or 8) lines across a vertical edge: q0 of the first at `d[base]`, the others
+        /// one `stride` below each other. Reads and writes 8 samples per line (16 for the
+        /// 16-wide filter) centred on the edge; `false` (nothing changed) when they aren't all
+        /// in `d`.
         #[target_feature(enable = $feature)]
-        fn vertical(d: &mut [u16], base: usize, stride: usize, size: LfSize, t: &LfThresh) -> bool {
+        fn vertical(d: &mut [u16], base: usize, stride: usize, n: usize, size: LfSize, t: &LfThresh) -> bool {
             // The first tap of each 8-sample run the filter needs.
             let runs: &[usize] = if size == LfSize::Sixteen { &[0, 8] } else { &[4] };
             let row_at = |i: usize, k: usize| tap(base, k, 1)?.checked_add(i.checked_mul(stride)?);
             let mut x = [splat(0); 16];
             for &k in runs {
-                let mut rows = [splat(0); 4];
-                for (i, v) in rows.iter_mut().enumerate() {
+                let mut rows = [splat(0); 8];
+                for (i, v) in rows[..n].iter_mut().enumerate() {
                     let Some(s) = row_at(i, k).and_then(|j| d.get(j..)).and_then(|s| s.first_chunk::<8>()) else {
                         return false;
                     };
                     *v = load8(s);
                 }
-                let cols = transpose(rows);
-                x[k..k + 8].copy_from_slice(&cols);
+                x[k..k + 8].copy_from_slice(&transpose(rows));
             }
-            filter(&mut x, size, t);
+            filter(&mut x, size, t, if n == 8 { splat(-1) } else { lanes4() });
             for &k in runs {
                 let mut cols = [splat(0); 8];
                 cols.copy_from_slice(&x[k..k + 8]);
-                for (i, v) in untranspose(cols).into_iter().enumerate() {
+                for (i, v) in transpose(cols).into_iter().take(n).enumerate() {
                     if let Some(s) = row_at(i, k).and_then(|j| d.get_mut(j..)).and_then(|s| s.first_chunk_mut::<8>()) {
                         store8(v, s);
                     }
@@ -148,10 +155,11 @@ macro_rules! deblock_kernels {
             max(min(v, hi), lo)
         }
 
-        /// The sample filter (7.14.6) on taps `x[k]` at offset `k - 8` from q0, one line per lane.
-        /// Every lane runs every filter and keeps the result its masks pick.
+        /// The sample filter (7.14.6) on taps `x[k]` at offset `k - 8` from q0, one line per lane
+        /// (the lanes set in `lines`). Every lane runs every filter and keeps the result its
+        /// masks pick.
         #[target_feature(enable = $feature)]
-        fn filter(x: &mut [V; 16], size: LfSize, t: &LfThresh) {
+        fn filter(x: &mut [V; 16], size: LfSize, t: &LfThresh, lines: V) {
             let (lim, tf) = (splat(t.limit), splat(t.flat));
             let [p3, p2, p1, p0, q0, q1, q2, q3] = [x[4], x[5], x[6], x[7], x[8], x[9], x[10], x[11]];
             // filter mask (7.14.6.2)
@@ -167,7 +175,7 @@ macro_rules! deblock_kernels {
                 }
                 flat = andnot(rough, splat(-1));
             }
-            let on = andnot(fail, lanes4());
+            let on = andnot(fail, lines);
             if !any(on) {
                 return;
             }

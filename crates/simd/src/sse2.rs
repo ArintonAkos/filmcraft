@@ -87,18 +87,18 @@ fn cdef_direction_sse2(rows: &[&[u16; 8]; 8], shift: u32) -> (usize, i32) {
 /// 8 lanes of i16; the deblocking kernels use the first four.
 type V = __m128i;
 
-/// 4 lines across a horizontal edge (see [`crate::deblock_horizontal`]); `false` when the
-/// samples aren't all in `d`.
-pub(crate) fn deblock_horizontal(d: &mut [u16], base: usize, stride: usize, size: LfSize, t: &LfThresh) -> bool {
+/// `n` (4 or 8) lines across a horizontal edge (see [`crate::deblock_horizontal`]); `false`
+/// when the samples aren't all in `d`.
+pub(crate) fn deblock_horizontal(d: &mut [u16], base: usize, stride: usize, n: usize, size: LfSize, t: &LfThresh) -> bool {
     // SAFETY: SSE2 is part of the x86_64 baseline: every core this build runs on has it.
-    unsafe { horizontal(d, base, stride, size, t) }
+    unsafe { horizontal(d, base, stride, n, size, t) }
 }
 
-/// 4 lines across a vertical edge (see [`crate::deblock_vertical`]); `false` when the samples
-/// aren't all in `d`.
-pub(crate) fn deblock_vertical(d: &mut [u16], base: usize, stride: usize, size: LfSize, t: &LfThresh) -> bool {
+/// `n` (4 or 8) lines across a vertical edge (see [`crate::deblock_vertical`]); `false` when
+/// the samples aren't all in `d`.
+pub(crate) fn deblock_vertical(d: &mut [u16], base: usize, stride: usize, n: usize, size: LfSize, t: &LfThresh) -> bool {
     // SAFETY: SSE2 is part of the x86_64 baseline: every core this build runs on has it.
-    unsafe { vertical(d, base, stride, size, t) }
+    unsafe { vertical(d, base, stride, n, size, t) }
 }
 
 crate::deblock::deblock_kernels!("sse2");
@@ -184,26 +184,13 @@ fn store8(v: V, s: &mut [u16; 8]) {
     // SAFETY: `s` is 8 u16, the 16 bytes `_mm_storeu_si128` writes (unaligned store).
     unsafe { _mm_storeu_si128(s.as_mut_ptr().cast(), v) }
 }
-/// 4 rows of 8 to 8 columns (in the first four lanes; the others hold the next column).
+/// 8 rows of 8 to 8 columns of 8 (and back: it is its own inverse).
 #[target_feature(enable = "sse2")]
-fn transpose([r0, r1, r2, r3]: [V; 4]) -> [V; 8] {
-    let (a, b) = (_mm_unpacklo_epi16(r0, r1), _mm_unpackhi_epi16(r0, r1));
-    let (c, d) = (_mm_unpacklo_epi16(r2, r3), _mm_unpackhi_epi16(r2, r3));
-    // c01: columns 0 and 1, c23, c45, c67.
-    let (c01, c23) = (_mm_unpacklo_epi32(a, c), _mm_unpackhi_epi32(a, c));
-    let (c45, c67) = (_mm_unpacklo_epi32(b, d), _mm_unpackhi_epi32(b, d));
-    let up = |c: V| _mm_unpackhi_epi64(c, c);
-    [c01, up(c01), c23, up(c23), c45, up(c45), c67, up(c67)]
-}
-/// 8 columns (in the first four lanes) back to 4 rows of 8.
-#[target_feature(enable = "sse2")]
-fn untranspose(c: [V; 8]) -> [V; 4] {
-    let rows = |a: V, b: V| {
-        // a: columns k, k + 1 of rows 0..4; b: columns k + 2, k + 3.
-        let (x, y) = (_mm_unpacklo_epi16(a, b), _mm_unpackhi_epi16(a, b));
-        (_mm_unpacklo_epi16(x, y), _mm_unpackhi_epi16(x, y))
-    };
-    let (r01l, r23l) = rows(_mm_unpacklo_epi64(c[0], c[1]), _mm_unpacklo_epi64(c[2], c[3]));
-    let (r01h, r23h) = rows(_mm_unpacklo_epi64(c[4], c[5]), _mm_unpacklo_epi64(c[6], c[7]));
-    [_mm_unpacklo_epi64(r01l, r01h), _mm_unpackhi_epi64(r01l, r01h), _mm_unpacklo_epi64(r23l, r23h), _mm_unpackhi_epi64(r23l, r23h)]
+fn transpose(r: [V; 8]) -> [V; 8] {
+    // Pairs of rows interleaved by 16, then 32, then 64 bits.
+    let a: [V; 8] = std::array::from_fn(|i| if i % 2 == 0 { _mm_unpacklo_epi16(r[i], r[i + 1]) } else { _mm_unpackhi_epi16(r[i - 1], r[i]) });
+    // b[0..4]: columns (0, 1), (2, 3), (4, 5), (6, 7) of rows 0..4; b[4..8]: of rows 4..8.
+    let b = |x: usize, y: usize, hi: bool| if hi { _mm_unpackhi_epi32(a[x], a[y]) } else { _mm_unpacklo_epi32(a[x], a[y]) };
+    let b = [b(0, 2, false), b(0, 2, true), b(1, 3, false), b(1, 3, true), b(4, 6, false), b(4, 6, true), b(5, 7, false), b(5, 7, true)];
+    std::array::from_fn(|c| if c % 2 == 0 { _mm_unpacklo_epi64(b[c / 2], b[c / 2 + 4]) } else { _mm_unpackhi_epi64(b[c / 2], b[c / 2 + 4]) })
 }

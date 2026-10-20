@@ -83,18 +83,18 @@ fn cdef_direction_neon(rows: &[&[u16; 8]; 8], shift: u32) -> (usize, i32) {
 /// 8 lanes of i16; the deblocking kernels use the first four.
 type V = int16x8_t;
 
-/// 4 lines across a horizontal edge (see [`crate::deblock_horizontal`]); `false` when the
-/// samples aren't all in `d`.
-pub(crate) fn deblock_horizontal(d: &mut [u16], base: usize, stride: usize, size: LfSize, t: &LfThresh) -> bool {
+/// `n` (4 or 8) lines across a horizontal edge (see [`crate::deblock_horizontal`]); `false`
+/// when the samples aren't all in `d`.
+pub(crate) fn deblock_horizontal(d: &mut [u16], base: usize, stride: usize, n: usize, size: LfSize, t: &LfThresh) -> bool {
     // SAFETY: NEON is part of the aarch64 baseline: every core this build runs on has it.
-    unsafe { horizontal(d, base, stride, size, t) }
+    unsafe { horizontal(d, base, stride, n, size, t) }
 }
 
-/// 4 lines across a vertical edge (see [`crate::deblock_vertical`]); `false` when the samples
-/// aren't all in `d`.
-pub(crate) fn deblock_vertical(d: &mut [u16], base: usize, stride: usize, size: LfSize, t: &LfThresh) -> bool {
+/// `n` (4 or 8) lines across a vertical edge (see [`crate::deblock_vertical`]); `false` when
+/// the samples aren't all in `d`.
+pub(crate) fn deblock_vertical(d: &mut [u16], base: usize, stride: usize, n: usize, size: LfSize, t: &LfThresh) -> bool {
     // SAFETY: NEON is part of the aarch64 baseline: every core this build runs on has it.
-    unsafe { vertical(d, base, stride, size, t) }
+    unsafe { vertical(d, base, stride, n, size, t) }
 }
 
 crate::deblock::deblock_kernels!("neon");
@@ -180,28 +180,15 @@ fn store8(v: V, s: &mut [u16; 8]) {
     // SAFETY: `s` is 8 u16, the 16 bytes `vst1q_u16` writes.
     unsafe { vst1q_u16(s.as_mut_ptr(), vreinterpretq_u16_s16(v)) }
 }
-/// 4 rows of 8 to 8 columns (in the first four lanes; the others hold column + 4 or column - 4).
+/// 8 rows of 8 to 8 columns of 8 (and back: it is its own inverse).
 #[target_feature(enable = "neon")]
-fn transpose([r0, r1, r2, r3]: [V; 4]) -> [V; 8] {
-    let (t0, t1) = (vtrn1q_s16(r0, r1), vtrn2q_s16(r0, r1));
-    let (t2, t3) = (vtrn1q_s16(r2, r3), vtrn2q_s16(r2, r3));
-    let w = vreinterpretq_s32_s16;
-    let h = vreinterpretq_s16_s32;
-    // c04: columns 0 and 4, c15, c26, c37.
-    let c04 = h(vtrn1q_s32(w(t0), w(t2)));
-    let c15 = h(vtrn1q_s32(w(t1), w(t3)));
-    let c26 = h(vtrn2q_s32(w(t0), w(t2)));
-    let c37 = h(vtrn2q_s32(w(t1), w(t3)));
-    let up = |c: V| vextq_s16::<4>(c, c);
-    [c04, c15, c26, c37, up(c04), up(c15), up(c26), up(c37)]
-}
-/// 8 columns (in the first four lanes) back to 4 rows of 8.
-#[target_feature(enable = "neon")]
-fn untranspose(c: [V; 8]) -> [V; 4] {
-    let pair = |a: V, b: V| vreinterpretq_s32_s16(vcombine_s16(vget_low_s16(a), vget_low_s16(b)));
-    let (c04, c15, c26, c37) = (pair(c[0], c[4]), pair(c[1], c[5]), pair(c[2], c[6]), pair(c[3], c[7]));
-    let h = vreinterpretq_s16_s32;
-    let (t0, t2) = (h(vtrn1q_s32(c04, c26)), h(vtrn2q_s32(c04, c26)));
-    let (t1, t3) = (h(vtrn1q_s32(c15, c37)), h(vtrn2q_s32(c15, c37)));
-    [vtrn1q_s16(t0, t1), vtrn2q_s16(t0, t1), vtrn1q_s16(t2, t3), vtrn2q_s16(t2, t3)]
+fn transpose(r: [V; 8]) -> [V; 8] {
+    let (w, h) = (vreinterpretq_s32_s16, vreinterpretq_s16_s32);
+    let (l, s) = (vreinterpretq_s64_s16, vreinterpretq_s16_s64);
+    // Pairs of rows interleaved by 16, then 32, then 64 bits.
+    let t: [V; 8] = std::array::from_fn(|i| if i % 2 == 0 { vtrn1q_s16(r[i], r[i + 1]) } else { vtrn2q_s16(r[i - 1], r[i]) });
+    let u = |a: usize, b: usize, hi: bool| if hi { h(vtrn2q_s32(w(t[a]), w(t[b]))) } else { h(vtrn1q_s32(w(t[a]), w(t[b]))) };
+    // u[c]: column c (rows 0..4) and column c + 4 of rows 0..4; u[c + 4]: the same of rows 4..8.
+    let u = [u(0, 2, false), u(1, 3, false), u(0, 2, true), u(1, 3, true), u(4, 6, false), u(5, 7, false), u(4, 6, true), u(5, 7, true)];
+    std::array::from_fn(|c| if c < 4 { s(vtrn1q_s64(l(u[c]), l(u[c + 4]))) } else { s(vtrn2q_s64(l(u[c - 4]), l(u[c]))) })
 }

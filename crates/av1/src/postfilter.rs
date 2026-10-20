@@ -118,14 +118,21 @@ fn filter_band(fs: &FrameState, plane: usize, (start, end): (usize, usize), band
         let row_step = if plane == 0 { 1 } else { 1 << fs.ssy };
         let col_step = if plane == 0 { 1 } else { 1 << fs.ssx };
         let mi_cols = fs.fh.mi_cols as usize;
-        let mut row = rows.start;
-        while row < rows.end {
-            let mut col = 0;
-            while col < mi_cols {
-                edge(fs, band, above.as_deref_mut(), plane, pass, row, col);
-                col += col_step;
+        // Neighbouring edges along an edge line with the same filter go to the vector kernels
+        // as one run: vertical edges in strips of two mode info rows (8 lines, a whole vector)
+        // taken column by column, so the walk stays within a few rows of memory; horizontal
+        // edges along whole rows.
+        if pass == 0 {
+            for top in rows.clone().step_by(2 * row_step) {
+                let strip = top..(top + 2 * row_step).min(rows.end);
+                for col in (0..mi_cols).step_by(col_step) {
+                    edge_line(fs, band, above.as_deref_mut(), plane, pass, strip.clone().step_by(row_step).map(|row| (row, col)));
+                }
             }
-            row += row_step;
+        } else {
+            for row in rows.step_by(row_step) {
+                edge_line(fs, band, above.as_deref_mut(), plane, pass, (0..mi_cols).step_by(col_step).map(|col| (row, col)));
+            }
         }
     };
     edges(band, None, 0, r0..r1);
@@ -142,9 +149,41 @@ fn filter_band(fs: &FrameState, plane: usize, (start, end): (usize, usize), band
     above.data.iter().zip(&before).enumerate().filter(|(_, (a, b))| a != b).map(|(i, (&a, _))| (i, a)).collect()
 }
 
-/// One loop filter edge (7.14.2) at mode info position (row, col): 4 lines of samples across
-/// it. `above` holds the rows above `band` for horizontal edges on the band's top row.
-fn edge(fs: &FrameState, band: &mut RowBand, above: Option<&mut RowBand>, plane: usize, pass: usize, row: usize, col: usize) {
+/// The edges at mode info positions `cells`, neighbours along one edge line: runs of them with
+/// the same filter are filtered together.
+#[inline(always)]
+fn edge_line(fs: &FrameState, band: &mut RowBand, mut above: Option<&mut RowBand>, plane: usize, pass: usize, cells: impl Iterator<Item = (usize, usize)>) {
+    let mut run: Option<((usize, usize), usize, EdgeFilter)> = None;
+    for at in cells {
+        let f = edge_filter(fs, plane, pass, at.0, at.1);
+        match (&mut run, f) {
+            (Some((_, n, g)), Some(f)) if *g == f => *n += 1,
+            _ => {
+                if let Some((first, n, g)) = run {
+                    filter_run(fs, band, above.as_deref_mut(), plane, pass, first, n, g);
+                }
+                run = f.map(|f| (at, 1, f));
+            }
+        }
+    }
+    if let Some((first, n, g)) = run {
+        filter_run(fs, band, above, plane, pass, first, n, g);
+    }
+}
+
+/// The filter of a loop filter edge (7.14.2 - 7.14.5).
+#[derive(Clone, Copy, PartialEq)]
+struct EdgeFilter {
+    size: LfSize,
+    limit: i32,
+    blimit: i32,
+    thresh: i32,
+}
+
+/// The filter of the loop filter edge at mode info position (row, col) (7.14.2), or None when
+/// it isn't filtered.
+#[inline(always)]
+fn edge_filter(fs: &FrameState, plane: usize, pass: usize, row: usize, col: usize) -> Option<EdgeFilter> {
     let (sub_x, sub_y) = if plane == 0 { (0, 0) } else { (fs.ssx, fs.ssy) };
     let (dx, dy) = if pass == 0 { (1i32, 0i32) } else { (0, 1) };
     let x = col * 4;
@@ -153,7 +192,7 @@ fn edge(fs: &FrameState, band: &mut RowBand, above: Option<&mut RowBand>, plane:
     let col = col | sub_x;
     let on_screen = !(x >= fs.fh.frame_width as usize || y >= fs.fh.frame_height as usize || (pass == 0 && x == 0) || (pass == 1 && y == 0));
     if !on_screen {
-        return;
+        return None;
     }
     let xp = x >> sub_x;
     let yp = y >> sub_y;
@@ -162,7 +201,7 @@ fn edge(fs: &FrameState, band: &mut RowBand, above: Option<&mut RowBand>, plane:
     let tx_sz = fs.lf_tx_size(plane, row >> sub_y, col >> sub_x);
     let is_tx_edge = if pass == 0 { xp.is_multiple_of(TX_WIDTH[tx_sz] as usize) } else { yp.is_multiple_of(TX_HEIGHT[tx_sz] as usize) };
     if !is_tx_edge {
-        return;
+        return None;
     }
     let mi = &fs.mi;
     let i = mi.idx(row, col);
@@ -176,7 +215,7 @@ fn edge(fs: &FrameState, band: &mut RowBand, above: Option<&mut RowBand>, plane:
         yp.is_multiple_of(4 * NUM_4X4_BLOCKS_HIGH[plane_size] as usize)
     };
     if !(is_block_edge || !skip || is_intra) {
-        return;
+        return None;
     }
     let prev_tx_sz = fs.lf_tx_size(plane, prev_row >> sub_y, prev_col >> sub_x);
     // filter size (7.14.3)
@@ -187,16 +226,34 @@ fn edge(fs: &FrameState, band: &mut RowBand, above: Option<&mut RowBand>, plane:
         (lvl, limit, blimit, thresh) = strength(fs, prev_row, prev_col, plane, pass);
     }
     if lvl == 0 {
-        return;
+        return None;
     }
-    let t = LfThresh::new(limit, blimit, thresh, fs.bit_depth);
-    let size = LfSize::new(filter_size, plane > 0);
+    Some(EdgeFilter { size: LfSize::new(filter_size, plane > 0), limit, blimit, thresh })
+}
+
+/// `edges` neighbouring loop filter edges with filter `f` from mode info position `first`
+/// (row, col): 4 lines of samples across each. `above` holds the rows above `band` for
+/// horizontal edges on the band's top row.
+#[allow(clippy::too_many_arguments)]
+fn filter_run(
+    fs: &FrameState,
+    band: &mut RowBand,
+    above: Option<&mut RowBand>,
+    plane: usize,
+    pass: usize,
+    (row, col): (usize, usize),
+    edges: usize,
+    f: EdgeFilter,
+) {
+    let (sub_x, sub_y) = if plane == 0 { (0, 0) } else { (fs.ssx, fs.ssy) };
+    let (xp, yp) = ((col * 4) >> sub_x, (row * 4) >> sub_y);
+    let t = LfThresh::new(f.limit, f.blimit, f.thresh, fs.bit_depth);
+    let lines = 4 * edges;
     let stride = band.stride;
     if let Some(above) = above.filter(|_| pass == 1 && yp == band.y0) {
         // The p side is in the rows above the band: filter each line in a copy that spans both.
         let (n_above, n_band) = (above.data.len() / stride.max(1), band.data.len() / stride.max(1));
-        for k in 0..4 {
-            let x = xp + k;
+        for x in xp..xp + lines {
             let mut line = [0u16; 2 * LF_LINE];
             for j in 1..=n_above.min(LF_LINE) {
                 line[LF_LINE - j] = above.data[(n_above - j) * stride + x];
@@ -204,7 +261,7 @@ fn edge(fs: &FrameState, band: &mut RowBand, above: Option<&mut RowBand>, plane:
             for j in 0..n_band.min(LF_LINE) {
                 line[LF_LINE + j] = band.data[j * stride + x];
             }
-            filmcraft_simd::deblock_line(&mut line, LF_LINE, 1, size, &t);
+            filmcraft_simd::deblock_line(&mut line, LF_LINE, 1, f.size, &t);
             for j in 1..=n_above.min(LF_LINE) {
                 above.data[(n_above - j) * stride + x] = line[LF_LINE - j];
             }
@@ -216,9 +273,9 @@ fn edge(fs: &FrameState, band: &mut RowBand, above: Option<&mut RowBand>, plane:
     }
     let base = (yp - band.y0) * stride + xp;
     if pass == 0 {
-        filmcraft_simd::deblock_vertical(band.data, base, stride, size, &t);
+        filmcraft_simd::deblock_vertical(band.data, base, stride, lines, f.size, &t);
     } else {
-        filmcraft_simd::deblock_horizontal(band.data, base, stride, size, &t);
+        filmcraft_simd::deblock_horizontal(band.data, base, stride, lines, f.size, &t);
     }
 }
 

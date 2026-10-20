@@ -110,7 +110,7 @@ fn lf_thresh(lvl: i32, sharp: i32, bit_depth: u32) -> LfThresh {
 /// 32x32 pictures around an edge through the middle: smooth sides (to reach the flat and wide
 /// paths) or noisy ones, a step of random height or a random walk across the edge, random
 /// strengths.
-fn deblock_cases() -> Vec<(Vec<u16>, LfThresh, LfSize, u32)> {
+fn deblock_cases() -> Vec<(Vec<u16>, LfThresh, LfSize, u32, usize)> {
     let mut seed = 0x9e37_79b9u32;
     let mut next = move || {
         seed ^= seed << 13;
@@ -137,15 +137,18 @@ fn deblock_cases() -> Vec<(Vec<u16>, LfThresh, LfSize, u32)> {
                     profile[a] =
                         if walk { (profile[a - 1] + (next() % (2 * s as u32 + 1)) as i32 - s).clamp(0, max) } else { level + if a >= 16 { step } else { 0 } };
                 }
+                // Lines differ in the size of the step, so lanes take different paths.
+                let scale: [i32; 32] = std::array::from_fn(|_| [0, 1, 1, 2][next() as usize % 4]);
                 let pic: Vec<u16> = (0..32 * 32)
                     .map(|i| {
-                        let across = if vertical { i % 32 } else { i / 32 };
+                        let (across, line) = if vertical { (i % 32, i / 32) } else { (i / 32, i % 32) };
                         let n = if noise == 0 { 0 } else { (next() % (noise as u32 + 1)) as i32 - noise / 2 };
-                        (profile[across] + n).clamp(0, max) as u16
+                        let p = if walk { profile[across] } else { level + if across >= 16 { step * scale[line] } else { 0 } };
+                        (p + n).clamp(0, max) as u16
                     })
                     .collect();
                 let t = lf_thresh(1 + (next() % 63) as i32, (next() % 8) as i32, bd);
-                out.push((pic, t, size, vertical as u32));
+                out.push((pic, t, size, vertical as u32, 4 * (1 + next() as usize % 4)));
             }
         }
     }
@@ -155,11 +158,12 @@ fn deblock_cases() -> Vec<(Vec<u16>, LfThresh, LfSize, u32)> {
 #[test]
 fn every_level_matches_the_scalar_loop_filter() {
     let (mut changed, mut total) = (0, 0);
-    for (pic, t, size, vertical) in deblock_cases() {
+    for (pic, t, size, vertical, lines) in deblock_cases() {
         let mut want = pic.clone();
         let base = if vertical == 1 { 8 * 32 + 16 } else { 16 * 32 + 8 };
+        // Up to 16 lines from line 8: all inside the 32x32 picture.
         let run = |level: Level, d: &mut [u16]| {
-            if vertical == 1 { deblock_vertical_at(level, d, base, 32, size, &t) } else { deblock_horizontal_at(level, d, base, 32, size, &t) }
+            if vertical == 1 { deblock_vertical_at(level, d, base, 32, lines, size, &t) } else { deblock_horizontal_at(level, d, base, 32, lines, size, &t) }
         };
         run(Level::Scalar, &mut want);
         total += 1;
@@ -167,7 +171,7 @@ fn every_level_matches_the_scalar_loop_filter() {
         for &level in levels() {
             let mut got = pic.clone();
             run(level, &mut got);
-            assert_eq!(got, want, "{level:?} {size:?} vertical {vertical} {t:?}");
+            assert_eq!(got, want, "{level:?} {size:?} vertical {vertical} {lines} lines {t:?}");
         }
     }
     // The cases reach the filters, not only the masks that turn them off.
@@ -181,11 +185,11 @@ fn loop_filter_falls_back_when_the_vector_rows_leave_the_buffer() {
     let pic: Vec<u16> = (0..4 * 8).map(|i| if i % 8 >= 2 { 120 } else { 100 }).collect();
     let t = lf_thresh(40, 0, 8);
     let mut want = pic.clone();
-    deblock_vertical_at(Level::Scalar, &mut want, 2, 8, LfSize::Four, &t);
+    deblock_vertical_at(Level::Scalar, &mut want, 2, 8, 4, LfSize::Four, &t);
     assert_ne!(want, pic);
     for &level in levels() {
         let mut got = pic.clone();
-        deblock_vertical_at(level, &mut got, 2, 8, LfSize::Four, &t);
+        deblock_vertical_at(level, &mut got, 2, 8, 4, LfSize::Four, &t);
         assert_eq!(got, want, "{level:?}");
     }
 }
@@ -200,10 +204,14 @@ fn loop_filter_clamps_a_zigzag_at_full_strength() {
         let t = lf_thresh(63, 0, bd);
         for vertical in [false, true] {
             let pic: Vec<u16> = (0..16 * 16).map(|i| line[if vertical { i % 16 } else { i / 16 }]).collect();
-            let base = if vertical { 4 * 16 + 8 } else { 8 * 16 + 4 };
+            let base = if vertical { 4 * 16 + 8 } else { 8 * 16 + 4 }; // 8 lines from line 4
             let mut want = pic.clone();
             let run = |level, d: &mut [u16]| {
-                if vertical { deblock_vertical_at(level, d, base, 16, LfSize::Four, &t) } else { deblock_horizontal_at(level, d, base, 16, LfSize::Four, &t) }
+                if vertical {
+                    deblock_vertical_at(level, d, base, 16, 8, LfSize::Four, &t)
+                } else {
+                    deblock_horizontal_at(level, d, base, 16, 8, LfSize::Four, &t)
+                }
             };
             run(Level::Scalar, &mut want);
             assert_ne!(want, pic);

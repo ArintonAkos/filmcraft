@@ -87,48 +87,66 @@ pub fn deblock_line(d: &mut [u16], base: usize, step: usize, size: LfSize, t: &L
     scalar::deblock_line(d, base, step, size, t);
 }
 
-/// AV1 loop filter (7.14.6) of the 4 lines across a vertical edge: `d[base]` is q0 of the
-/// first line, and each next line starts `stride` further.
-pub fn deblock_vertical(d: &mut [u16], base: usize, stride: usize, size: LfSize, t: &LfThresh) {
-    deblock_vertical_at(level(), d, base, stride, size, t);
+/// AV1 loop filter (7.14.6) of `lines` (a multiple of 4) lines across a vertical edge with the
+/// same filter: `d[base]` is q0 of the first line, and each next line starts `stride` further.
+pub fn deblock_vertical(d: &mut [u16], base: usize, stride: usize, lines: usize, size: LfSize, t: &LfThresh) {
+    deblock_vertical_at(level(), d, base, stride, lines, size, t);
 }
 
 /// [`deblock_vertical`] on a given level.
-pub fn deblock_vertical_at(level: Level, d: &mut [u16], base: usize, stride: usize, size: LfSize, t: &LfThresh) {
-    let done = match level {
-        #[cfg(target_arch = "aarch64")]
-        Level::Neon => neon::deblock_vertical(d, base, stride, size, t),
-        #[cfg(target_arch = "x86_64")]
-        Level::Sse2 => sse2::deblock_vertical(d, base, stride, size, t),
-        _ => false,
-    };
-    // Scalar, or a vector kernel's 8-sample rows don't all fit in `d`.
-    if !done {
-        for i in 0..4 {
-            scalar::deblock_line(d, base + i * stride, 1, size, t);
+pub fn deblock_vertical_at(level: Level, d: &mut [u16], base: usize, stride: usize, lines: usize, size: LfSize, t: &LfThresh) {
+    deblock_lines(lines, |first, n| {
+        let at = base + first * stride;
+        let done = match level {
+            #[cfg(target_arch = "aarch64")]
+            Level::Neon => neon::deblock_vertical(d, at, stride, n, size, t),
+            #[cfg(target_arch = "x86_64")]
+            Level::Sse2 => sse2::deblock_vertical(d, at, stride, n, size, t),
+            _ => false,
+        };
+        // Scalar, or a vector kernel's 8-sample rows don't all fit in `d`.
+        if !done {
+            for i in 0..n {
+                scalar::deblock_line(d, at + i * stride, 1, size, t);
+            }
         }
-    }
+    });
 }
 
-/// AV1 loop filter (7.14.6) of the 4 lines across a horizontal edge: `d[base]` is q0 of the
-/// first line, the next three follow it, and `stride` is the distance between rows.
-pub fn deblock_horizontal(d: &mut [u16], base: usize, stride: usize, size: LfSize, t: &LfThresh) {
-    deblock_horizontal_at(level(), d, base, stride, size, t);
+/// AV1 loop filter (7.14.6) of `lines` (a multiple of 4) lines across a horizontal edge with
+/// the same filter: `d[base]` is q0 of the first line, the others follow it, and `stride` is
+/// the distance between rows.
+pub fn deblock_horizontal(d: &mut [u16], base: usize, stride: usize, lines: usize, size: LfSize, t: &LfThresh) {
+    deblock_horizontal_at(level(), d, base, stride, lines, size, t);
 }
 
 /// [`deblock_horizontal`] on a given level.
-pub fn deblock_horizontal_at(level: Level, d: &mut [u16], base: usize, stride: usize, size: LfSize, t: &LfThresh) {
-    let done = match level {
-        #[cfg(target_arch = "aarch64")]
-        Level::Neon => neon::deblock_horizontal(d, base, stride, size, t),
-        #[cfg(target_arch = "x86_64")]
-        Level::Sse2 => sse2::deblock_horizontal(d, base, stride, size, t),
-        _ => false,
-    };
-    if !done {
-        for i in 0..4 {
-            scalar::deblock_line(d, base + i, stride, size, t);
+pub fn deblock_horizontal_at(level: Level, d: &mut [u16], base: usize, stride: usize, lines: usize, size: LfSize, t: &LfThresh) {
+    deblock_lines(lines, |first, n| {
+        let at = base + first;
+        let done = match level {
+            #[cfg(target_arch = "aarch64")]
+            Level::Neon => neon::deblock_horizontal(d, at, stride, n, size, t),
+            #[cfg(target_arch = "x86_64")]
+            Level::Sse2 => sse2::deblock_horizontal(d, at, stride, n, size, t),
+            _ => false,
+        };
+        if !done {
+            for i in 0..n {
+                scalar::deblock_line(d, at + i, stride, size, t);
+            }
         }
+    });
+}
+
+/// `lines` in chunks for the vector kernels: (first line, 8 or 4 lines).
+#[inline(always)]
+fn deblock_lines(lines: usize, mut chunk: impl FnMut(usize, usize)) {
+    let mut first = 0;
+    while first + 4 <= lines {
+        let n = if first + 8 <= lines { 8 } else { 4 };
+        chunk(first, n);
+        first += n;
     }
 }
 
