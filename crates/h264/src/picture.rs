@@ -1,9 +1,9 @@
 //! Picture buffers and per-macroblock state.
 
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// Planar 4:2:0 8-bit sample buffers (MB-aligned dimensions, stride == width).
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct Planes {
     pub y: Vec<u8>,
     pub cb: Vec<u8>,
@@ -113,7 +113,8 @@ impl Default for MbState {
 /// One published macroblock row of a decoded frame: final (deblocked) samples plus the motion data
 /// needed as co-located information for direct prediction.
 pub struct FrameRow {
-    /// 16 luma lines.
+    /// 16 luma lines (empty when only the finished picture's planes carry the samples, see
+    /// [`Frame::make_row`]).
     pub y: Box<[u8]>,
     /// 8 lines per chroma component.
     pub cb: Box<[u8]>,
@@ -130,7 +131,9 @@ pub struct FrameRow {
 /// A decoded (or in-progress) frame as stored in the DPB and referenced by later pictures.
 ///
 /// Rows are published in order by the thread decoding the picture; readers block (per row) until the
-/// data they need is available, which lets several pictures decode concurrently.
+/// data they need is available, which lets several pictures decode concurrently. Once the whole
+/// picture is decoded, its contiguous planes are added too ([`Frame::finish`]): readers then use
+/// those instead (no row lookups, and interior blocks are read in place).
 pub struct Frame {
     pub id: u32,
     pub poc: i32,
@@ -140,11 +143,48 @@ pub struct Frame {
     pub cheight: usize,
     pub mb_w: usize,
     rows: Box<[OnceLock<FrameRow>]>,
+    /// The finished picture. `OnceLock` publishes it with release / acquire ordering: a reader that
+    /// sees it also sees every sample written (and deblocked) before [`Frame::finish`].
+    full: OnceLock<Planes>,
+    /// Where `full` goes when the frame is dropped, for the next picture to decode into.
+    recycle: Option<PlanePool>,
 }
+
+/// Planes of dropped frames, kept for reuse.
+pub type PlanePool = Arc<Mutex<Vec<Planes>>>;
 
 impl Frame {
     pub fn new(id: u32, poc: i32, mb_w: usize, mb_h: usize) -> Self {
-        Frame { id, poc, width: mb_w * 16, height: mb_h * 16, cwidth: mb_w * 8, cheight: mb_h * 8, mb_w, rows: (0..mb_h).map(|_| OnceLock::new()).collect() }
+        Frame {
+            id,
+            poc,
+            width: mb_w * 16,
+            height: mb_h * 16,
+            cwidth: mb_w * 8,
+            cheight: mb_h * 8,
+            mb_w,
+            rows: (0..mb_h).map(|_| OnceLock::new()).collect(),
+            full: OnceLock::new(),
+            recycle: None,
+        }
+    }
+
+    /// Hand the frame's planes to `pool` when it is dropped.
+    pub fn recycled_into(mut self, pool: PlanePool) -> Self {
+        self.recycle = Some(pool);
+        self
+    }
+
+    /// Add the finished picture's planes (ignored if already set). Rows published without samples
+    /// (see [`Frame::make_row`]) must not be read before this.
+    pub fn finish(&self, planes: Planes) {
+        let _ = self.full.set(planes);
+    }
+
+    /// The finished picture's planes, once [`Frame::finish`] has run.
+    #[inline]
+    pub fn planes(&self) -> Option<&Planes> {
+        self.full.get()
     }
 
     pub fn mb_h(&self) -> usize {
@@ -180,14 +220,14 @@ impl Frame {
         }
     }
 
-    /// Build a published row from a contiguous plane set (rows of MB row `r`) and motion data.
-    pub fn make_row(planes: &Planes, r: usize, mbs: &[MbState], ref_ids: &dyn Fn(&MbState, usize, i8) -> u32) -> FrameRow {
+    /// Build a published row from a contiguous plane set (rows of MB row `r`) and motion data. Without
+    /// `samples` the row carries motion data only: for a frame no one reads before it is finished.
+    pub fn make_row(planes: &Planes, r: usize, mbs: &[MbState], ref_ids: &dyn Fn(&MbState, usize, i8) -> u32, samples: bool) -> FrameRow {
         let w = planes.width;
         let cw = planes.cwidth;
         let mb_w = w / 16;
-        let y = planes.y[r * 16 * w..(r + 1) * 16 * w].into();
-        let cb = planes.cb[r * 8 * cw..(r + 1) * 8 * cw].into();
-        let cr = planes.cr[r * 8 * cw..(r + 1) * 8 * cw].into();
+        let lines = |p: &[u8], n: usize| if samples { p[r * n..(r + 1) * n].into() } else { Box::default() };
+        let (y, cb, cr) = (lines(&planes.y, 16 * w), lines(&planes.cb, 8 * cw), lines(&planes.cr, 8 * cw));
         let row_mbs = &mbs[r * mb_w..(r + 1) * mb_w];
         let mut mv = [vec![[0i16; 2]; mb_w * 16], vec![[0i16; 2]; mb_w * 16]];
         let mut ref_idx = [vec![-1i8; mb_w * 4], vec![-1i8; mb_w * 4]];
@@ -217,13 +257,14 @@ impl Frame {
 
     /// A frame with every row published from `planes` and no motion (intra), e.g. "non-existing"
     /// frames inferred for frame_num gaps.
-    pub fn from_planes(id: u32, poc: i32, planes: &Planes) -> Self {
+    pub fn from_planes(id: u32, poc: i32, planes: Planes) -> Self {
         let (mb_w, mb_h) = (planes.width / 16, planes.height / 16);
         let f = Frame::new(id, poc, mb_w, mb_h);
         let blank = vec![MbState::default(); mb_w * mb_h];
         for r in 0..mb_h {
-            f.publish(r, Frame::make_row(planes, r, &blank, &|_, _, _| u32::MAX));
+            f.publish(r, Frame::make_row(&planes, r, &blank, &|_, _, _| u32::MAX, false));
         }
+        f.finish(planes);
         f
     }
 
@@ -231,6 +272,13 @@ impl Frame {
     #[inline]
     pub fn luma_window(&self, x0: i32, y0: i32, w: usize, h: usize, out: &mut [u8], os: usize) {
         let (width, height) = (self.width, self.height);
+        if let Some(p) = self.planes() {
+            for r in 0..h {
+                let yy = (y0 + r as i32).clamp(0, height as i32 - 1) as usize;
+                copy_line::<24>(&p.y[yy * width..yy * width + width], x0, &mut out[r * os..], w);
+            }
+            return;
+        }
         // A window spans at most three MB rows: look each up (and wait for it) once.
         let (mut mb_row, mut lines): (usize, &[u8]) = (usize::MAX, &[]);
         for r in 0..h {
@@ -248,6 +296,14 @@ impl Frame {
     #[inline]
     pub fn chroma_window(&self, c: usize, x0: i32, y0: i32, w: usize, h: usize, out: &mut [u8], os: usize) {
         let (cw, ch) = (self.cwidth, self.cheight);
+        if let Some(p) = self.planes() {
+            let plane = if c == 0 { &p.cb } else { &p.cr };
+            for r in 0..h {
+                let yy = (y0 + r as i32).clamp(0, ch as i32 - 1) as usize;
+                copy_line::<16>(&plane[yy * cw..yy * cw + cw], x0, &mut out[r * os..], w);
+            }
+            return;
+        }
         let (mut mb_row, mut lines): (usize, &[u8]) = (usize::MAX, &[]);
         for r in 0..h {
             let yy = (y0 + r as i32).clamp(0, ch as i32 - 1) as usize;
@@ -265,12 +321,25 @@ impl Frame {
     pub fn copy_cropped(&self, crop: (usize, usize, usize, usize)) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
         let (cx, cy, cw, ch) = crop;
         let alloc = plane_allocator();
+        let (ccx, ccy, ccw, cch) = (cx / 2, cy / 2, cw.div_ceil(2), ch.div_ceil(2));
+        if let Some(p) = self.planes() {
+            let mut y = alloc(cw * ch);
+            for r in cy..cy + ch {
+                y.extend_from_slice(&p.y[r * self.width + cx..r * self.width + cx + cw]);
+            }
+            let (mut u, mut v) = (alloc(ccw * cch), alloc(ccw * cch));
+            for r in ccy..ccy + cch {
+                let o = r * self.cwidth + ccx;
+                u.extend_from_slice(&p.cb[o..o + ccw]);
+                v.extend_from_slice(&p.cr[o..o + ccw]);
+            }
+            return (y, u, v);
+        }
         let mut y = alloc(cw * ch);
         for r in cy..cy + ch {
             let row = self.row(r >> 4);
             y.extend_from_slice(&row.y[(r & 15) * self.width + cx..(r & 15) * self.width + cx + cw]);
         }
-        let (ccx, ccy, ccw, cch) = (cx / 2, cy / 2, cw.div_ceil(2), ch.div_ceil(2));
         let mut u = alloc(ccw * cch);
         let mut v = alloc(ccw * cch);
         for r in ccy..ccy + cch {
@@ -280,6 +349,17 @@ impl Frame {
             v.extend_from_slice(&row.cr[o..o + ccw]);
         }
         (y, u, v)
+    }
+}
+
+impl Drop for Frame {
+    fn drop(&mut self) {
+        if let (Some(pool), Some(planes)) = (&self.recycle, self.full.take())
+            && let Ok(mut pool) = pool.lock()
+            && pool.len() < 4
+        {
+            pool.push(planes);
+        }
     }
 }
 

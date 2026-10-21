@@ -43,6 +43,9 @@ pub struct PicState {
     rows_published: usize,
     /// Draft mode for a non-reference picture: rows are published without deblocking.
     pub skip_deblock: bool,
+    /// Published rows carry samples, for pictures decoding concurrently. Without, only the finished
+    /// picture's planes do ([`Frame::finish`]).
+    pub row_samples: bool,
 }
 
 impl PicState {
@@ -62,6 +65,7 @@ impl PicState {
             rows_deblocked: 0,
             rows_published: 0,
             skip_deblock: false,
+            row_samples: true,
         }
     }
 
@@ -81,6 +85,30 @@ impl PicState {
         self.rows_deblocked = 0;
         self.rows_published = 0;
         self.skip_deblock = false;
+        self.row_samples = true;
+    }
+
+    /// Leading MB rows already published.
+    pub fn rows_published(&self) -> usize {
+        self.rows_published
+    }
+
+    /// Fill macroblocks that no slice decoded with gray, so the result never depends on what a
+    /// recycled buffer held before.
+    fn fill_missing(&mut self) {
+        let (w, cw) = (self.planes.width, self.planes.cwidth);
+        for (addr, _) in self.mbs.iter().enumerate().filter(|(_, m)| m.slice_num == u32::MAX) {
+            let (x, y) = (addr % self.mb_w, addr / self.mb_w);
+            for r in 0..16 {
+                let o = (y * 16 + r) * w + x * 16;
+                self.planes.y[o..o + 16].fill(128);
+            }
+            for r in 0..8 {
+                let o = (y * 8 + r) * cw + x * 8;
+                self.planes.cb[o..o + 8].fill(128);
+                self.planes.cr[o..o + 8].fill(128);
+            }
+        }
     }
 
     /// Record a decoded macroblock and deblock / publish rows that became final.
@@ -100,6 +128,9 @@ impl PicState {
     /// Deblock and publish rows. With `finished`, everything remaining is processed (also rows with
     /// missing macroblocks, so that waiting readers never block forever).
     pub fn flush_rows(&mut self, finished: bool) {
+        if finished {
+            self.fill_missing();
+        }
         // Deblocking row r must wait until row r + 1 is reconstructed (its intra prediction reads the
         // unfiltered bottom line of row r); row r is final once row r + 1 is deblocked.
         let deblock_limit = if finished { self.mb_h } else { self.rows_recon.saturating_sub(1) };
@@ -118,7 +149,7 @@ impl PicState {
             let slices = &self.slices;
             let ids =
                 |st: &MbState, l: usize, ri: i8| slices.get(st.slice_num as usize).and_then(|s| s.ref_ids[l].get(ri as usize).copied()).unwrap_or(u32::MAX);
-            let row = Frame::make_row(&self.planes, r, &self.mbs, &ids);
+            let row = Frame::make_row(&self.planes, r, &self.mbs, &ids, self.row_samples);
             self.frame.publish(r, row);
             self.rows_published += 1;
         }
@@ -215,8 +246,9 @@ pub struct SliceDecoder<'a> {
 
 /// Predict a bw x bh luma block at (px, py) with motion vector `mv` from reference `f` into `y`
 /// (block origin, stride), and the corresponding chroma blocks into `c` (stride `cs`), each
-/// written as `out` says (luma, Cb, Cr), from reference windows copied out with the picture's
-/// edge samples repeated.
+/// written as `out` says (luma, Cb, Cr). Blocks whose reference samples (with the interpolation
+/// filters' reach) lie inside a finished reference picture are read in place; otherwise from
+/// windows copied out with the picture's edge samples repeated.
 #[allow(clippy::too_many_arguments)]
 #[inline]
 fn predict_block(f: &Frame, mv: [i16; 2], px: usize, py: usize, bw: usize, bh: usize, y: (&mut [u8], usize), c: [&mut [u8]; 2], cs: usize, out: [H264Out; 3]) {
@@ -224,17 +256,39 @@ fn predict_block(f: &Frame, mv: [i16; 2], px: usize, py: usize, bw: usize, bh: u
     let mut win = [0u8; LW * 21];
     let ix = px as i32 + (mv[0] as i32 >> 2);
     let iy = py as i32 + (mv[1] as i32 >> 2);
-    f.luma_window(ix - 2, iy - 2, bw + 5, bh + 5, &mut win, LW);
-    filmcraft_simd::h264_luma(&win, LW, (mv[0] & 3) as u32, (mv[1] & 3) as u32, bw, bh, y.0, y.1, out[0]);
+    let (lfx, lfy) = ((mv[0] & 3) as u32, (mv[1] & 3) as u32);
+    let planes = f.planes();
+    // The 6-tap filter reads 2 samples before and 3 after the block in each direction.
+    match planes.and_then(|p| inside(ix - 2, iy - 2, bw + 5, bh + 5, p.width, p.height).map(|o| (p, o))) {
+        Some((p, o)) => filmcraft_simd::h264_luma(&p.y[o..], p.width, lfx, lfy, bw, bh, y.0, y.1, out[0]),
+        None => {
+            f.luma_window(ix - 2, iy - 2, bw + 5, bh + 5, &mut win, LW);
+            filmcraft_simd::h264_luma(&win, LW, lfx, lfy, bw, bh, y.0, y.1, out[0]);
+        }
+    }
     let cx = (px / 2) as i32 + (mv[0] as i32 >> 3);
     let cy = (py / 2) as i32 + (mv[1] as i32 >> 3);
     let (cw, ch) = (bw / 2, bh / 2);
     let (fx, fy) = ((mv[0] & 7) as u32, (mv[1] & 7) as u32);
+    // The bilinear chroma filter reads 1 sample after the block in each direction.
+    let direct = planes.and_then(|p| inside(cx, cy, cw + 1, ch + 1, p.cwidth, p.height / 2).map(|o| (p, o)));
     for (comp, (dst, out)) in c.into_iter().zip([out[1], out[2]]).enumerate() {
-        let mut w = [0u8; 16 * 9];
-        f.chroma_window(comp, cx, cy, cw + 1, ch + 1, &mut w, 16);
-        filmcraft_simd::h264_chroma(&w, 16, fx, fy, cw, ch, dst, cs, out);
+        match direct {
+            Some((p, o)) => filmcraft_simd::h264_chroma(&[&p.cb, &p.cr][comp][o..], p.cwidth, fx, fy, cw, ch, dst, cs, out),
+            None => {
+                let mut w = [0u8; 16 * 9];
+                f.chroma_window(comp, cx, cy, cw + 1, ch + 1, &mut w, 16);
+                filmcraft_simd::h264_chroma(&w, 16, fx, fy, cw, ch, dst, cs, out);
+            }
+        }
     }
+}
+
+/// Offset of the `w` x `h` area at (x, y) in a `pw` x `ph` plane, if it lies entirely inside.
+#[inline(always)]
+fn inside(x: i32, y: i32, w: usize, h: usize, pw: usize, ph: usize) -> Option<usize> {
+    let (x, y) = (usize::try_from(x).ok()?, usize::try_from(y).ok()?);
+    (x + w <= pw && y + h <= ph).then_some(y * pw + x)
 }
 
 #[inline(always)]
@@ -1436,5 +1490,60 @@ impl<'a> SliceDecoder<'a> {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inside_needs_the_whole_area_in_the_plane() {
+        assert_eq!(inside(0, 0, 21, 21, 21, 21), Some(0));
+        assert_eq!(inside(2, 3, 21, 21, 23, 24), Some(3 * 23 + 2));
+        assert_eq!(inside(-1, 0, 21, 21, 64, 64), None);
+        assert_eq!(inside(0, -1, 21, 21, 64, 64), None);
+        assert_eq!(inside(44, 0, 21, 21, 64, 64), None);
+        assert_eq!(inside(0, 44, 21, 21, 64, 64), None);
+    }
+
+    /// Predictions read in place from a finished reference match the ones from windows copied out
+    /// of its rows, for blocks inside, across and outside every edge.
+    #[test]
+    fn finished_frames_predict_like_published_rows() {
+        let (mb_w, mb_h) = (3, 2);
+        let mut planes = Planes::new(mb_w * 16, mb_h * 16);
+        let mut seed = 0x1234_5678u32;
+        for p in [&mut planes.y, &mut planes.cb, &mut planes.cr] {
+            for v in p.iter_mut() {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                *v = (seed >> 24) as u8;
+            }
+        }
+        let blank = vec![MbState::default(); mb_w * mb_h];
+        let rows = Frame::new(1, 0, mb_w, mb_h);
+        let full = Frame::new(2, 0, mb_w, mb_h);
+        for r in 0..mb_h {
+            rows.publish(r, Frame::make_row(&planes, r, &blank, &|_, _, _| u32::MAX, true));
+            full.publish(r, Frame::make_row(&planes, r, &blank, &|_, _, _| u32::MAX, false));
+        }
+        full.finish(planes);
+        let (w, cw) = (mb_w * 16, mb_w * 8);
+        let predict = |f: &Frame, mv: [i16; 2], px: usize, py: usize, bw: usize, bh: usize| {
+            let (mut y, mut cb, mut cr) = (vec![0u8; w * mb_h * 16], vec![0u8; cw * mb_h * 8], vec![0u8; cw * mb_h * 8]);
+            let c = py / 2 * cw + px / 2;
+            predict_block(f, mv, px, py, bw, bh, (&mut y[py * w + px..], w), [&mut cb[c..], &mut cr[c..]], cw, [H264Out::Put; 3]);
+            (y, cb, cr)
+        };
+        for (bw, bh) in [(16, 16), (16, 8), (8, 16), (8, 8), (8, 4), (4, 8), (4, 4)] {
+            for (px, py) in [(0, 0), (16, 0), (w - bw, mb_h * 16 - bh), (16, 16)] {
+                for mx in (-90..=90).step_by(7) {
+                    for my in (-90..=90).step_by(5) {
+                        let mv = [mx as i16, my as i16];
+                        assert!(predict(&rows, mv, px, py, bw, bh) == predict(&full, mv, px, py, bw, bh), "{bw}x{bh} at ({px}, {py}), mv {mv:?}");
+                    }
+                }
+            }
+        }
     }
 }
