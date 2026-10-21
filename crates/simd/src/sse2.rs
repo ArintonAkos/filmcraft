@@ -89,16 +89,16 @@ type V = __m128i;
 
 /// `n` (4 or 8) lines across a horizontal edge (see [`crate::deblock_horizontal`]); `false`
 /// when the samples aren't all in `d`.
-pub(crate) fn deblock_horizontal(d: &mut [u16], base: usize, stride: usize, n: usize, size: LfSize, t: &LfThresh) -> bool {
+pub(crate) fn deblock_horizontal(d: &mut [u16], base: usize, stride: usize, n: usize, on: u8, size: LfSize, t: &LfThresh) -> bool {
     // SAFETY: SSE2 is part of the x86_64 baseline: every core this build runs on has it.
-    unsafe { horizontal(d, base, stride, n, size, t) }
+    unsafe { horizontal(d, base, stride, n, on, size, t) }
 }
 
 /// `n` (4 or 8) lines across a vertical edge (see [`crate::deblock_vertical`]); `false` when
 /// the samples aren't all in `d`.
-pub(crate) fn deblock_vertical(d: &mut [u16], base: usize, stride: usize, n: usize, size: LfSize, t: &LfThresh) -> bool {
+pub(crate) fn deblock_vertical(d: &mut [u16], base: usize, stride: usize, n: usize, on: u8, size: LfSize, t: &LfThresh) -> bool {
     // SAFETY: SSE2 is part of the x86_64 baseline: every core this build runs on has it.
-    unsafe { vertical(d, base, stride, n, size, t) }
+    unsafe { vertical(d, base, stride, n, on, size, t) }
 }
 
 crate::deblock::deblock_kernels!("sse2");
@@ -161,8 +161,9 @@ fn any(m: V) -> bool {
     _mm_movemask_epi8(m) != 0
 }
 #[target_feature(enable = "sse2")]
-fn lanes4() -> V {
-    _mm_set_epi64x(0, -1)
+fn lanes(on: u8) -> V {
+    let bits = _mm_set_epi16(128, 64, 32, 16, 8, 4, 2, 1);
+    _mm_cmpeq_epi16(_mm_and_si128(_mm_set1_epi16(on as i16), bits), bits)
 }
 #[target_feature(enable = "sse2")]
 fn load4(s: &[u16; 4]) -> V {

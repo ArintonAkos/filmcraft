@@ -30,8 +30,8 @@ pub(crate) fn cdef_direction(rows: &[&[u16; 8]; 8], shift: u32) -> (usize, i32) 
     cdef_pick(&std::array::from_fn(|d| partial[d].iter().zip(&CDEF_COST_WEIGHTS[d]).map(|(&p, &w)| p * p * w).sum()))
 }
 
-/// Sample filtering process (7.14.6) for one line across a loop filter edge: `base` indexes q0
-/// and `step` is the distance between samples across the edge.
+/// Sample filtering process (AV1 7.14.6, VP9 8.8.5) for one line across a loop filter edge:
+/// `base` indexes q0 and `step` is the distance between samples across the edge.
 #[inline(always)]
 pub(crate) fn deblock_line(d: &mut [u16], base: usize, step: usize, size: LfSize, t: &LfThresh) {
     let at = |d: &[u16], k: isize| -> i32 { d[(base as isize + k * step as isize) as usize] as i32 };
@@ -56,7 +56,7 @@ pub(crate) fn deblock_line(d: &mut [u16], base: usize, step: usize, size: LfSize
             if (p3 - p2).abs() > lim || (q3 - q2).abs() > lim {
                 return;
             }
-            flat = flat && (p3 - p0).abs() <= tf && (q3 - q0).abs() <= tf;
+            flat = flat && (p3 - p0).abs() <= tf && (q3 - q0).abs() <= tf && size != LfSize::Vp9Four;
         }
     }
     if !flat {
@@ -78,33 +78,39 @@ pub(crate) fn deblock_line(d: &mut [u16], base: usize, step: usize, size: LfSize
         return;
     }
     match size {
-        LfSize::Four => {}
+        LfSize::Four | LfSize::Vp9Four => {}
         LfSize::Six => wide::<2, 1, 3>(d, base, step),
-        LfSize::Eight => wide::<3, 0, 3>(d, base, step),
+        LfSize::Eight | LfSize::Vp9Eight => wide::<3, 0, 3>(d, base, step),
         LfSize::Sixteen => {
             let tf = t.flat;
             let flat2 = (4..7).all(|k| (at(d, k) - q0).abs() <= tf && (at(d, -k - 1) - p0).abs() <= tf);
             if flat2 { wide::<6, 1, 4>(d, base, step) } else { wide::<3, 0, 3>(d, base, step) }
         }
+        LfSize::Vp9Sixteen => {
+            let tf = t.flat;
+            let flat2 = (4..8).all(|k| (at(d, k) - q0).abs() <= tf && (at(d, -k - 1) - p0).abs() <= tf);
+            if flat2 { wide::<7, 0, 4>(d, base, step) } else { wide::<3, 0, 3>(d, base, step) }
+        }
     }
 }
 
-/// Wide filter process (7.14.6.4) with n = N, the 2-weight taps |j| <= N2 and log2Size = LOG2.
+/// Wide filter process (AV1 7.14.6.4, VP9 8.8.5.3) with n = N, the 2-weight taps |j| <= N2 and
+/// log2Size = LOG2.
 #[inline(always)]
 fn wide<const N: usize, const N2: usize, const LOG2: u32>(d: &mut [u16], base: usize, step: usize) {
     // v[k] = sample at offset k - (N + 1) from q0, k in 0 .. 2N + 2
-    let mut v = [0i32; 14];
+    let mut v = [0i32; 16];
     let first = base - (N + 1) * step;
     for (k, x) in v[..2 * N + 2].iter_mut().enumerate() {
         *x = d[first + k * step] as i32;
     }
     // e[m] = v[clamp(m - N, 0, 2N + 1)]: the clamped tap positions as one array, so
     // F[i] = sum_{jj = 0}^{2N} e[i + 1 + jj] * (2 if |jj - N| <= N2 else 1), a sliding window.
-    let mut e = [0i32; 25];
+    let mut e = [0i32; 29];
     for (m, x) in e[..4 * N + 1].iter_mut().enumerate() {
         *x = v[m.saturating_sub(N).min(2 * N + 1)];
     }
-    let mut f = [0i32; 12];
+    let mut f = [0i32; 14];
     let mut win: i32 = e[1..2 * N + 2].iter().sum();
     for i in 0..2 * N {
         if i > 0 {

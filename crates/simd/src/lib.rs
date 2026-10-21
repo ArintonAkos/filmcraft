@@ -109,9 +109,9 @@ pub fn deblock_vertical_at(level: Level, d: &mut [u16], base: usize, stride: usi
         let at = base + first * stride;
         let done = match level {
             #[cfg(target_arch = "aarch64")]
-            Level::Neon => neon::deblock_vertical(d, at, stride, n, size, t),
+            Level::Neon => neon::deblock_vertical(d, at, stride, n, 0xFF, size, t),
             #[cfg(target_arch = "x86_64")]
-            Level::Sse2 => sse2::deblock_vertical(d, at, stride, n, size, t),
+            Level::Sse2 => sse2::deblock_vertical(d, at, stride, n, 0xFF, size, t),
             _ => false,
         };
         // Scalar, or a vector kernel's 8-sample rows don't all fit in `d`.
@@ -136,9 +136,9 @@ pub fn deblock_horizontal_at(level: Level, d: &mut [u16], base: usize, stride: u
         let at = base + first;
         let done = match level {
             #[cfg(target_arch = "aarch64")]
-            Level::Neon => neon::deblock_horizontal(d, at, stride, n, size, t),
+            Level::Neon => neon::deblock_horizontal(d, at, stride, n, 0xFF, size, t),
             #[cfg(target_arch = "x86_64")]
-            Level::Sse2 => sse2::deblock_horizontal(d, at, stride, n, size, t),
+            Level::Sse2 => sse2::deblock_horizontal(d, at, stride, n, 0xFF, size, t),
             _ => false,
         };
         if !done {
@@ -147,6 +147,38 @@ pub fn deblock_horizontal_at(level: Level, d: &mut [u16], base: usize, stride: u
             }
         }
     });
+}
+
+/// VP9 loop filter (8.8.5) of a group of `n` (4 or 8) lines across one edge with the same filter
+/// (`size` one of the `Vp9` ones): `d[base]` is q0 of the first line, the next lines follow it
+/// (`vertical`: one `stride` below each other; otherwise one sample apart, rows `stride` apart),
+/// and line l is filtered where bit l of `on` is set.
+#[allow(clippy::too_many_arguments)]
+pub fn vp9_deblock(d: &mut [u16], base: usize, stride: usize, vertical: bool, n: usize, on: u8, size: LfSize, t: &LfThresh) {
+    vp9_deblock_at(level(), d, base, stride, vertical, n, on, size, t);
+}
+
+/// [`vp9_deblock`] on a given level.
+#[allow(clippy::too_many_arguments)]
+pub fn vp9_deblock_at(level: Level, d: &mut [u16], base: usize, stride: usize, vertical: bool, n: usize, on: u8, size: LfSize, t: &LfThresh) {
+    let n = if n >= 8 { 8 } else { 4 };
+    let done = match (level, vertical) {
+        #[cfg(target_arch = "aarch64")]
+        (Level::Neon, true) => neon::deblock_vertical(d, base, stride, n, on, size, t),
+        #[cfg(target_arch = "aarch64")]
+        (Level::Neon, false) => neon::deblock_horizontal(d, base, stride, n, on, size, t),
+        #[cfg(target_arch = "x86_64")]
+        (Level::Sse2, true) => sse2::deblock_vertical(d, base, stride, n, on, size, t),
+        #[cfg(target_arch = "x86_64")]
+        (Level::Sse2, false) => sse2::deblock_horizontal(d, base, stride, n, on, size, t),
+        _ => false,
+    };
+    if !done {
+        let (along, across) = if vertical { (stride, 1) } else { (1, stride) };
+        for l in (0..n).filter(|l| on >> l & 1 == 1) {
+            scalar::deblock_line(d, base + l * along, across, size, t);
+        }
+    }
 }
 
 /// `lines` in chunks for the vector kernels: (first line, 8 or 4 lines).

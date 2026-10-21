@@ -85,16 +85,16 @@ type V = int16x8_t;
 
 /// `n` (4 or 8) lines across a horizontal edge (see [`crate::deblock_horizontal`]); `false`
 /// when the samples aren't all in `d`.
-pub(crate) fn deblock_horizontal(d: &mut [u16], base: usize, stride: usize, n: usize, size: LfSize, t: &LfThresh) -> bool {
+pub(crate) fn deblock_horizontal(d: &mut [u16], base: usize, stride: usize, n: usize, on: u8, size: LfSize, t: &LfThresh) -> bool {
     // SAFETY: NEON is part of the aarch64 baseline: every core this build runs on has it.
-    unsafe { horizontal(d, base, stride, n, size, t) }
+    unsafe { horizontal(d, base, stride, n, on, size, t) }
 }
 
 /// `n` (4 or 8) lines across a vertical edge (see [`crate::deblock_vertical`]); `false` when
 /// the samples aren't all in `d`.
-pub(crate) fn deblock_vertical(d: &mut [u16], base: usize, stride: usize, n: usize, size: LfSize, t: &LfThresh) -> bool {
+pub(crate) fn deblock_vertical(d: &mut [u16], base: usize, stride: usize, n: usize, on: u8, size: LfSize, t: &LfThresh) -> bool {
     // SAFETY: NEON is part of the aarch64 baseline: every core this build runs on has it.
-    unsafe { vertical(d, base, stride, n, size, t) }
+    unsafe { vertical(d, base, stride, n, on, size, t) }
 }
 
 crate::deblock::deblock_kernels!("neon");
@@ -156,8 +156,11 @@ fn any(m: V) -> bool {
     vmaxvq_u16(vreinterpretq_u16_s16(m)) != 0
 }
 #[target_feature(enable = "neon")]
-fn lanes4() -> V {
-    vcombine_s16(vdup_n_s16(-1), vdup_n_s16(0))
+fn lanes(on: u8) -> V {
+    const BITS: [i16; 8] = [1, 2, 4, 8, 16, 32, 64, 128];
+    // SAFETY: `BITS` is 8 i16, the 16 bytes `vld1q_s16` reads.
+    let bits = unsafe { vld1q_s16(BITS.as_ptr()) };
+    vreinterpretq_s16_u16(vtstq_s16(vdupq_n_s16(on as i16), bits))
 }
 #[target_feature(enable = "neon")]
 fn load4(s: &[u16; 4]) -> V {

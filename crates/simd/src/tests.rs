@@ -122,7 +122,7 @@ fn deblock_cases() -> Vec<(Vec<u16>, LfThresh, LfSize, u32, usize)> {
     for bd in [8, 10, 12] {
         let max = (1i32 << bd) - 1;
         let unit = 1i32 << (bd - 8);
-        for size in [LfSize::Four, LfSize::Six, LfSize::Eight, LfSize::Sixteen] {
+        for size in [LfSize::Four, LfSize::Six, LfSize::Eight, LfSize::Sixteen, LfSize::Vp9Four, LfSize::Vp9Eight, LfSize::Vp9Sixteen] {
             for _ in 0..3000 {
                 let noise = [0, 1, 2, 4, 16, 120][next() as usize % 6] * unit;
                 let step = [0, 1, 2, 3, 8, 40, 100][next() as usize % 7] * unit;
@@ -176,6 +176,37 @@ fn every_level_matches_the_scalar_loop_filter() {
     }
     // The cases reach the filters, not only the masks that turn them off.
     assert!(changed > total / 3, "{changed} of {total}");
+}
+
+#[test]
+fn every_level_matches_the_scalar_vp9_loop_filter_per_line() {
+    let mut seed = 0x0009_10f1u32;
+    let mut next = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        seed
+    };
+    for (i, (pic, t, size, vertical, _)) in deblock_cases().into_iter().enumerate() {
+        if !matches!(size, LfSize::Vp9Four | LfSize::Vp9Eight | LfSize::Vp9Sixteen) {
+            continue;
+        }
+        let vertical = vertical == 1;
+        let base = if vertical { 8 * 32 + 16 } else { 16 * 32 + 8 };
+        let n = if i % 3 == 0 { 4 } else { 8 };
+        let on = if i % 2 == 0 { 0xFF } else { next() as u8 };
+        // Every line on its own, as the scalar fallback filters them.
+        let mut want = pic.clone();
+        let (along, across) = if vertical { (32, 1) } else { (1, 32) };
+        for l in (0..n).filter(|l| on >> l & 1 == 1) {
+            crate::scalar::deblock_line(&mut want, base + l * along, across, size, &t);
+        }
+        for &level in levels() {
+            let mut got = pic.clone();
+            vp9_deblock_at(level, &mut got, base, 32, vertical, n, on, size, &t);
+            assert_eq!(got, want, "{level:?} {size:?} vertical {vertical} {n} lines on {on:#04x} {t:?}");
+        }
+    }
 }
 
 #[test]
