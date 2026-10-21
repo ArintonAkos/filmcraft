@@ -3,6 +3,7 @@
 use crate::frame::{MiGrid, MiInfo};
 use crate::header::{LoopFilterParams, Segmentation};
 use crate::tables::*;
+use filmcraft_simd::{LfSize, LfThresh};
 
 /// Frame-level loop filter setup (8.8.1) plus the per-level limits of 8.8.4.
 pub struct LfFrame {
@@ -15,6 +16,9 @@ pub struct LfFrame {
     pub ss_x: usize,
     pub ss_y: usize,
     pub bit_depth: u8,
+    /// Filter with `filmcraft_simd`'s vector kernels; without (the scalar level), with the
+    /// group filter below, which the compiler vectorizes for any target.
+    pub vector: bool,
 }
 
 impl LfFrame {
@@ -56,7 +60,8 @@ impl LfFrame {
             let limit = if sh > 0 { (l >> shift).clamp(1, 9 - sh) } else { (l >> shift).max(1) };
             *e = (limit, 2 * (l + 2) + limit, l >> 4);
         }
-        LfFrame { lvl, limits, mi_rows, mi_cols, ss_x: ss_x as usize, ss_y: ss_y as usize, bit_depth }
+        let vector = filmcraft_simd::level() != filmcraft_simd::Level::Scalar;
+        LfFrame { lvl, limits, mi_rows, mi_cols, ss_x: ss_x as usize, ss_y: ss_y as usize, bit_depth, vector }
     }
 
     fn level(&self, mi: &MiInfo) -> u8 {
@@ -146,6 +151,11 @@ fn filter_sb_plane(v: &mut PlaneView, mi: &MiGrid, f: &LfFrame, plane: usize, pa
                 let pos = (py - v.oy) * v.stride + px - v.ox;
                 let along = if pass == 0 { v.stride } else { 1 };
                 let lim = Limits { apply, limit, blimit, thresh, filter_size, bit_depth: f.bit_depth };
+                if f.vector {
+                    filter_group_simd(v.data, pos, v.stride, pass == 0, n, &lim);
+                    i += 8;
+                    continue;
+                }
                 let (d, st) = (&mut *v.data, across as usize);
                 match (f.bit_depth <= 10, filter_size == TX_16X16, pass == 1) {
                     (true, false, false) => lanes16::filter_group::<4, false>(d, pos, along, st, &lim),
@@ -165,6 +175,23 @@ fn filter_sb_plane(v: &mut PlaneView, mi: &MiGrid, f: &LfFrame, plane: usize, pa
 
 /// Samples along an edge filtered together.
 const LANES: usize = 8;
+
+/// The VP9 sample filter of a filter size.
+fn lf_size(filter_size: u8) -> LfSize {
+    match filter_size {
+        TX_4X4 => LfSize::Vp9Four,
+        TX_8X8 => LfSize::Vp9Eight,
+        _ => LfSize::Vp9Sixteen,
+    }
+}
+
+/// The group of `n` lines from q0 at `d[pos]` (`vertical` edge: one `stride` below each other,
+/// else side by side) through `filmcraft_simd`'s vector kernels.
+fn filter_group_simd(d: &mut [u16], pos: usize, stride: usize, vertical: bool, n: usize, g: &Limits) {
+    let on = g.apply.iter().enumerate().fold(0u8, |m, (l, &a)| m | ((a as u8) << l));
+    let t = LfThresh::new(g.limit, g.blimit, g.thresh, g.bit_depth as u32);
+    filmcraft_simd::vp9_deblock(d, pos, stride, vertical, n, on, lf_size(g.filter_size), &t);
+}
 
 /// Per-group filter parameters.
 struct Limits {
@@ -367,3 +394,69 @@ macro_rules! group_filter {
 }
 group_filter!(lanes16, i16);
 group_filter!(lanes32, i32);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The vector kernels filter every group as the group filter does: all filter sizes, bit
+    /// depths, edge directions and lane masks, on smooth sides (the flat filters) and steps.
+    #[test]
+    fn vector_kernels_match_the_group_filter() {
+        let mut seed = 0x1f00_d5edu32;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        let stride = 40usize;
+        let mut changed = 0;
+        for case in 0..30_000 {
+            let bit_depth = [8u8, 10, 12][case % 3];
+            let max = (1i32 << bit_depth) - 1;
+            let u = 1i32 << (bit_depth - 8);
+            let level = (next() % (max as u32 + 1)) as i32;
+            let step = [0, 1, 2, 5, 30, 90][next() as usize % 6] * u;
+            let noise = [0, 1, 2, 8][next() as usize % 4] * u;
+            let pass = case / 3 % 2;
+            let data: Vec<u16> = (0..stride * stride)
+                .map(|i| {
+                    let across = if pass == 0 { i % stride } else { i / stride };
+                    let n = if noise == 0 { 0 } else { (next() % (noise as u32 + 1)) as i32 - noise / 2 };
+                    (level + if across >= 16 { step } else { 0 } + n).clamp(0, max) as u16
+                })
+                .collect();
+            let lvl = 1 + (next() % 63) as i32;
+            let limit = (lvl >> (next() % 2)).max(1);
+            let mut apply: [bool; LANES] = if next() % 3 == 0 { std::array::from_fn(|_| next() % 4 != 0) } else { [true; LANES] };
+            let n = if next() % 4 == 0 { 4 } else { 8 };
+            apply[n..].fill(false);
+            let filter_size = [TX_4X4, TX_8X8, TX_16X16][next() as usize % 3];
+            let g = Limits { apply, limit, blimit: 2 * (lvl + 2) + limit, thresh: lvl >> 4, filter_size, bit_depth };
+            // q0 of the first line at (16, 8) for a vertical edge, (8, 16) for a horizontal one.
+            let pos = if pass == 0 { 8 * stride + 16 } else { 16 * stride + 8 };
+            let (along, across) = if pass == 0 { (stride, 1) } else { (1, stride) };
+            let mut want = data.clone();
+            match (bit_depth <= 10, filter_size == TX_16X16, pass == 1) {
+                (true, false, false) => lanes16::filter_group::<4, false>(&mut want, pos, along, across, &g),
+                (true, false, true) => lanes16::filter_group::<4, true>(&mut want, pos, along, across, &g),
+                (true, true, false) => lanes16::filter_group::<8, false>(&mut want, pos, along, across, &g),
+                (true, true, true) => lanes16::filter_group::<8, true>(&mut want, pos, along, across, &g),
+                (false, false, false) => lanes32::filter_group::<4, false>(&mut want, pos, along, across, &g),
+                (false, false, true) => lanes32::filter_group::<4, true>(&mut want, pos, along, across, &g),
+                (false, true, false) => lanes32::filter_group::<8, false>(&mut want, pos, along, across, &g),
+                (false, true, true) => lanes32::filter_group::<8, true>(&mut want, pos, along, across, &g),
+            }
+            changed += (want != data) as usize;
+            let on = apply.iter().enumerate().fold(0u8, |m, (l, &a)| m | ((a as u8) << l));
+            let t = LfThresh::new(g.limit, g.blimit, g.thresh, bit_depth as u32);
+            for &level in filmcraft_simd::levels() {
+                let mut got = data.clone();
+                filmcraft_simd::vp9_deblock_at(level, &mut got, pos, stride, pass == 0, n, on, lf_size(filter_size), &t);
+                assert_eq!(got, want, "{level:?} case {case} bd {bit_depth} size {filter_size} pass {pass} n {n} apply {apply:?}");
+            }
+        }
+        assert!(changed > 10_000, "{changed}");
+    }
+}
