@@ -4,7 +4,9 @@
 //! compound prediction (`vrhadd`). 8-bit sums are kept modulo 2^16, 8 lanes per vector, and
 //! narrowed as the scalar version's `narrow8` does; deeper samples take 32-bit sums, whose
 //! rounding narrowing shift `vqrshrun` is exactly Round2(sum, 7) clipped below at 0. Blocks 4
-//! wide take 4 lanes, wider ones vectors of 8.
+//! wide take 4 lanes, wider ones vectors of 8. Two-pass blocks go down strips of 8 (or 4)
+//! columns with the last 8 horizontally filtered rows in registers, so nothing is stored between
+//! the passes.
 
 use core::arch::aarch64::*;
 
@@ -76,13 +78,11 @@ impl Taps {
     }
 }
 
-/// 8 samples from `o`: `predict` checked `s` holds every offset the kernels load from plus 8
-/// (the temporary buffers are sized for it).
+/// 8 samples from `o`: `predict` checked `s` holds every offset the kernels load from plus 8.
 #[target_feature(enable = "neon")]
 fn ld8(s: &[u16], o: usize) -> uint16x8_t {
     debug_assert!(o + 8 <= s.len());
-    // SAFETY: `o + 8 <= s.len()` (checked by `predict`, or the temporary buffer's size), so the 8
-    // samples `vld1q_u16` reads are in `s`.
+    // SAFETY: `o + 8 <= s.len()` (checked by `predict`), so the 8 samples `vld1q_u16` reads are in `s`.
     unsafe { vld1q_u16(s.as_ptr().add(o)) }
 }
 
@@ -226,9 +226,6 @@ fn st4<const AVG: bool>(dst: &mut [u16], o: usize, p: uint16x4_t) {
     }
 }
 
-/// Room for the horizontal pass of the largest block (71 rows of 64) plus one vector.
-const TMP: usize = 71 * 64 + 8;
-
 /// A block `W` (8..=64) wide.
 #[target_feature(enable = "neon")]
 fn block<const W: usize, const AVG: bool, const WRAP: bool>(src: &[u16], ss: usize, k: &Taps, h: usize, max: u16, dst: &mut [u16], ds: usize) {
@@ -255,15 +252,15 @@ fn block<const W: usize, const AVG: bool, const WRAP: bool>(src: &[u16], ss: usi
             }
         }
         (Some(f), Some(g)) => {
-            let mut tmp = [0u16; TMP];
-            for i in 0..h + 7 {
-                for c in (0..W).step_by(8) {
-                    st8::<false>(&mut tmp, i * W + c, h8::<WRAP>(src, i * ss + c, f, max));
-                }
-            }
-            for i in 0..h {
-                for c in (0..W).step_by(8) {
-                    st8::<AVG>(dst, i * ds + c, v8::<WRAP>(&tmp, i * W + c, W, g, max));
+            // Down each strip of 8 columns, with the last 8 horizontally filtered rows in registers.
+            for c in (0..W).step_by(8) {
+                let mut x: [uint16x8_t; 8] = core::array::from_fn(|t| h8::<WRAP>(src, t * ss + c, f, max));
+                for i in 0..h {
+                    st8::<AVG>(dst, i * ds + c, fir8::<WRAP>(x, g, max));
+                    if i + 1 < h {
+                        let next = h8::<WRAP>(src, (i + 8) * ss + c, f, max);
+                        x = core::array::from_fn(|t| if t < 7 { x[t + 1] } else { next });
+                    }
                 }
             }
         }
@@ -290,12 +287,13 @@ fn block4<const AVG: bool, const WRAP: bool>(src: &[u16], ss: usize, k: &Taps, h
             }
         }
         (Some(f), Some(g)) => {
-            let mut tmp = [0u16; 71 * 4 + 8];
-            for i in 0..h + 7 {
-                st4::<false>(&mut tmp, i * 4, h4::<WRAP>(src, i * ss, f, max));
-            }
+            let mut x: [uint16x4_t; 8] = core::array::from_fn(|t| h4::<WRAP>(src, t * ss, f, max));
             for i in 0..h {
-                st4::<AVG>(dst, i * ds, v4::<WRAP>(&tmp, i * 4, 4, g, max));
+                st4::<AVG>(dst, i * ds, fir4::<WRAP>(x, g, max));
+                if i + 1 < h {
+                    let next = h4::<WRAP>(src, (i + 8) * ss, f, max);
+                    x = core::array::from_fn(|t| if t < 7 { x[t + 1] } else { next });
+                }
             }
         }
     }
