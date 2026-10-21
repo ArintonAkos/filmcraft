@@ -326,7 +326,6 @@ pub fn deblock_mb(pic: &mut PicState, addr: usize, mb_w: usize) {
             let r = q.ref_idx[l];
             r[1] == r[0] && r[2] == r[0] && r[3] == r[0] && q.mv[l].iter().all(|m| *m == q.mv[l][0])
         });
-        let qm: [Motion; 16] = std::array::from_fn(|r| block_motion(q, &qids, r));
         for dir in 0..2 {
             let neighbor = if dir == 0 { left } else { top };
             if let Some(n) = neighbor {
@@ -337,8 +336,11 @@ pub fn deblock_mb(pic: &mut PicState, addr: usize, mb_w: usize) {
                     let pids = ref_ids8(p, &pic.slices[p.slice_num as usize]);
                     for k in 0..4 {
                         let (rq, rp) = if dir == 0 { (k * 4, k * 4 + 3) } else { (k, 12 + k) };
-                        bs[dir][0][k] =
-                            if (p.nz_mask >> rp) & 1 != 0 || (q.nz_mask >> rq) & 1 != 0 { 2 } else { motion_bs(&block_motion(p, &pids, rp), &qm[rq]) };
+                        bs[dir][0][k] = if (p.nz_mask >> rp) & 1 != 0 || (q.nz_mask >> rq) & 1 != 0 {
+                            2
+                        } else {
+                            motion_bs(&block_motion(p, &pids, rp), &block_motion(q, &qids, rq))
+                        };
                     }
                 }
             }
@@ -352,7 +354,11 @@ pub fn deblock_mb(pic: &mut PicState, addr: usize, mb_w: usize) {
                 }
                 for k in 0..4 {
                     let (rq, rp) = if dir == 0 { (k * 4 + e, k * 4 + e - 1) } else { (e * 4 + k, e * 4 + k - 4) };
-                    bs[dir][e][k] = if (q.nz_mask >> rp) & 1 != 0 || (q.nz_mask >> rq) & 1 != 0 { 2 } else { motion_bs(&qm[rp], &qm[rq]) };
+                    bs[dir][e][k] = if (q.nz_mask >> rp) & 1 != 0 || (q.nz_mask >> rq) & 1 != 0 {
+                        2
+                    } else {
+                        motion_bs(&block_motion(q, &qids, rp), &block_motion(q, &qids, rq))
+                    };
                 }
             }
         }
@@ -365,9 +371,11 @@ pub fn deblock_mb(pic: &mut PicState, addr: usize, mb_w: usize) {
         let qpav = (qpp + qpq + 1) >> 1;
         let index_a = (qpav + alpha_off).clamp(0, 51) as usize;
         let index_b = (qpav + beta_off).clamp(0, 51) as usize;
-        let tc = |b: u8| if (1..4).contains(&b) { TC0[index_a][b as usize - 1] as i32 } else { 0 };
-        // 8-bit tables: alpha < 256, beta < 19, tC0 < 26.
-        filmcraft_simd::H264Edge { bs: b, tc0: [tc(b[0]), tc(b[1]), tc(b[2]), tc(b[3])].map(|t| t as u8), alpha: ALPHA[index_a], beta: BETA[index_b] }
+        // tC0 by bS: TC0's row for bS 1..=3, none for 0 and 4 (8-bit tables: alpha < 256, beta < 19,
+        // tC0 < 26).
+        let [t1, t2, t3] = TC0[index_a];
+        let tc = [0, t1, t2, t3, 0];
+        filmcraft_simd::H264Edge { bs: b, tc0: b.map(|b| tc[(b as usize).min(4)]), alpha: ALPHA[index_a], beta: BETA[index_b] }
     };
     let width = pic.planes.width;
     let cwidth = pic.planes.cwidth;
