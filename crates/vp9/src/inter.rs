@@ -53,6 +53,41 @@ pub fn predict(
     }
 }
 
+/// `dst[..n] = src[..n]` with a fixed-length copy for the block widths (and window widths,
+/// + 7) that occur, so that each row is a few inline loads and stores rather than a memcpy call.
+#[inline(always)]
+pub(crate) fn copy_samples(dst: &mut [u16], src: &[u16], n: usize) {
+    #[inline(always)]
+    fn fixed<const N: usize>(dst: &mut [u16], src: &[u16]) {
+        if let (Some(d), Some(s)) = (dst.first_chunk_mut::<N>(), src.first_chunk::<N>()) {
+            *d = *s;
+        }
+    }
+    match n {
+        4 => fixed::<4>(dst, src),
+        8 => fixed::<8>(dst, src),
+        16 => fixed::<16>(dst, src),
+        32 => fixed::<32>(dst, src),
+        64 => fixed::<64>(dst, src),
+        11 => fixed::<11>(dst, src),
+        15 => fixed::<15>(dst, src),
+        23 => fixed::<23>(dst, src),
+        39 => fixed::<39>(dst, src),
+        71 => fixed::<71>(dst, src),
+        _ => copy_samples_any(dst, src, n),
+    }
+}
+
+/// [`copy_samples`] of any length, out of line: inlined, the compiler merges the fixed-length
+/// copies with this variable-length one into one memcpy call of a run-time length.
+#[cold]
+#[inline(never)]
+fn copy_samples_any(dst: &mut [u16], src: &[u16], n: usize) {
+    if let (Some(d), Some(s)) = (dst.get_mut(..n), src.get(..n)) {
+        d.copy_from_slice(s);
+    }
+}
+
 /// Copy the (w + 7) x (h + 7) source window starting at (x0 - 3, y0 - 3) with edge clamping.
 fn fetch_window(r: &RefPlane, x0: i32, y0: i32, w: usize, h: usize, win: &mut [u16]) -> usize {
     let ws = w + 7;
@@ -62,7 +97,7 @@ fn fetch_window(r: &RefPlane, x0: i32, y0: i32, w: usize, h: usize, win: &mut [u
         let dst = &mut win[row * ws..row * ws + ws];
         let xs = x0 - 3;
         if xs >= 0 && xs + ws as i32 - 1 <= r.last_x {
-            dst.copy_from_slice(&src[xs as usize..xs as usize + ws]);
+            copy_samples(dst, &src[xs as usize..xs as usize + ws], ws);
         } else {
             for (c, d) in dst.iter_mut().enumerate() {
                 *d = src[(xs + c as i32).clamp(0, r.last_x) as usize];
@@ -92,7 +127,7 @@ fn predict_unscaled(r: &RefPlane, x: i32, y: i32, w: usize, h: usize, filter: u8
         (0, 0) => {
             for i in 0..h {
                 let s = so + (i + 3) * ss + 3;
-                out[i * w..i * w + w].copy_from_slice(&src[s..s + w]);
+                copy_samples(&mut out[i * w..i * w + w], &src[s..s + w], w);
             }
         }
         (_, 0) => {

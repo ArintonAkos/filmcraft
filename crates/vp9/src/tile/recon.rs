@@ -324,7 +324,7 @@ impl<'a> TileDecoder<'a> {
                     *d = ((a as u32 + bb as u32 + 1) >> 1) as u16;
                 }
             } else {
-                row.copy_from_slice(&self.pred[i * w..i * w + w]);
+                inter::copy_samples(row, &self.pred[i * w..i * w + w], w);
             }
         }
     }
