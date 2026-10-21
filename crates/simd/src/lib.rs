@@ -300,61 +300,76 @@ fn cdef_pick(cost: &[i32; 8]) -> (usize, i32) {
     (dir, (best - cost[(dir + 4) & 7]) >> 10)
 }
 
-/// Whether a `w` x `h` block window starting at `win[0]` with rows `ws` apart, and the block
-/// itself in `out` with rows `os` apart, fit their slices.
-fn block_fits(win: &[u8], ws: usize, ww: usize, wh: usize, out: &[u8], os: usize, w: usize, h: usize) -> bool {
+/// How an H.264 prediction is written into the picture (8.4.2.3), for 8-bit video: weights and
+/// offsets -128..=127, `log_wd` (logWD) up to 7.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum H264Out {
+    /// `dst = p`.
+    Put,
+    /// Default bi-prediction, `dst` holding the first prediction: `dst = (dst + p + 1) >> 1`.
+    Avg,
+    /// A weighted single prediction: `Clip1(((p * w + 2^(log_wd - 1)) >> log_wd) + o)`
+    /// (`Clip1(p * w + o)` for `log_wd` 0).
+    Weight { w: i32, o: i32, log_wd: u32 },
+    /// Weighted bi-prediction, `dst` holding the first prediction:
+    /// `Clip1(((dst * w0 + p * w1 + 2^log_wd) >> (log_wd + 1)) + o)`, `o` = (o0 + o1 + 1) >> 1.
+    WeightBi { w0: i32, w1: i32, o: i32, log_wd: u32 },
+}
+
+/// Whether a `ww` x `wh` window (rows `ws` apart) fits `win` and the `w` x `h` block (rows `ds`
+/// apart) fits `dst`.
+fn block_fits(win: &[u8], ws: usize, ww: usize, wh: usize, dst: &[u8], ds: usize, w: usize, h: usize) -> bool {
     let need = |len: usize, stride: usize, cols: usize, rows: usize| {
         rows == 0 || (rows - 1).checked_mul(stride).and_then(|n| n.checked_add(cols)).is_some_and(|n| n <= len)
     };
-    need(win.len(), ws, ww, wh) && need(out.len(), os, w, h)
+    need(win.len(), ws, ww, wh) && need(dst.len(), ds, w, h)
 }
 
-/// H.264 luma sample interpolation (8.4.2.2.1) of a `w` x `h` block (`w` and `h` 4, 8 or 16):
-/// `win` holds the (w + 5) x (h + 5) window starting at (x - 2, y - 2), rows `ws` apart, and
-/// (`fx`, `fy`) is the quarter-sample fraction; `out` gets the block, rows `os` apart. The vector
-/// version reads 16 samples from up to 5 past each window row's start (it needs
-/// `(h + 4) * ws + 21` samples, and otherwise the scalar one runs). Blocks that do not fit
-/// `win` or `out` leave `out` unchanged.
-pub fn h264_luma(win: &[u8], ws: usize, fx: u32, fy: u32, w: usize, h: usize, out: &mut [u8], os: usize) {
-    h264_luma_at(level(), win, ws, fx, fy, w, h, out, os);
+/// H.264 luma prediction (8.4.2.2.1, 8.4.2.3) of a `w` x `h` block (`w` and `h` 4, 8 or 16),
+/// written into `dst` (rows `ds` apart) as `out` says. `win` holds the (w + 5) x (h + 5)
+/// reference window from (x - 2, y - 2), rows `ws` apart; (`fx`, `fy`) is the quarter-sample
+/// fraction. The vector version reads 16 (8 for blocks up to 8 wide) samples from up to 5 past
+/// each window row's start, so it needs `(h + 4) * ws + 21` (`+ 13`) of them and otherwise the
+/// scalar one runs. Blocks that do not fit leave `dst` unchanged.
+pub fn h264_luma(win: &[u8], ws: usize, fx: u32, fy: u32, w: usize, h: usize, dst: &mut [u8], ds: usize, out: H264Out) {
+    h264_luma_at(level(), win, ws, fx, fy, w, h, dst, ds, out);
 }
 
 /// [`h264_luma`] on a given level.
-pub fn h264_luma_at(level: Level, win: &[u8], ws: usize, fx: u32, fy: u32, w: usize, h: usize, out: &mut [u8], os: usize) {
-    if !matches!(w, 4 | 8 | 16) || !matches!(h, 4 | 8 | 16) || fx > 3 || fy > 3 || !block_fits(win, ws, w + 5, h + 5, out, os, w, h) {
+pub fn h264_luma_at(level: Level, win: &[u8], ws: usize, fx: u32, fy: u32, w: usize, h: usize, dst: &mut [u8], ds: usize, out: H264Out) {
+    if !matches!(w, 4 | 8 | 16) || !matches!(h, 4 | 8 | 16) || fx > 3 || fy > 3 || !block_fits(win, ws, w + 5, h + 5, dst, ds, w, h) {
         return;
     }
     let done = match level {
         #[cfg(target_arch = "aarch64")]
-        Level::Neon => h264_neon::luma(win, ws, fx, fy, w, h, out, os),
+        Level::Neon => h264_neon::luma(win, ws, fx, fy, w, h, dst, ds, out),
         _ => false,
     };
     if !done {
-        h264::luma(win, ws, fx, fy, w, h, out, os);
+        h264::luma_out(win, ws, fx, fy, w, h, dst, ds, out);
     }
 }
 
-/// H.264 chroma sample interpolation (8.4.2.2.2) of a `w` x `h` block (`w` and `h` 2, 4 or 8):
-/// `win` holds the (w + 1) x (h + 1) window from the block's integer position, rows `ws` apart,
-/// and (`fx`, `fy`) is the eighth-sample fraction; `out` gets the block, rows `os` apart. The
-/// vector version reads 8 samples from up to 1 past each window row's start (it needs
-/// `h * ws + 9`). Blocks that do not fit `win` or `out` leave `out` unchanged.
-pub fn h264_chroma(win: &[u8], ws: usize, fx: u32, fy: u32, w: usize, h: usize, out: &mut [u8], os: usize) {
-    h264_chroma_at(level(), win, ws, fx, fy, w, h, out, os);
+/// H.264 chroma prediction (8.4.2.2.2, 8.4.2.3) of a `w` x `h` block (`w` and `h` 2, 4 or 8)
+/// into `dst` as `out` says. `win` holds the (w + 1) x (h + 1) window from the block's integer
+/// position, rows `ws` apart (the vector version reads 9 samples from each row's start: it needs
+/// `h * ws + 9`); (`fx`, `fy`) is the eighth-sample fraction.
+pub fn h264_chroma(win: &[u8], ws: usize, fx: u32, fy: u32, w: usize, h: usize, dst: &mut [u8], ds: usize, out: H264Out) {
+    h264_chroma_at(level(), win, ws, fx, fy, w, h, dst, ds, out);
 }
 
 /// [`h264_chroma`] on a given level.
-pub fn h264_chroma_at(level: Level, win: &[u8], ws: usize, fx: u32, fy: u32, w: usize, h: usize, out: &mut [u8], os: usize) {
-    if !matches!(w, 2 | 4 | 8) || !matches!(h, 2 | 4 | 8) || fx > 7 || fy > 7 || !block_fits(win, ws, w + 1, h + 1, out, os, w, h) {
+pub fn h264_chroma_at(level: Level, win: &[u8], ws: usize, fx: u32, fy: u32, w: usize, h: usize, dst: &mut [u8], ds: usize, out: H264Out) {
+    if !matches!(w, 2 | 4 | 8) || !matches!(h, 2 | 4 | 8) || fx > 7 || fy > 7 || !block_fits(win, ws, w + 1, h + 1, dst, ds, w, h) {
         return;
     }
     let done = match level {
         #[cfg(target_arch = "aarch64")]
-        Level::Neon => h264_neon::chroma(win, ws, fx, fy, w, h, out, os),
+        Level::Neon => h264_neon::chroma(win, ws, fx, fy, w, h, dst, ds, out),
         _ => false,
     };
     if !done {
-        h264::chroma(win, ws, fx, fy, w, h, out, os);
+        h264::chroma_out(win, ws, fx, fy, w, h, dst, ds, out);
     }
 }
 

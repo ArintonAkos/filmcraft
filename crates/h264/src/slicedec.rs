@@ -3,7 +3,7 @@
 use crate::cavlc;
 use crate::deblock;
 use crate::error::{Result, ensure, invalid};
-use crate::inter::{self, Weight};
+use crate::inter::Weight;
 use crate::intra::{self, Avail};
 use crate::mbtypes::*;
 use crate::params::{Pps, Sps};
@@ -12,6 +12,7 @@ use crate::slice::{SliceHeader, SliceType};
 use crate::tables::*;
 use crate::transform::{self, LevelScale};
 use filmcraft_bitstream::BitReader;
+use filmcraft_simd::H264Out;
 
 /// Per-slice data kept with the picture (deblocking, motion field export).
 #[derive(Clone, Debug, Default)]
@@ -167,13 +168,11 @@ pub(crate) struct Scratch {
     pub blk_nz: u16,
     /// Chroma blocks with coefficients (bit per raster 2x2 block).
     pub c_nz: [u8; 2],
-    pub pred: [[u8; 256]; 2],
-    pub pred_c: [[[u8; 64]; 2]; 2],
 }
 
 impl Scratch {
     pub fn new() -> Box<Self> {
-        Box::new(Scratch { coef: [0; 256], coef_c: [[0; 64]; 2], blk_nz: 0, c_nz: [0; 2], pred: [[0; 256]; 2], pred_c: [[[0; 64]; 2]; 2] })
+        Box::new(Scratch { coef: [0; 256], coef_c: [[0; 64]; 2], blk_nz: 0, c_nz: [0; 2] })
     }
 }
 
@@ -214,25 +213,27 @@ pub struct SliceDecoder<'a> {
     pub prev_qp_delta_nz: bool,
 }
 
-/// Interpolate a bw x bh luma block at (px, py) with motion vector `mv` from reference `f` into `y`,
-/// and the corresponding chroma blocks into `c` (stride `cs`).
+/// Predict a bw x bh luma block at (px, py) with motion vector `mv` from reference `f` into `y`
+/// (block origin, stride), and the corresponding chroma blocks into `c` (stride `cs`), each
+/// written as `out` says (luma, Cb, Cr), from reference windows copied out with the picture's
+/// edge samples repeated.
 #[allow(clippy::too_many_arguments)]
 #[inline]
-fn predict_block(f: &Frame, mv: [i16; 2], px: usize, py: usize, bw: usize, bh: usize, y: (&mut [u8], usize), c: [&mut [u8]; 2], cs: usize) {
+fn predict_block(f: &Frame, mv: [i16; 2], px: usize, py: usize, bw: usize, bh: usize, y: (&mut [u8], usize), c: [&mut [u8]; 2], cs: usize, out: [H264Out; 3]) {
     const LW: usize = 24;
     let mut win = [0u8; LW * 21];
     let ix = px as i32 + (mv[0] as i32 >> 2);
     let iy = py as i32 + (mv[1] as i32 >> 2);
     f.luma_window(ix - 2, iy - 2, bw + 5, bh + 5, &mut win, LW);
-    inter::mc_luma_win(&win, LW, (mv[0] & 3) as u32, (mv[1] & 3) as u32, bw, bh, y.0, y.1);
+    filmcraft_simd::h264_luma(&win, LW, (mv[0] & 3) as u32, (mv[1] & 3) as u32, bw, bh, y.0, y.1, out[0]);
     let cx = (px / 2) as i32 + (mv[0] as i32 >> 3);
     let cy = (py / 2) as i32 + (mv[1] as i32 >> 3);
     let (cw, ch) = (bw / 2, bh / 2);
     let (fx, fy) = ((mv[0] & 7) as u32, (mv[1] & 7) as u32);
-    for (comp, out) in c.into_iter().enumerate() {
+    for (comp, (dst, out)) in c.into_iter().zip([out[1], out[2]]).enumerate() {
         let mut w = [0u8; 16 * 9];
         f.chroma_window(comp, cx, cy, cw + 1, ch + 1, &mut w, 16);
-        inter::mc_chroma_win(&w, 16, fx, fy, cw, ch, out, cs);
+        filmcraft_simd::h264_chroma(&w, 16, fx, fy, cw, ch, dst, cs, out);
     }
 }
 
@@ -739,39 +740,28 @@ impl<'a> SliceDecoder<'a> {
         let ys = self.pic.planes.width;
         let cs = self.pic.planes.cwidth;
         let (cx, cy) = (px / 2, py / 2);
-        if use0 != use1 && wts.iter().all(|w| *w == Weight::Default) {
-            // single-list unweighted prediction: interpolate straight into the picture
-            let l = if use0 { 0 } else { 1 };
-            let f = &self.refs[l][refs[l] as usize].frame;
-            let planes = &mut self.pic.planes;
-            predict_block(f, mvs[l], px, py, bw, bh, (&mut planes.y[py * ys + px..], ys), [&mut planes.cb[cy * cs + cx..], &mut planes.cr[cy * cs + cx..]], cs);
-            return;
-        }
-        let s = &mut *self.s;
+        // Each prediction goes straight into the picture: the first is put (or weighted, alone),
+        // the second averaged (or weighted) with it (8.4.2.3).
+        let bi = use0 && use1;
+        let mut first = true;
         for l in 0..2 {
-            if refs[l] < 0 {
+            if !(if l == 0 { use0 } else { use1 }) {
                 continue;
             }
             let Some(rp) = self.refs[l].get(refs[l] as usize) else { continue };
-            let [pc0, pc1] = &mut s.pred_c[l];
-            predict_block(&rp.frame, mvs[l], px, py, bw, bh, (&mut s.pred[l][..], 16), [&mut pc0[..], &mut pc1[..]], 8);
-        }
-        inter::weighted_store(
-            &mut self.pic.planes.y[py * ys + px..],
-            ys,
-            if use0 { Some(&s.pred[0][..]) } else { None },
-            if use1 { Some(&s.pred[1][..]) } else { None },
-            16,
-            bw,
-            bh,
-            wts[0],
-        );
-        for c in 0..2 {
-            let wc = wts[c + 1];
-            let a = if use0 { Some(&s.pred_c[0][c][..]) } else { None };
-            let b = if use1 { Some(&s.pred_c[1][c][..]) } else { None };
-            let plane = if c == 0 { &mut self.pic.planes.cb } else { &mut self.pic.planes.cr };
-            inter::weighted_store(&mut plane[cy * cs + cx..], cs, a, b, 8, bw / 2, bh / 2, wc);
+            let out = wts.map(|w| match (w, first, bi) {
+                (Weight::Default, true, _) | (Weight::Weighted { .. }, true, true) => H264Out::Put,
+                (Weight::Default, false, _) => H264Out::Avg,
+                (Weight::Weighted { log_wd, w0, w1, o0, o1 }, true, false) => {
+                    let (w, o) = if l == 0 { (w0, o0) } else { (w1, o1) };
+                    H264Out::Weight { w, o, log_wd: log_wd as u32 }
+                }
+                (Weight::Weighted { log_wd, w0, w1, o0, o1 }, false, _) => H264Out::WeightBi { w0, w1, o: (o0 + o1 + 1) >> 1, log_wd: log_wd as u32 },
+            });
+            let planes = &mut self.pic.planes;
+            let y = (&mut planes.y[py * ys + px..], ys);
+            predict_block(&rp.frame, mvs[l], px, py, bw, bh, y, [&mut planes.cb[cy * cs + cx..], &mut planes.cr[cy * cs + cx..]], cs, out);
+            first = false;
         }
     }
 

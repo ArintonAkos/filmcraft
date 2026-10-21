@@ -2,7 +2,7 @@
 //! filters (8.7.2), scalar: the references the vector versions must match (the code
 //! filmcraft-h264 used before the vector kernels).
 
-use crate::H264Edge;
+use crate::{H264Edge, H264Out};
 
 const WIN: usize = 16 + 5;
 
@@ -53,6 +53,48 @@ fn vtap_row(rows: [&[u8]; 6], out: &mut [i32], n: usize) {
     let [a, b, c, d, e, f] = rows.map(|r| &r[..n]);
     for i in 0..n {
         out[i] = tap6(a[i] as i32, b[i] as i32, c[i] as i32, d[i] as i32, e[i] as i32, f[i] as i32);
+    }
+}
+
+/// See [`crate::h264_luma`]: interpolated straight into `dst` (put), or into a block that is
+/// then written out.
+pub(crate) fn luma_out(win: &[u8], ws: usize, fx: u32, fy: u32, w: usize, h: usize, dst: &mut [u8], ds: usize, out: H264Out) {
+    if out == H264Out::Put {
+        return luma(win, ws, fx, fy, w, h, dst, ds);
+    }
+    let mut pred = [0u8; 16 * 16];
+    luma(win, ws, fx, fy, w, h, &mut pred, 16);
+    write_out(dst, ds, &pred, 16, w, h, out);
+}
+
+/// See [`crate::h264_chroma`].
+pub(crate) fn chroma_out(win: &[u8], ws: usize, fx: u32, fy: u32, w: usize, h: usize, dst: &mut [u8], ds: usize, out: H264Out) {
+    if out == H264Out::Put {
+        return chroma(win, ws, fx, fy, w, h, dst, ds);
+    }
+    let mut pred = [0u8; 8 * 8];
+    chroma(win, ws, fx, fy, w, h, &mut pred, 8);
+    write_out(dst, ds, &pred, 8, w, h, out);
+}
+
+/// The w x h prediction `pred` (rows `ps` apart) into `dst` as `out` says (8.4.2.3).
+fn write_out(dst: &mut [u8], ds: usize, pred: &[u8], ps: usize, w: usize, h: usize, out: H264Out) {
+    for r in 0..h {
+        for c in 0..w {
+            let (Some(&p), Some(d)) = (pred.get(r * ps + c), dst.get_mut(r * ds + c)) else {
+                continue;
+            };
+            let (p, x) = (p as i32, *d as i32);
+            *d = match out {
+                H264Out::Put => p as u8,
+                H264Out::Avg => ((x + p + 1) >> 1) as u8,
+                H264Out::Weight { w, o, log_wd } => {
+                    let round = if log_wd >= 1 { 1 << (log_wd - 1) } else { 0 };
+                    clip1(((p * w + round) >> log_wd) + o)
+                }
+                H264Out::WeightBi { w0, w1, o, log_wd } => clip1(((x * w0 + p * w1 + (1 << log_wd)) >> (log_wd + 1)) + o),
+            };
+        }
     }
 }
 

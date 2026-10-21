@@ -47,11 +47,13 @@ fn tap6(a: i32, b: i32, c: i32, d: i32, e: i32, f: i32) -> i32 {
     a - 5 * b + 20 * c + 20 * d - 5 * e + f
 }
 
+#[cfg(test)]
 #[inline(always)]
 fn clip1(v: i32) -> u8 {
     v.clamp(0, 255) as u8
 }
 
+#[cfg(test)]
 /// Copy `n` bytes with a fixed-size move for the common block widths.
 #[inline(always)]
 fn copy_n(dst: &mut [u8], src: &[u8], n: usize) {
@@ -86,11 +88,12 @@ pub fn mc_luma(p: PlaneRef, x: i32, y: i32, fx: u32, fy: u32, bw: usize, bh: usi
     mc_luma_win(src, ss, fx, fy, bw, bh, out, os);
 }
 
-/// Luma interpolation from a prepared window: `src[0]` is the sample at (x - 2, y - 2) and `ss` the
-/// window stride; the window covers (bw + 5) x (bh + 5) samples.
+/// Luma interpolation from a window whose rows are `ss` apart in `src` (`src[0]` is the sample at
+/// (x - 2, y - 2)), put into `out`: the tests' entry to the decoder's kernel.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub fn mc_luma_win(src: &[u8], ss: usize, fx: u32, fy: u32, bw: usize, bh: usize, out: &mut [u8], os: usize) {
-    filmcraft_simd::h264_luma(src, ss, fx, fy, bw, bh, out, os);
+    filmcraft_simd::h264_luma(src, ss, fx, fy, bw, bh, out, os, filmcraft_simd::H264Out::Put);
 }
 
 /// Chroma sample interpolation (8.4.2.2.2) for a bw x bh block at integer position (x, y) with
@@ -117,11 +120,11 @@ pub fn mc_chroma(p: PlaneRef, x: i32, y: i32, fx: u32, fy: u32, bw: usize, bh: u
     mc_chroma_win(src, ss, fx, fy, bw, bh, out, os);
 }
 
-/// Chroma interpolation from a prepared (bw + 1) x (bh + 1) window whose first sample is the integer
-/// position of the block.
+/// Chroma interpolation from a window whose rows are `ss` apart in `src`, put into `out` (tests).
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub fn mc_chroma_win(src: &[u8], ss: usize, fx: u32, fy: u32, bw: usize, bh: usize, out: &mut [u8], os: usize) {
-    filmcraft_simd::h264_chroma(src, ss, fx, fy, bw, bh, out, os);
+    filmcraft_simd::h264_chroma(src, ss, fx, fy, bw, bh, out, os, filmcraft_simd::H264Out::Put);
 }
 
 /// Weights for one prediction direction or pair.
@@ -133,7 +136,9 @@ pub enum Weight {
     Weighted { log_wd: i32, w0: i32, w1: i32, o0: i32, o1: i32 },
 }
 
-/// Combine prediction(s) into `dst` (stride `ds`). `p0`/`p1` have stride `ps`.
+/// Combine prediction(s) into `dst` (stride `ds`). `p0`/`p1` have stride `ps`: the reference for
+/// the prediction kernels' output modes (`filmcraft_simd::H264Out`).
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub fn weighted_store(dst: &mut [u8], ds: usize, p0: Option<&[u8]>, p1: Option<&[u8]>, ps: usize, bw: usize, bh: usize, w: Weight) {
     match (p0, p1, w) {

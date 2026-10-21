@@ -317,7 +317,7 @@ fn cdef_filter_falls_back_when_a_tap_leaves_the_buffer() {
 }
 
 #[test]
-fn every_level_matches_the_scalar_h264_interpolation() {
+fn every_level_matches_the_scalar_h264_prediction() {
     let mut seed = 0x0264_5eedu32;
     let mut next = move || {
         seed ^= seed << 13;
@@ -325,32 +325,42 @@ fn every_level_matches_the_scalar_h264_interpolation() {
         seed ^= seed << 5;
         seed
     };
-    for case in 0..6_000 {
+    for case in 0..12_000 {
         // Windows of extremes as well as random samples, so clipping and saturation are hit.
         let sample = |n: u32| match n % 4 {
             0 => 0u8,
             1 => 255,
             _ => (n >> 3) as u8,
         };
-        let ws = 24 + (case % 3) * 8;
-        let win: Vec<u8> = (0..ws * 22).map(|_| sample(next())).collect();
+        // Window strides and lengths: long enough for the vector loads or (some) not.
+        let ws = [24, 32, 21, 16][case % 4];
+        let win: Vec<u8> = (0..ws * 21 - [0, 0, 3, 8][case / 4 % 4]).map(|_| sample(next())).collect();
+        let w8 = |n: u32| (n % 256) as i32 - 128;
+        let out = match next() % 6 {
+            0 | 1 => H264Out::Put,
+            2 => H264Out::Avg,
+            3 => H264Out::Weight { w: w8(next()), o: w8(next()), log_wd: next() % 8 },
+            4 => H264Out::Weight { w: (next() % 65) as i32, o: 0, log_wd: 5 },
+            _ => H264Out::WeightBi { w0: w8(next()), w1: w8(next()), o: w8(next()), log_wd: next() % 8 },
+        };
+        let dst0: Vec<u8> = (0..16 * 20).map(|_| sample(next())).collect();
         let (w, h) = [(16, 16), (16, 8), (8, 16), (8, 8), (8, 4), (4, 8), (4, 4)][case % 7];
         let (fx, fy) = (next() % 4, next() % 4);
-        let mut want = vec![7u8; 16 * 16];
-        h264_luma_at(Level::Scalar, &win, ws, fx, fy, w, h, &mut want, 16);
+        let mut want = dst0.clone();
+        h264_luma_at(Level::Scalar, &win, ws, fx, fy, w, h, &mut want, 20, out);
         for &level in levels() {
-            let mut got = vec![7u8; 16 * 16];
-            h264_luma_at(level, &win, ws, fx, fy, w, h, &mut got, 16);
-            assert_eq!(got, want, "{level:?} luma {w}x{h} frac {fx},{fy}");
+            let mut got = dst0.clone();
+            h264_luma_at(level, &win, ws, fx, fy, w, h, &mut got, 20, out);
+            assert_eq!(got, want, "{level:?} luma {w}x{h} frac {fx},{fy} {out:?} window {ws} x {}", win.len());
         }
         let (cw, ch) = [(8, 8), (8, 4), (4, 8), (4, 4), (4, 2), (2, 4), (2, 2)][case % 7];
         let (cx, cy) = (next() % 8, next() % 8);
-        let mut want = vec![7u8; 8 * 8];
-        h264_chroma_at(Level::Scalar, &win, ws, cx, cy, cw, ch, &mut want, 8);
+        let mut want = dst0.clone();
+        h264_chroma_at(Level::Scalar, &win, ws, cx, cy, cw, ch, &mut want, 20, out);
         for &level in levels() {
-            let mut got = vec![7u8; 8 * 8];
-            h264_chroma_at(level, &win, ws, cx, cy, cw, ch, &mut got, 8);
-            assert_eq!(got, want, "{level:?} chroma {cw}x{ch} frac {cx},{cy}");
+            let mut got = dst0.clone();
+            h264_chroma_at(level, &win, ws, cx, cy, cw, ch, &mut got, 20, out);
+            assert_eq!(got, want, "{level:?} chroma {cw}x{ch} frac {cx},{cy} {out:?}");
         }
     }
 }

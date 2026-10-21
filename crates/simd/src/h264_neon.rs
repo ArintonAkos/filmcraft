@@ -1,224 +1,335 @@
-//! NEON kernels for H.264 8-bit inter prediction (8.4.2.2). Luma: 16 lanes of samples, the
-//! 6-tap sums in 16-bit lanes (they fit: -2550..=10710), the centre position's second pass in
-//! 32-bit lanes; the rounding narrowing shifts `vqrshrun` are exactly Clip1((v + 16) >> 5) and
-//! Clip1((v + 512) >> 10). Chroma: the bilinear weights in 16-bit lanes.
+//! NEON kernels for H.264 8-bit inter prediction (8.4.2.2, 8.4.2.3) and deblocking (8.7.2).
+//!
+//! Prediction reads the block's reference window and writes the block straight into the picture:
+//! put, the rounding average of bi-prediction (`vrhadd`), or weighted prediction, each a kernel
+//! of its own (the mode is a const parameter). Luma blocks 16 wide take 16 lanes
+//! (6-tap sums in two vectors of 16-bit lanes), 8- and 4-wide ones 8 lanes; the sums fit 16 bits
+//! (-2550..=10710), the centre position's second pass takes 32-bit lanes, and the rounding
+//! narrowing shifts `vqrshrun` are exactly Clip1((v + 16) >> 5) and Clip1((v + 512) >> 10).
 
 use core::arch::aarch64::*;
 
-/// Samples loaded per window row: 16, from up to 5 past the row start.
-const REACH: usize = 5 + 16;
+use crate::H264Out;
 
-/// See [`crate::h264_luma`]; false when the window or `out` is too small for the vector loads
-/// and stores (the caller then takes the scalar version).
-pub(crate) fn luma(win: &[u8], ws: usize, fx: u32, fy: u32, w: usize, h: usize, out: &mut [u8], os: usize) -> bool {
-    let fits = matches!(w, 4 | 8 | 16)
-        && (1..=16).contains(&h)
-        && (h + 4).checked_mul(ws).and_then(|n| n.checked_add(REACH)).is_some_and(|n| n <= win.len())
-        && (h - 1).checked_mul(os).and_then(|n| n.checked_add(w)).is_some_and(|n| n <= out.len());
-    if fits {
-        // SAFETY: NEON is part of the aarch64 baseline: every core this build runs on has it.
-        unsafe { luma_neon(win, ws, fx, fy, w, h, out, os) };
-    }
-    fits
+/// Output modes, the const parameter of the kernels.
+const PUT: u8 = 0;
+const AVG: u8 = 1;
+const WEIGHT: u8 = 2;
+const WEIGHT_BI: u8 = 3;
+
+/// The weights of an output mode (unused ones zero).
+#[derive(Clone, Copy)]
+struct Wt {
+    w0: i16,
+    w1: i16,
+    o: i16,
+    log_wd: i16,
 }
 
-/// 16 samples of `win` from `o`. Every offset the luma kernel loads from is at most
-/// `(h + 4) * ws + 5` (window row h + 4, column 5), and `luma` checked `win` holds that plus 16.
+/// The kernel parameter and weights of `out`, or None when the weights are outside 8-bit H.264's
+/// range (-128..=127, log2 denominator up to 7), for which the single weighting fits 16-bit lanes.
+fn mode(out: H264Out) -> Option<(u8, Wt)> {
+    let r = |v: i32| (-128..=127).contains(&v);
+    let z = Wt { w0: 0, w1: 0, o: 0, log_wd: 0 };
+    match out {
+        H264Out::Put => Some((PUT, z)),
+        H264Out::Avg => Some((AVG, z)),
+        H264Out::Weight { w, o, log_wd } if r(w) && r(o) && log_wd <= 7 => Some((WEIGHT, Wt { w0: w as i16, o: o as i16, log_wd: log_wd as i16, ..z })),
+        H264Out::WeightBi { w0, w1, o, log_wd } if r(w0) && r(w1) && r(o) && log_wd <= 7 => {
+            Some((WEIGHT_BI, Wt { w0: w0 as i16, w1: w1 as i16, o: o as i16, log_wd: log_wd as i16 }))
+        }
+        _ => None,
+    }
+}
+
+/// Whether the w x h block fits `dst` (rows `ds` apart).
+fn dst_fits(dst: &[u8], ds: usize, w: usize, h: usize) -> bool {
+    h == 0 || (h - 1).checked_mul(ds).and_then(|n| n.checked_add(w)).is_some_and(|n| n <= dst.len())
+}
+
+/// See [`crate::h264_luma`]; false when the window is too small for the vector loads (16
+/// samples, 8 for blocks up to 8 wide, from up to 5 past each row's start), `dst` too small, or
+/// the weights out of range: the scalar version then runs.
+pub(crate) fn luma(win: &[u8], ws: usize, fx: u32, fy: u32, w: usize, h: usize, dst: &mut [u8], ds: usize, out: H264Out) -> bool {
+    let lanes = if w == 16 { 16 } else { 8 };
+    let Some((m, wt)) = mode(out) else {
+        return false;
+    };
+    let fits = matches!(w, 4 | 8 | 16)
+        && (1..=16).contains(&h)
+        && (h + 4).checked_mul(ws).and_then(|n| n.checked_add(5 + lanes)).is_some_and(|n| n <= win.len())
+        && dst_fits(dst, ds, w, h);
+    if !fits {
+        return false;
+    }
+    // SAFETY: NEON is part of the aarch64 baseline: every core this build runs on has it (every arm).
+    unsafe {
+        match (w == 16, m) {
+            (true, PUT) => luma16::<PUT>(win, ws, fx, fy, h, dst, ds, wt),
+            (true, AVG) => luma16::<AVG>(win, ws, fx, fy, h, dst, ds, wt),
+            (true, WEIGHT) => luma16::<WEIGHT>(win, ws, fx, fy, h, dst, ds, wt),
+            (true, _) => luma16::<WEIGHT_BI>(win, ws, fx, fy, h, dst, ds, wt),
+            (false, PUT) => luma8::<PUT>(win, ws, fx, fy, w, h, dst, ds, wt),
+            (false, AVG) => luma8::<AVG>(win, ws, fx, fy, w, h, dst, ds, wt),
+            (false, WEIGHT) => luma8::<WEIGHT>(win, ws, fx, fy, w, h, dst, ds, wt),
+            (false, _) => luma8::<WEIGHT_BI>(win, ws, fx, fy, w, h, dst, ds, wt),
+        }
+    }
+    true
+}
+
+/// 16 samples of the window from `o`: `luma` checked `win` holds every offset the kernel
+/// loads from (at most window row h + 4, column 5) plus 16.
 #[target_feature(enable = "neon")]
-fn ld(win: &[u8], o: usize) -> uint8x16_t {
+fn ld16(win: &[u8], o: usize) -> uint8x16_t {
     debug_assert!(o + 16 <= win.len());
-    // SAFETY: `o + 16 <= win.len()` for every offset `luma_neon` passes (see above), so the 16
-    // bytes `vld1q_u8` reads are inside `win`.
+    // SAFETY: `o + 16 <= win.len()` (see above), so the 16 bytes `vld1q_u8` reads are in `win`.
     unsafe { vld1q_u8(win.as_ptr().add(o)) }
 }
 
-/// The first `w` lanes of `v` into `out` from `o`.
+/// 8 samples of the window from `o` (checked as for [`ld16`], for 8 lanes).
 #[target_feature(enable = "neon")]
-fn put(out: &mut [u8], o: usize, w: usize, v: uint8x16_t) {
-    let mut t = [0u8; 16];
-    // SAFETY: `t` is 16 bytes, the 16 bytes `vst1q_u8` writes.
-    unsafe { vst1q_u8(t.as_mut_ptr(), v) };
-    match w {
-        16 => copy::<16>(out, o, &t),
-        8 => copy::<8>(out, o, &t),
-        _ => copy::<4>(out, o, &t),
-    }
+fn ld8(win: &[u8], o: usize) -> uint8x8_t {
+    debug_assert!(o + 8 <= win.len());
+    // SAFETY: `o + 8 <= win.len()` (checked by `luma` / `chroma` for every offset they load).
+    unsafe { vld1_u8(win.as_ptr().add(o)) }
 }
 
-#[inline(always)]
-fn copy<const N: usize>(out: &mut [u8], o: usize, t: &[u8; 16]) {
-    if let (Some(d), Some(s)) = (out.get_mut(o..).and_then(|d| d.first_chunk_mut::<N>()), t.first_chunk::<N>()) {
-        *d = *s;
-    }
-}
-
-/// a - 5b + 20c + 20d - 5e + f, unclipped, in two vectors of 8 lanes (wrapping u16 arithmetic
-/// gives the exact signed result, which fits 16 bits).
+/// a - 5b + 20c + 20d - 5e + f, unclipped, in 16-bit lanes (wrapping u16 arithmetic gives the
+/// exact signed result, which fits).
 #[target_feature(enable = "neon")]
-fn tap6(v: [uint8x16_t; 6]) -> [int16x8_t; 2] {
+fn tap6_8(v: [uint8x8_t; 6]) -> int16x8_t {
     let [a, b, c, d, e, f] = v;
-    let lo = vmlsq_n_u16(
-        vmlaq_n_u16(vaddl_u8(vget_low_u8(a), vget_low_u8(f)), vaddl_u8(vget_low_u8(c), vget_low_u8(d)), 20),
-        vaddl_u8(vget_low_u8(b), vget_low_u8(e)),
-        5,
-    );
+    vreinterpretq_s16_u16(vmlsq_n_u16(vmlaq_n_u16(vaddl_u8(a, f), vaddl_u8(c, d), 20), vaddl_u8(b, e), 5))
+}
+
+#[target_feature(enable = "neon")]
+fn tap6_16(v: [uint8x16_t; 6]) -> [int16x8_t; 2] {
+    let [a, b, c, d, e, f] = v;
+    let lo = tap6_8([a, b, c, d, e, f].map(|x| vget_low_u8(x)));
     let hi = vmlsq_n_u16(vmlaq_n_u16(vaddl_high_u8(a, f), vaddl_high_u8(c, d), 20), vaddl_high_u8(b, e), 5);
-    [vreinterpretq_s16_u16(lo), vreinterpretq_s16_u16(hi)]
-}
-
-/// The horizontal 6-tap of window row `r` (outputs from its column 0's window).
-#[target_feature(enable = "neon")]
-fn tap6_h(win: &[u8], ws: usize, r: usize) -> [int16x8_t; 2] {
-    let o = r * ws;
-    tap6([ld(win, o), ld(win, o + 1), ld(win, o + 2), ld(win, o + 3), ld(win, o + 4), ld(win, o + 5)])
-}
-
-/// The vertical 6-tap of window rows r..r + 6 at column `c`.
-#[target_feature(enable = "neon")]
-fn tap6_v(win: &[u8], ws: usize, r: usize, c: usize) -> [int16x8_t; 2] {
-    tap6([0, 1, 2, 3, 4, 5].map(|k| ld(win, (r + k) * ws + c)))
+    [lo, vreinterpretq_s16_u16(hi)]
 }
 
 /// Clip1((t + 16) >> 5).
 #[target_feature(enable = "neon")]
-fn half(t: [int16x8_t; 2]) -> uint8x16_t {
-    vcombine_u8(vqrshrun_n_s16::<5>(t[0]), vqrshrun_n_s16::<5>(t[1]))
-}
-
-/// The centre sample j: Clip1((6-tap of the unclipped horizontal half samples of rows
-/// k[0..6] + 512) >> 10), in 32-bit lanes.
-#[target_feature(enable = "neon")]
-fn centre(k: &[[int16x8_t; 2]]) -> uint8x16_t {
-    let mut r = [vdup_n_u8(0); 2];
-    for (p, r) in r.iter_mut().enumerate() {
-        let t = |i: usize| k.get(i).map_or(vdupq_n_s16(0), |v| v[p]);
-        let (t0, t1, t2, t3, t4, t5) = (t(0), t(1), t(2), t(3), t(4), t(5));
-        let lo = vmlsl_n_s16(
-            vmlsl_n_s16(
-                vmlal_n_s16(vmlal_n_s16(vaddl_s16(vget_low_s16(t0), vget_low_s16(t5)), vget_low_s16(t2), 20), vget_low_s16(t3), 20),
-                vget_low_s16(t1),
-                5,
-            ),
-            vget_low_s16(t4),
-            5,
-        );
-        let hi = vmlsl_high_n_s16(vmlsl_high_n_s16(vmlal_high_n_s16(vmlal_high_n_s16(vaddl_high_s16(t0, t5), t2, 20), t3, 20), t1, 5), t4, 5);
-        *r = vqmovn_u16(vcombine_u16(vqrshrun_n_s32::<10>(lo), vqrshrun_n_s32::<10>(hi)));
-    }
-    vcombine_u8(r[0], r[1])
+fn half8(t: int16x8_t) -> uint8x8_t {
+    vqrshrun_n_s16::<5>(t)
 }
 
 #[target_feature(enable = "neon")]
-fn luma_neon(win: &[u8], ws: usize, fx: u32, fy: u32, w: usize, h: usize, out: &mut [u8], os: usize) {
-    // Sample G of block row r is window row r + 2, column 2.
-    let g = |r: usize, dr: usize, dc: usize| ld(win, (r + 2 + dr) * ws + 2 + dc);
-    match (fx, fy) {
-        (0, 0) => {
-            for r in 0..h {
-                put(out, r * os, w, g(r, 0, 0));
-            }
-        }
-        (_, 0) => {
-            for r in 0..h {
-                let b = half(tap6_h(win, ws, r + 2));
-                let v = match fx {
-                    2 => b,
-                    1 => vrhaddq_u8(g(r, 0, 0), b),
-                    _ => vrhaddq_u8(g(r, 0, 1), b),
-                };
-                put(out, r * os, w, v);
-            }
-        }
-        (0, _) => {
-            for r in 0..h {
-                let hv = half(tap6_v(win, ws, r, 2));
-                let v = match fy {
-                    2 => hv,
-                    1 => vrhaddq_u8(g(r, 0, 0), hv),
-                    _ => vrhaddq_u8(g(r, 1, 0), hv),
-                };
-                put(out, r * os, w, v);
-            }
-        }
-        (2, _) | (_, 2) => {
-            // Unclipped horizontal half samples of window rows 0..h + 5, once per block.
-            let mut b1 = [[vdupq_n_s16(0); 2]; 21];
-            for (k, b) in b1.iter_mut().enumerate().take(h + 5) {
-                *b = tap6_h(win, ws, k);
-            }
-            for r in 0..h {
-                let k = b1.get(r..r + 6).unwrap_or(&[]);
-                let j = centre(k);
-                let v = match (fx, fy) {
-                    (2, 2) => j,
-                    (2, 1) => vrhaddq_u8(half(b1[r + 2]), j),
-                    (2, _) => vrhaddq_u8(half(b1[r + 3]), j),
-                    _ => vrhaddq_u8(half(tap6_v(win, ws, r, if fx == 1 { 2 } else { 3 })), j),
-                };
-                put(out, r * os, w, v);
-            }
+fn half16(t: [int16x8_t; 2]) -> uint8x16_t {
+    vcombine_u8(half8(t[0]), half8(t[1]))
+}
+
+/// The centre sample j of 8 lanes: Clip1((6-tap of the unclipped horizontal half samples of
+/// rows k[0..6] + 512) >> 10), in 32-bit lanes.
+#[target_feature(enable = "neon")]
+fn centre8(k: [int16x8_t; 6]) -> uint8x8_t {
+    let [t0, t1, t2, t3, t4, t5] = k;
+    let lo = vmlsl_n_s16(
+        vmlsl_n_s16(vmlal_n_s16(vmlal_n_s16(vaddl_s16(vget_low_s16(t0), vget_low_s16(t5)), vget_low_s16(t2), 20), vget_low_s16(t3), 20), vget_low_s16(t1), 5),
+        vget_low_s16(t4),
+        5,
+    );
+    let hi = vmlsl_high_n_s16(vmlsl_high_n_s16(vmlal_high_n_s16(vmlal_high_n_s16(vaddl_high_s16(t0, t5), t2, 20), t3, 20), t1, 5), t4, 5);
+    vqmovn_u16(vcombine_u16(vqrshrun_n_s32::<10>(lo), vqrshrun_n_s32::<10>(hi)))
+}
+
+#[target_feature(enable = "neon")]
+fn centre16(k: [[int16x8_t; 2]; 6]) -> uint8x16_t {
+    vcombine_u8(centre8(k.map(|v| v[0])), centre8(k.map(|v| v[1])))
+}
+
+/// `p` combined with `d` (the first prediction, for AVG and WEIGHT_BI) by output mode `M`.
+#[target_feature(enable = "neon")]
+fn combine8<const M: u8>(d: uint8x8_t, p: uint8x8_t, wt: Wt) -> uint8x8_t {
+    match M {
+        PUT => p,
+        AVG => vrhadd_u8(d, p),
+        WEIGHT => {
+            // |p * w| <= 32640, plus the rounding (at most 64): 16-bit lanes; the offset is added
+            // saturating, which clips the same as Clip1 would.
+            let x = vreinterpretq_s16_u16(vmovl_u8(p));
+            let rnd = if wt.log_wd >= 1 { 1i16 << (wt.log_wd - 1) } else { 0 };
+            let v = vshlq_s16(vaddq_s16(vmulq_n_s16(x, wt.w0), vdupq_n_s16(rnd)), vdupq_n_s16(-wt.log_wd));
+            vqmovun_s16(vqaddq_s16(v, vdupq_n_s16(wt.o)))
         }
         _ => {
-            // e, g, p, r: a horizontal half sample of row r + 2 or r + 3 and a vertical one of
-            // column c + 2 or c + 3.
-            let hoff = if fy == 1 { 2 } else { 3 };
-            let voff = if fx == 1 { 2 } else { 3 };
-            for r in 0..h {
-                put(out, r * os, w, vrhaddq_u8(half(tap6_h(win, ws, r + hoff)), half(tap6_v(win, ws, r, voff))));
-            }
+            let x = vreinterpretq_s16_u16(vmovl_u8(d));
+            let y = vreinterpretq_s16_u16(vmovl_u8(p));
+            let (rnd, sh) = (vdupq_n_s32(1 << wt.log_wd), vdupq_n_s32(-(wt.log_wd as i32 + 1)));
+            let lo = vshlq_s32(vaddq_s32(vmlal_n_s16(vmull_n_s16(vget_low_s16(x), wt.w0), vget_low_s16(y), wt.w1), rnd), sh);
+            let hi = vshlq_s32(vaddq_s32(vmlal_high_n_s16(vmull_high_n_s16(x, wt.w0), y, wt.w1), rnd), sh);
+            vqmovun_s16(vqaddq_s16(vcombine_s16(vqmovn_s32(lo), vqmovn_s32(hi)), vdupq_n_s16(wt.o)))
         }
     }
 }
 
-/// See [`crate::h264_chroma`]; false when the window or `out` is too small.
-pub(crate) fn chroma(win: &[u8], ws: usize, fx: u32, fy: u32, w: usize, h: usize, out: &mut [u8], os: usize) -> bool {
+/// One output row of `w` (2, 4 or 8) samples from `o`, written by mode `M`. `dst` holds the row
+/// (`dst_fits`); rows narrower than 8 are read and written as one integer.
+#[target_feature(enable = "neon")]
+fn out8<const M: u8>(dst: &mut [u8], o: usize, w: usize, p: uint8x8_t, wt: Wt) {
+    match w {
+        8 => {
+            let Some(d) = dst.get_mut(o..).and_then(|d| d.first_chunk_mut::<8>()) else {
+                return;
+            };
+            // SAFETY: `d` is 8 bytes, the 8 bytes `vld1_u8` reads and `vst1_u8` writes.
+            unsafe {
+                let old = if M == AVG || M == WEIGHT_BI { vld1_u8(d.as_ptr()) } else { p };
+                vst1_u8(d.as_mut_ptr(), combine8::<M>(old, p, wt));
+            }
+        }
+        4 => {
+            let Some(d) = dst.get_mut(o..).and_then(|d| d.first_chunk_mut::<4>()) else {
+                return;
+            };
+            let old = vcreate_u8(u32::from_le_bytes(*d) as u64);
+            *d = vget_lane_u32::<0>(vreinterpret_u32_u8(combine8::<M>(old, p, wt))).to_le_bytes();
+        }
+        _ => {
+            let Some(d) = dst.get_mut(o..).and_then(|d| d.first_chunk_mut::<2>()) else {
+                return;
+            };
+            let old = vcreate_u8(u16::from_le_bytes(*d) as u64);
+            *d = vget_lane_u16::<0>(vreinterpret_u16_u8(combine8::<M>(old, p, wt))).to_le_bytes();
+        }
+    }
+}
+
+#[target_feature(enable = "neon")]
+fn out16<const M: u8>(dst: &mut [u8], o: usize, p: uint8x16_t, wt: Wt) {
+    let Some(d) = dst.get_mut(o..).and_then(|d| d.first_chunk_mut::<16>()) else {
+        return;
+    };
+    if M == PUT {
+        // SAFETY: `d` is 16 bytes, the 16 bytes `vst1q_u8` writes.
+        unsafe { vst1q_u8(d.as_mut_ptr(), p) };
+        return;
+    }
+    // SAFETY: `d` is 16 bytes, the 16 bytes `vld1q_u8` reads and `vst1q_u8` writes.
+    unsafe {
+        let old = vld1q_u8(d.as_ptr());
+        let v = if M == AVG {
+            vrhaddq_u8(old, p)
+        } else {
+            vcombine_u8(combine8::<M>(vget_low_u8(old), vget_low_u8(p), wt), combine8::<M>(vget_high_u8(old), vget_high_u8(p), wt))
+        };
+        vst1q_u8(d.as_mut_ptr(), v);
+    }
+}
+
+/// The luma prediction of one block (all 16 sample positions, as the scalar version), over
+/// vectors of `$ld` / `$tap6` / `$half` / `$centre`, written by `$out`.
+macro_rules! luma_kernel {
+    ($name:ident, $ld:ident, $tap6:ident, $half:ident, $centre:ident, $avg:ident, $zero:expr, ($($w:ident: $wt:ty),*), $out:ident $(, $outw:ident)?) => {
+        #[target_feature(enable = "neon")]
+        fn $name<const M: u8>(win: &[u8], ws: usize, fx: u32, fy: u32, $($w: $wt,)* h: usize, dst: &mut [u8], ds: usize, wt: Wt) {
+            let ld = |r: usize, c: usize| $ld(win, r * ws + c);
+            let tap_h = |r: usize| $tap6([ld(r, 0), ld(r, 1), ld(r, 2), ld(r, 3), ld(r, 4), ld(r, 5)]);
+            let tap_v = |r: usize, c: usize| $tap6([ld(r, c), ld(r + 1, c), ld(r + 2, c), ld(r + 3, c), ld(r + 4, c), ld(r + 5, c)]);
+            // Sample G of block row r is window row r + 2, column 2.
+            let g = |r: usize, dr: usize, dc: usize| ld(r + 2 + dr, 2 + dc);
+            let mut put = |r: usize, v| $out::<M>(dst, r * ds, $($outw,)? v, wt);
+            match (fx, fy) {
+                (0, 0) => {
+                    for r in 0..h {
+                        put(r, g(r, 0, 0));
+                    }
+                }
+                (_, 0) => {
+                    for r in 0..h {
+                        let b = $half(tap_h(r + 2));
+                        let v = match fx {
+                            2 => b,
+                            1 => $avg(g(r, 0, 0), b),
+                            _ => $avg(g(r, 0, 1), b),
+                        };
+                        put(r, v);
+                    }
+                }
+                (0, _) => {
+                    for r in 0..h {
+                        let hv = $half(tap_v(r, 2));
+                        let v = match fy {
+                            2 => hv,
+                            1 => $avg(g(r, 0, 0), hv),
+                            _ => $avg(g(r, 1, 0), hv),
+                        };
+                        put(r, v);
+                    }
+                }
+                (2, _) | (_, 2) => {
+                    // Unclipped horizontal half samples of window rows 0..h + 5, once per block.
+                    let mut b1 = [$zero; 21];
+                    for (k, b) in b1.iter_mut().enumerate().take(h + 5) {
+                        *b = tap_h(k);
+                    }
+                    for r in 0..h {
+                        let k = std::array::from_fn(|i| b1[(r + i).min(20)]);
+                        let j = $centre(k);
+                        let v = match (fx, fy) {
+                            (2, 2) => j,
+                            (2, 1) => $avg($half(k[2]), j),
+                            (2, _) => $avg($half(k[3]), j),
+                            _ => $avg($half(tap_v(r, if fx == 1 { 2 } else { 3 })), j),
+                        };
+                        put(r, v);
+                    }
+                }
+                _ => {
+                    // e, g, p, r: a horizontal half sample of row r + 2 or r + 3 and a vertical
+                    // one of column c + 2 or c + 3.
+                    let hoff = if fy == 1 { 2 } else { 3 };
+                    let voff = if fx == 1 { 2 } else { 3 };
+                    for r in 0..h {
+                        put(r, $avg($half(tap_h(r + hoff)), $half(tap_v(r, voff))));
+                    }
+                }
+            }
+        }
+    };
+}
+
+luma_kernel!(luma16, ld16, tap6_16, half16, centre16, vrhaddq_u8, [vdupq_n_s16(0); 2], (), out16);
+luma_kernel!(luma8, ld8, tap6_8, half8, centre8, vrhadd_u8, vdupq_n_s16(0), (w: usize), out8, w);
+
+/// See [`crate::h264_chroma`]; false when the window is too small (9 samples are loaded from
+/// each row's start), `dst` too small or the weights out of range.
+pub(crate) fn chroma(win: &[u8], ws: usize, fx: u32, fy: u32, w: usize, h: usize, dst: &mut [u8], ds: usize, out: H264Out) -> bool {
+    let Some((m, wt)) = mode(out) else {
+        return false;
+    };
     let fits = matches!(w, 2 | 4 | 8)
         && (1..=8).contains(&h)
         && fx < 8
         && fy < 8
         && h.checked_mul(ws).and_then(|n| n.checked_add(9)).is_some_and(|n| n <= win.len())
-        && (h - 1).checked_mul(os).and_then(|n| n.checked_add(w)).is_some_and(|n| n <= out.len());
-    if fits {
-        // SAFETY: NEON is part of the aarch64 baseline: every core this build runs on has it.
-        unsafe { chroma_neon(win, ws, fx, fy, w, h, out, os) };
+        && dst_fits(dst, ds, w, h);
+    if !fits {
+        return false;
     }
-    fits
-}
-
-#[inline(always)]
-fn copy8<const N: usize>(out: &mut [u8], o: usize, t: &[u8; 8]) {
-    if let (Some(d), Some(s)) = (out.get_mut(o..).and_then(|d| d.first_chunk_mut::<N>()), t.first_chunk::<N>()) {
-        *d = *s;
+    // SAFETY: NEON is part of the aarch64 baseline: every core this build runs on has it (every arm).
+    unsafe {
+        match m {
+            PUT => chroma_neon::<PUT>(win, ws, fx, fy, w, h, dst, ds, wt),
+            AVG => chroma_neon::<AVG>(win, ws, fx, fy, w, h, dst, ds, wt),
+            WEIGHT => chroma_neon::<WEIGHT>(win, ws, fx, fy, w, h, dst, ds, wt),
+            _ => chroma_neon::<WEIGHT_BI>(win, ws, fx, fy, w, h, dst, ds, wt),
+        }
     }
-}
-
-/// 8 samples of `win` from `o` (zeros past its end, which `chroma` rules out).
-#[target_feature(enable = "neon")]
-fn ld8(win: &[u8], o: usize) -> uint8x8_t {
-    match win.get(o..).and_then(|s| s.first_chunk::<8>()) {
-        // SAFETY: `s` is 8 bytes, the 8 bytes `vld1_u8` reads.
-        Some(s) => unsafe { vld1_u8(s.as_ptr()) },
-        None => vdup_n_u8(0),
-    }
+    true
 }
 
 #[target_feature(enable = "neon")]
-fn chroma_neon(win: &[u8], ws: usize, fx: u32, fy: u32, w: usize, h: usize, out: &mut [u8], os: usize) {
+fn chroma_neon<const M: u8>(win: &[u8], ws: usize, fx: u32, fy: u32, w: usize, h: usize, dst: &mut [u8], ds: usize, wt: Wt) {
     // Weights at most 64: the sums stay below 2^14.
     let [a, b, c, d] = [(8 - fx) * (8 - fy), fx * (8 - fy), (8 - fx) * fy, fx * fy].map(|v| vdup_n_u8(v as u8));
     for r in 0..h {
         let (o0, o1) = (r * ws, (r + 1) * ws);
         let acc = vmlal_u8(vmlal_u8(vmlal_u8(vmull_u8(ld8(win, o0), a), ld8(win, o0 + 1), b), ld8(win, o1), c), ld8(win, o1 + 1), d);
-        let v = vrshrn_n_u16::<6>(acc);
-        let mut t = [0u8; 8];
-        // SAFETY: `t` is 8 bytes, the 8 bytes `vst1_u8` writes.
-        unsafe { vst1_u8(t.as_mut_ptr(), v) };
-        let o = r * os;
-        match w {
-            8 => copy8::<8>(out, o, &t),
-            4 => copy8::<4>(out, o, &t),
-            _ => copy8::<2>(out, o, &t),
-        }
+        out8::<M>(dst, r * ds, w, vrshrn_n_u16::<6>(acc), wt);
     }
 }
 
