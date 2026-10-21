@@ -21,6 +21,7 @@
 mod deblock;
 mod h264;
 mod scalar;
+mod vp9;
 
 #[cfg(target_arch = "aarch64")]
 #[allow(unsafe_code)]
@@ -29,6 +30,10 @@ mod h264_neon;
 #[cfg(target_arch = "aarch64")]
 #[allow(unsafe_code)]
 mod neon;
+
+#[cfg(target_arch = "aarch64")]
+#[allow(unsafe_code)]
+mod vp9_neon;
 
 #[cfg(target_arch = "x86_64")]
 #[allow(unsafe_code)]
@@ -318,7 +323,7 @@ pub enum H264Out {
 
 /// Whether a `ww` x `wh` window (rows `ws` apart) fits `win` and the `w` x `h` block (rows `ds`
 /// apart) fits `dst`.
-fn block_fits(win: &[u8], ws: usize, ww: usize, wh: usize, dst: &[u8], ds: usize, w: usize, h: usize) -> bool {
+fn block_fits<T>(win: &[T], ws: usize, ww: usize, wh: usize, dst: &[T], ds: usize, w: usize, h: usize) -> bool {
     let need = |len: usize, stride: usize, cols: usize, rows: usize| {
         rows == 0 || (rows - 1).checked_mul(stride).and_then(|n| n.checked_add(cols)).is_some_and(|n| n <= len)
     };
@@ -411,3 +416,73 @@ pub fn h264_deblock_at(level: Level, pix: &mut [u8], stride: usize, x: usize, y:
 
 #[cfg(test)]
 mod tests;
+
+/// How a VP9 inter prediction is written into the picture.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Vp9Out {
+    /// `dst = p`.
+    Put,
+    /// Compound prediction, `dst` holding the first one: `dst = Round2(dst + p, 1)`.
+    Avg,
+}
+
+/// VP9 inter prediction of a `w` x `h` block from an unscaled reference (8.5.2.4 with steps of
+/// 16; `w` 4, 8, 16, 32 or 64, `h` 1..=64), written into `dst` (rows `ds` apart) as `out` says.
+/// `src` holds the (w + 7) x (h + 7) reference window from (x - 3, y - 3), rows `ss` apart; `fh`
+/// and `fv` are the 8-tap filters of the horizontal and vertical sub-sample positions (None at
+/// whole-sample positions), and samples are at most `max` (255, 1023 or 4095). Each pass is
+/// Round2(sum, 7) clipped to 0..=max. The vector version loads one sample past each window row,
+/// so it needs `(h + 6) * ss + w + 8` samples in `src` and otherwise the scalar one runs. Blocks
+/// that do not fit leave `dst` unchanged.
+#[allow(clippy::too_many_arguments)]
+pub fn vp9_predict(
+    src: &[u16],
+    ss: usize,
+    fh: Option<&[i16; 8]>,
+    fv: Option<&[i16; 8]>,
+    w: usize,
+    h: usize,
+    max: u16,
+    dst: &mut [u16],
+    ds: usize,
+    out: Vp9Out,
+) {
+    vp9_predict_at(level(), src, ss, fh, fv, w, h, max, dst, ds, out);
+}
+
+/// [`vp9_predict`] on a given level.
+#[allow(clippy::too_many_arguments)]
+pub fn vp9_predict_at(
+    level: Level,
+    src: &[u16],
+    ss: usize,
+    fh: Option<&[i16; 8]>,
+    fv: Option<&[i16; 8]>,
+    w: usize,
+    h: usize,
+    max: u16,
+    dst: &mut [u16],
+    ds: usize,
+    out: Vp9Out,
+) {
+    if !matches!(w, 4 | 8 | 16 | 32 | 64) || !(1..=64).contains(&h) || !block_fits(src, ss, w + 7, h + 7, dst, ds, w, h) {
+        return;
+    }
+    let wrap = max == 255 && fh.is_none_or(vp9_wraps) && fv.is_none_or(vp9_wraps);
+    let done = match level {
+        #[cfg(target_arch = "aarch64")]
+        Level::Neon => vp9_neon::predict(src, ss, fh, fv, w, h, max, wrap, dst, ds, out),
+        _ => false,
+    };
+    if !done {
+        vp9::predict(src, ss, fh, fv, w, h, max, wrap, dst, ds, out);
+    }
+}
+
+/// Whether 8-bit sums of filter `f` may be kept modulo 2^16: its positive taps add up to at most
+/// 192 and its negative ones to at least -64, so that each sum plus 64 lies in [-16256, 49024].
+fn vp9_wraps(f: &[i16; 8]) -> bool {
+    let pos: i32 = f.iter().map(|&c| (c as i32).max(0)).sum();
+    let neg: i32 = f.iter().map(|&c| (c as i32).min(0)).sum();
+    pos <= 192 && neg >= -64
+}

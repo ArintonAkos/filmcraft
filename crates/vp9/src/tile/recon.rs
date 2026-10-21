@@ -5,7 +5,7 @@ use super::{Blk, TileDecoder};
 use crate::boolcoder::BoolDecoder;
 use crate::error::Error;
 use crate::frame::Mv;
-use crate::inter::{self, RefPlane};
+use crate::inter::{self, RefPlane, Vp9Out};
 use crate::intra::{self, IntraEdge};
 use crate::tables::*;
 use crate::transform;
@@ -250,12 +250,16 @@ impl<'a> TileDecoder<'a> {
         (c, max_row + 1)
     }
 
-    /// Inter prediction process (8.5.2) for one block region.
+    /// Inter prediction process (8.5.2) for one block region, written straight into the picture
+    /// (the second prediction of a compound block averaged into the first).
     #[allow(clippy::too_many_arguments)]
     fn predict_inter(&mut self, b: &Blk, plane: usize, x: usize, y: usize, w: usize, h: usize, block_idx: usize) {
         let is_compound = b.ref_frame[1] > INTRA_FRAME;
         let (sx, sy) = if plane > 0 { (self.ss_x, self.ss_y) } else { (0, 0) };
+        let (stride, x_off) = (self.strip.strides[plane], self.strip.x_off[plane]);
+        let o = (y * stride + x).saturating_sub(x_off);
         for rl in 0..1 + is_compound as usize {
+            let out = if rl == 0 { Vp9Out::Put } else { Vp9Out::Avg };
             // Motion vector selection (8.5.2.1).
             let bm = &b.block_mvs[rl];
             let mv = if plane == 0 || b.size >= BLOCK_8X8 || (sx == 0 && sy == 0) {
@@ -288,12 +292,21 @@ impl<'a> TileDecoder<'a> {
                 if self.error.is_none() {
                     self.error = Some(Error::MissingReference(format!("block uses unusable reference {}", b.ref_frame[rl])));
                 }
-                let out = if rl == 0 { &mut self.pred } else { &mut self.pred2 };
-                out[..w * h].fill(1 << (self.bit_depth - 1));
+                self.pred[..w * h].fill(1 << (self.bit_depth - 1));
+                write_pred(&mut self.strip.planes[plane], o, stride, &self.pred, w, h, out);
                 continue;
             };
             // Motion vector scaling (8.5.2.3).
             let (x_scale, y_scale) = (rf.x_scale as i64, rf.y_scale as i64);
+            let f = rf.frame;
+            let rp =
+                RefPlane { frame: f, plane, last_x: ((f.info.width as i32 + sx as i32) >> sx) - 1, last_y: ((f.info.height as i32 + sy as i32) >> sy) - 1 };
+            if rf.x_step == 16 && rf.y_step == 16 && x_scale == 1 << 14 && y_scale == 1 << 14 && matches!(w, 4 | 8 | 16 | 32 | 64) {
+                let (start_x, start_y) = (((x as i32) << 4) + cmv_col, ((y as i32) << 4) + cmv_row);
+                let dst = self.strip.planes[plane].get_mut(o..).unwrap_or_default();
+                inter::predict_unscaled(&rp, start_x, start_y, w, h, b.interp_filter, self.bit_depth, dst, stride, out, &mut self.mc_win);
+                continue;
+            }
             let (start_x, start_y, step_x, step_y) = if rf.x_step == 16 && rf.y_step == 16 && x_scale == 1 << 14 && y_scale == 1 << 14 {
                 (((x as i32) << 4) + cmv_col, ((y as i32) << 4) + cmv_row, 16, 16)
             } else {
@@ -308,23 +321,22 @@ impl<'a> TileDecoder<'a> {
                 let dy = ((cmv_row as i64 * y_scale) >> 14) + frac_y;
                 (((base_x << 4) + dx) as i32, ((base_y << 4) + dy) as i32, rf.x_step, rf.y_step)
             };
-            let f = rf.frame;
-            let rp =
-                RefPlane { frame: f, plane, last_x: ((f.info.width as i32 + sx as i32) >> sx) - 1, last_y: ((f.info.height as i32 + sy as i32) >> sy) - 1 };
-            let out = if rl == 0 { &mut self.pred } else { &mut self.pred2 };
-            inter::predict(&rp, start_x, start_y, step_x, step_y, w, h, b.interp_filter, self.bit_depth, out, &mut self.mc_tmp, &mut self.mc_win);
+            inter::predict_scaled(&rp, start_x, start_y, step_x, step_y, w, h, b.interp_filter, self.bit_depth, &mut self.pred, &mut self.mc_tmp);
+            write_pred(&mut self.strip.planes[plane], o, stride, &self.pred, w, h, out);
         }
-        let (stride, x_off) = (self.strip.strides[plane], self.strip.x_off[plane]);
-        let dst = &mut self.strip.planes[plane];
-        for i in 0..h {
-            let o = (y + i) * stride + x - x_off;
-            let row = &mut dst[o..o + w];
-            if is_compound {
-                for ((d, &a), &bb) in row.iter_mut().zip(&self.pred[i * w..i * w + w]).zip(&self.pred2[i * w..i * w + w]) {
-                    *d = ((a as u32 + bb as u32 + 1) >> 1) as u16;
+    }
+}
+
+/// Write the `w` x `h` prediction `p` (stride `w`) at `dst[o..]` (rows `stride` apart) as `out` says.
+fn write_pred(dst: &mut [u16], o: usize, stride: usize, p: &[u16], w: usize, h: usize, out: Vp9Out) {
+    for i in 0..h {
+        let (Some(row), Some(p)) = (dst.get_mut(o + i * stride..o + i * stride + w), p.get(i * w..i * w + w)) else { return };
+        match out {
+            Vp9Out::Put => inter::copy_samples(row, p, w),
+            Vp9Out::Avg => {
+                for (d, &a) in row.iter_mut().zip(p) {
+                    *d = ((*d as u32 + a as u32 + 1) >> 1) as u16;
                 }
-            } else {
-                inter::copy_samples(row, &self.pred[i * w..i * w + w], w);
             }
         }
     }

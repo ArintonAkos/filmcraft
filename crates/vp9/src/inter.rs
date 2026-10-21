@@ -1,14 +1,17 @@
 //! Block inter prediction process (8.5.2.4): separable 8-tap sub-sample interpolation with edge
-//! clamping, for unscaled (step 16) and scaled references.
+//! clamping, for unscaled (step 16; the filters are `filmcraft_simd::vp9_predict`) and scaled
+//! references.
 
 use crate::frame::Frame;
 use crate::tables::SUBPEL_FILTERS;
+pub use filmcraft_simd::Vp9Out;
 
 /// Filter taps of `filter` (0..3) at sub-sample position `frac` (0..15).
 #[inline(always)]
-fn taps(filter: u8, frac: usize) -> &'static [i16] {
+fn taps(filter: u8, frac: usize) -> &'static [i16; 8] {
+    const NONE: [i16; 8] = [0, 0, 0, 128, 0, 0, 0, 0];
     let o = (filter as usize * 16 + frac) * 8;
-    &SUBPEL_FILTERS[o..o + 8]
+    SUBPEL_FILTERS.get(o..).and_then(|f| f.first_chunk::<8>()).unwrap_or(&NONE)
 }
 
 /// Plane `plane` of a reference frame, valid for x <= last_x, y <= last_y. Rows are read through
@@ -27,30 +30,27 @@ impl RefPlane<'_> {
     }
 }
 
-/// Predict a `w` x `h` block whose top-left sample is at (`x`, `y`) in 1/16 sample units of the
-/// reference, stepping `step_x` / `step_y` (16 = unscaled). Output samples go to `out` (stride
-/// `w`). `tmp` must hold at least `(h * step_y / 16 + 8) * w` entries, `win` at least
-/// `(w + 7) * (h + 7)` (edge-clamped source window).
+/// Predict a `w` x `h` block (`w` 4, 8, 16, 32 or 64) whose top-left sample is at (`x`, `y`) in
+/// 1/16 sample units of an unscaled reference, written into `dst` (rows `ds` apart) as `out`
+/// says. `win` must hold at least `(w + 7) * (h + 7) + 1` entries (edge-clamped source window,
+/// plus the one sample the vector loads read past it).
 #[allow(clippy::too_many_arguments)]
-pub fn predict(
-    r: &RefPlane,
-    x: i32,
-    y: i32,
-    step_x: i32,
-    step_y: i32,
-    w: usize,
-    h: usize,
-    filter: u8,
-    bit_depth: u8,
-    out: &mut [u16],
-    tmp: &mut [u16],
-    win: &mut [u16],
-) {
-    if step_x == 16 && step_y == 16 {
-        predict_unscaled(r, x, y, w, h, filter, bit_depth, out, tmp, win);
-    } else {
-        predict_scaled(r, x, y, step_x, step_y, w, h, filter, bit_depth, out, tmp);
-    }
+pub fn predict_unscaled(r: &RefPlane, x: i32, y: i32, w: usize, h: usize, filter: u8, bit_depth: u8, dst: &mut [u16], ds: usize, out: Vp9Out, win: &mut [u16]) {
+    let (x0, y0) = (x >> 4, y >> 4);
+    let (fx, fy) = ((x & 15) as usize, (y & 15) as usize);
+    let inside = x0 - 3 >= 0 && y0 - 3 >= 0 && x0 + w as i32 + 4 <= r.last_x && y0 + h as i32 + 4 <= r.last_y;
+    // Source view with origin at (x0 - 3, y0 - 3): the reference band itself when the window
+    // lies inside the picture and inside one band.
+    let span = if inside { r.frame.span(r.plane, (y0 - 3) as usize, (y0 + h as i32 + 5) as usize) } else { None };
+    let (src, ss): (&[u16], usize) = match span {
+        Some((data, o)) => (data.get(o + (x0 - 3) as usize..).unwrap_or_default(), r.frame.strides[r.plane]),
+        None => {
+            let ws = fetch_window(r, x0, y0, w, h, win);
+            (&win[..], ws)
+        }
+    };
+    let (fh, fv) = ((fx != 0).then(|| taps(filter, fx)), (fy != 0).then(|| taps(filter, fy)));
+    filmcraft_simd::vp9_predict(src, ss, fh, fv, w, h, ((1u32 << bit_depth) - 1) as u16, dst, ds, out);
 }
 
 /// `dst[..n] = src[..n]` with a fixed-length copy for the block widths (and window widths,
@@ -107,174 +107,11 @@ fn fetch_window(r: &RefPlane, x0: i32, y0: i32, w: usize, h: usize, win: &mut [u
     ws
 }
 
+/// General process of 8.5.2.4 (any step): the `w` x `h` block at (`x`, `y`) in 1/16 sample units,
+/// stepping `step_x` / `step_y`, into `out` (stride `w`). `tmp` must hold at least
+/// `(h * step_y / 16 + 8) * w` entries.
 #[allow(clippy::too_many_arguments)]
-fn predict_unscaled(r: &RefPlane, x: i32, y: i32, w: usize, h: usize, filter: u8, bit_depth: u8, out: &mut [u16], tmp: &mut [u16], win: &mut [u16]) {
-    let (x0, y0) = (x >> 4, y >> 4);
-    let (fx, fy) = ((x & 15) as usize, (y & 15) as usize);
-    let max = (1i32 << bit_depth) - 1;
-    let inside = x0 - 3 >= 0 && y0 - 3 >= 0 && x0 + w as i32 + 4 <= r.last_x && y0 + h as i32 + 4 <= r.last_y;
-    // Source view with origin at (x0 - 3, y0 - 3): the reference band itself when the window
-    // lies inside the picture and inside one band.
-    let span = if inside { r.frame.span(r.plane, (y0 - 3) as usize, (y0 + h as i32 + 5) as usize) } else { None };
-    let (src, ss, so): (&[u16], usize, usize) = match span {
-        Some((data, o)) => (data, r.frame.strides[r.plane], o + (x0 - 3) as usize),
-        None => {
-            let ws = fetch_window(r, x0, y0, w, h, win);
-            (&win[..], ws, 0)
-        }
-    };
-    match (fx, fy) {
-        (0, 0) => {
-            for i in 0..h {
-                let s = so + (i + 3) * ss + 3;
-                copy_samples(&mut out[i * w..i * w + w], &src[s..s + w], w);
-            }
-        }
-        (_, 0) => {
-            let f = taps(filter, fx);
-            for i in 0..h {
-                filter_h(&src[so + (i + 3) * ss..], f, max, &mut out[i * w..i * w + w]);
-            }
-        }
-        (0, _) => {
-            let f = taps(filter, fy);
-            for i in 0..h {
-                filter_v(&src[so + i * ss + 3..], ss, f, max, &mut out[i * w..i * w + w]);
-            }
-        }
-        _ => {
-            let fh = taps(filter, fx);
-            let fv = taps(filter, fy);
-            for i in 0..h + 7 {
-                filter_h(&src[so + i * ss..], fh, max, &mut tmp[i * w..i * w + w]);
-            }
-            for i in 0..h {
-                filter_v(&tmp[i * w..], w, fv, max, &mut out[i * w..i * w + w]);
-            }
-        }
-    }
-}
-
-/// Horizontal 8-tap filter of one row: `o[j]` from `s[j..j + 8]`. The taps are the outer loop
-/// so that the row vectorizes (same sums, same order of the exact integer additions).
-#[inline(always)]
-fn filter_h(s: &[u16], f: &[i16], max: i32, o: &mut [u16]) {
-    match o.len() {
-        4 => filter_h_n::<4>(s, f, max, o),
-        8 => filter_h_n::<8>(s, f, max, o),
-        16 => filter_h_n::<16>(s, f, max, o),
-        32 => filter_h_n::<32>(s, f, max, o),
-        64 => filter_h_n::<64>(s, f, max, o),
-        _ => {
-            for (j, d) in o.iter_mut().enumerate() {
-                let acc: i32 = (0..8).map(|t| f[t] as i32 * s[j + t] as i32).sum();
-                *d = ((acc + 64) >> 7).clamp(0, max) as u16;
-            }
-        }
-    }
-}
-
-#[inline(always)]
-fn filter_h_n<const W: usize>(s: &[u16], f: &[i16], max: i32, o: &mut [u16]) {
-    let Some(o) = o.first_chunk_mut::<W>() else {
-        return;
-    };
-    if max == 255 {
-        let mut acc = [64u16; W];
-        for t in 0..8 {
-            let c = f[t] as u16;
-            let Some(p) = s.get(t..).and_then(|s| s.first_chunk::<W>()) else {
-                return;
-            };
-            for j in 0..W {
-                acc[j] = acc[j].wrapping_add(c.wrapping_mul(p[j]));
-            }
-        }
-        narrow8(&acc, o);
-        return;
-    }
-    let mut acc = [64i32; W];
-    for t in 0..8 {
-        let c = f[t] as i32;
-        let Some(p) = s.get(t..).and_then(|s| s.first_chunk::<W>()) else {
-            return;
-        };
-        for j in 0..W {
-            acc[j] += c * p[j] as i32;
-        }
-    }
-    for j in 0..W {
-        o[j] = (acc[j] >> 7).clamp(0, max) as u16;
-    }
-}
-
-/// Round2(sum, 7) clipped to 8 bits, from 8-bit filter sums kept modulo 2^16 (8 lanes per
-/// vector instead of 4). With 8-bit samples every sum of the VP9 filters (whose positive taps
-/// add up to at most 182 and negative taps to at most -54) plus the rounding term 64 lies in
-/// [-13706, 46474]: wrapped, the non-negative ones stay below 0xC000 and the negative ones
-/// (which clip to 0) land above it.
-#[inline(always)]
-fn narrow8<const W: usize>(acc: &[u16; W], o: &mut [u16; W]) {
-    for j in 0..W {
-        o[j] = if acc[j] < 0xC000 { (acc[j] >> 7).min(255) } else { 0 };
-    }
-}
-
-/// Vertical 8-tap filter of one row: `o[j]` from `s[j + t * ss]`, t = 0..8.
-#[inline(always)]
-fn filter_v(s: &[u16], ss: usize, f: &[i16], max: i32, o: &mut [u16]) {
-    match o.len() {
-        4 => filter_v_n::<4>(s, ss, f, max, o),
-        8 => filter_v_n::<8>(s, ss, f, max, o),
-        16 => filter_v_n::<16>(s, ss, f, max, o),
-        32 => filter_v_n::<32>(s, ss, f, max, o),
-        64 => filter_v_n::<64>(s, ss, f, max, o),
-        _ => {
-            for (j, d) in o.iter_mut().enumerate() {
-                let acc: i32 = (0..8).map(|t| f[t] as i32 * s[j + t * ss] as i32).sum();
-                *d = ((acc + 64) >> 7).clamp(0, max) as u16;
-            }
-        }
-    }
-}
-
-#[inline(always)]
-fn filter_v_n<const W: usize>(s: &[u16], ss: usize, f: &[i16], max: i32, o: &mut [u16]) {
-    let Some(o) = o.first_chunk_mut::<W>() else {
-        return;
-    };
-    if max == 255 {
-        let mut acc = [64u16; W];
-        for t in 0..8 {
-            let c = f[t] as u16;
-            let Some(p) = s.get(t * ss..).and_then(|s| s.first_chunk::<W>()) else {
-                return;
-            };
-            for j in 0..W {
-                acc[j] = acc[j].wrapping_add(c.wrapping_mul(p[j]));
-            }
-        }
-        narrow8(&acc, o);
-        return;
-    }
-    let mut acc = [64i32; W];
-    for t in 0..8 {
-        let c = f[t] as i32;
-        let Some(p) = s.get(t * ss..).and_then(|s| s.first_chunk::<W>()) else {
-            return;
-        };
-        for j in 0..W {
-            acc[j] += c * p[j] as i32;
-        }
-    }
-    for j in 0..W {
-        o[j] = (acc[j] >> 7).clamp(0, max) as u16;
-    }
-}
-
-/// General process of 8.5.2.4 (any step).
-#[allow(clippy::too_many_arguments)]
-fn predict_scaled(r: &RefPlane, x: i32, y: i32, step_x: i32, step_y: i32, w: usize, h: usize, filter: u8, bit_depth: u8, out: &mut [u16], tmp: &mut [u16]) {
+pub fn predict_scaled(r: &RefPlane, x: i32, y: i32, step_x: i32, step_y: i32, w: usize, h: usize, filter: u8, bit_depth: u8, out: &mut [u16], tmp: &mut [u16]) {
     let max = (1i32 << bit_depth) - 1;
     let ih = ((((h as i32 - 1) * step_y + 15) >> 4) + 8) as usize;
     for row in 0..ih {
@@ -339,7 +176,7 @@ mod tests {
                 for &(bw, bh) in &[(4usize, 4usize), (8, 8), (16, 8)] {
                     let mut a = vec![0u16; bw * bh];
                     let mut b = vec![0u16; bw * bh];
-                    predict_unscaled(&r, x, y, bw, bh, filter, 8, &mut a, &mut tmp, &mut [0u16; 71 * 71]);
+                    predict_unscaled(&r, x, y, bw, bh, filter, 8, &mut a, bw, Vp9Out::Put, &mut [0u16; 71 * 71 + 1]);
                     predict_scaled(&r, x, y, 16, 16, bw, bh, filter, 8, &mut b, &mut tmp);
                     assert_eq!(a, b, "filter {filter} pos ({x},{y}) {bw}x{bh}");
                 }

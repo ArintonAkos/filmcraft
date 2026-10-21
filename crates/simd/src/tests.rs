@@ -399,3 +399,98 @@ fn every_level_matches_the_scalar_h264_deblocking() {
         }
     }
 }
+
+/// 8.5.2.4 with a step of 16 as the spec writes it: 32-bit sums, Round2(sum, 7) clipped per pass.
+#[allow(clippy::too_many_arguments)]
+fn spec_vp9_predict(
+    src: &[u16],
+    ss: usize,
+    fh: Option<&[i16; 8]>,
+    fv: Option<&[i16; 8]>,
+    w: usize,
+    h: usize,
+    max: u16,
+    dst: &mut [u16],
+    ds: usize,
+    out: Vp9Out,
+) {
+    let id = [0, 0, 0, 128, 0, 0, 0, 0];
+    let (fh, fv) = (fh.unwrap_or(&id), fv.unwrap_or(&id));
+    let round = |acc: i32| ((acc + 64) >> 7).clamp(0, max as i32);
+    let tmp: Vec<i32> = (0..(h + 7) * w).map(|n| round((0..8).map(|t| fh[t] as i32 * src[(n / w) * ss + n % w + t] as i32).sum())).collect();
+    for i in 0..h {
+        for j in 0..w {
+            let p = round((0..8).map(|t| fv[t] as i32 * tmp[(i + t) * w + j]).sum()) as u16;
+            let d = &mut dst[i * ds + j];
+            *d = if out == Vp9Out::Avg { ((*d as u32 + p as u32 + 1) >> 1) as u16 } else { p };
+        }
+    }
+}
+
+#[test]
+fn every_level_matches_the_spec_vp9_prediction() {
+    let mut seed = 0x0009_5eedu32;
+    let mut next = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        seed
+    };
+    // Two of VP9's filters (regular and sharp, at their extremes) besides random ones.
+    let vp9 = [[0i16, 1, -5, 126, 8, -3, 1, 0], [-2, 5, -10, 79, 79, -10, 5, -2], [-1, 3, -7, 127, 8, -3, 1, 0], [-4, 11, -23, 80, 80, -23, 11, -4]];
+    let (mut wrapped, mut exact) = (0, 0);
+    for case in 0..8_000 {
+        let max = [255u16, 255, 1023, 4095][case % 4];
+        let sample = |n: u32| match n % 5 {
+            0 => 0u16,
+            1 => max,
+            _ => ((n >> 3) % (max as u32 + 1)) as u16,
+        };
+        let taps = |next: &mut dyn FnMut() -> u32| -> [i16; 8] {
+            let n = next();
+            match n % 4 {
+                0 => vp9[(n / 4) as usize % 4],
+                1 => std::array::from_fn(|_| (next() % 256) as i16 - 128),
+                _ => std::array::from_fn(|_| (next() % 90) as i16 - 30),
+            }
+        };
+        let (fh, fv) = (taps(&mut next), taps(&mut next));
+        let (fh, fv) = match next() % 4 {
+            0 => (None, None),
+            1 => (Some(fh), None),
+            2 => (None, Some(fv)),
+            _ => (Some(fh), Some(fv)),
+        };
+        let w = [4, 8, 16, 32, 64][case % 5];
+        let h = [4, 8, 16, 32, 64, 1, 3, 12][next() as usize % 8].min(if w == 64 { 64 } else { 32 });
+        let ss = w + 7 + [0, 1, 9][next() as usize % 3];
+        // Windows exactly as large as the scalar version needs, one more (as the vector loads
+        // need), or with room to spare.
+        let len = (h + 6) * ss + w + 7 + [0, 1, 8][next() as usize % 3];
+        let src: Vec<u16> = (0..len).map(|_| sample(next())).collect();
+        let ds = w + [0, 5][next() as usize % 2];
+        let dst0: Vec<u16> = (0..(h - 1) * ds + w).map(|_| sample(next())).collect();
+        let out = if next() % 2 == 0 { Vp9Out::Put } else { Vp9Out::Avg };
+        if max == 255 && fh.as_ref().is_none_or(vp9_wraps) && fv.as_ref().is_none_or(vp9_wraps) {
+            wrapped += 1;
+        } else {
+            exact += 1;
+        }
+        let mut want = dst0.clone();
+        spec_vp9_predict(&src, ss, fh.as_ref(), fv.as_ref(), w, h, max, &mut want, ds, out);
+        for &level in levels() {
+            let mut got = dst0.clone();
+            vp9_predict_at(level, &src, ss, fh.as_ref(), fv.as_ref(), w, h, max, &mut got, ds, out);
+            assert_eq!(got, want, "{level:?} {w}x{h} max {max} taps {fh:?} {fv:?} {out:?} window {ss} x {len}");
+        }
+    }
+    assert!(wrapped > 1000 && exact > 1000, "{wrapped} {exact}");
+}
+
+#[test]
+fn vp9_wraps_only_where_16_bit_sums_are_exact() {
+    assert!(vp9_wraps(&[-4, 11, -23, 80, 80, -23, 11, -4]));
+    assert!(vp9_wraps(&[0, 0, 0, 192, 0, 0, -64, 0]));
+    assert!(!vp9_wraps(&[0, 0, 0, 193, 0, 0, 0, 0]));
+    assert!(!vp9_wraps(&[0, 0, 0, 128, 0, 0, -65, 0]));
+}
