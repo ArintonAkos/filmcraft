@@ -315,3 +315,77 @@ fn cdef_filter_falls_back_when_a_tap_leaves_the_buffer() {
         assert_eq!(got, want, "{level:?}");
     }
 }
+
+#[test]
+fn every_level_matches_the_scalar_h264_interpolation() {
+    let mut seed = 0x0264_5eedu32;
+    let mut next = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        seed
+    };
+    for case in 0..6_000 {
+        // Windows of extremes as well as random samples, so clipping and saturation are hit.
+        let sample = |n: u32| match n % 4 {
+            0 => 0u8,
+            1 => 255,
+            _ => (n >> 3) as u8,
+        };
+        let ws = 24 + (case % 3) * 8;
+        let win: Vec<u8> = (0..ws * 22).map(|_| sample(next())).collect();
+        let (w, h) = [(16, 16), (16, 8), (8, 16), (8, 8), (8, 4), (4, 8), (4, 4)][case % 7];
+        let (fx, fy) = (next() % 4, next() % 4);
+        let mut want = vec![7u8; 16 * 16];
+        h264_luma_at(Level::Scalar, &win, ws, fx, fy, w, h, &mut want, 16);
+        for &level in levels() {
+            let mut got = vec![7u8; 16 * 16];
+            h264_luma_at(level, &win, ws, fx, fy, w, h, &mut got, 16);
+            assert_eq!(got, want, "{level:?} luma {w}x{h} frac {fx},{fy}");
+        }
+        let (cw, ch) = [(8, 8), (8, 4), (4, 8), (4, 4), (4, 2), (2, 4), (2, 2)][case % 7];
+        let (cx, cy) = (next() % 8, next() % 8);
+        let mut want = vec![7u8; 8 * 8];
+        h264_chroma_at(Level::Scalar, &win, ws, cx, cy, cw, ch, &mut want, 8);
+        for &level in levels() {
+            let mut got = vec![7u8; 8 * 8];
+            h264_chroma_at(level, &win, ws, cx, cy, cw, ch, &mut got, 8);
+            assert_eq!(got, want, "{level:?} chroma {cw}x{ch} frac {cx},{cy}");
+        }
+    }
+}
+
+#[test]
+fn every_level_matches_the_scalar_h264_deblocking() {
+    let mut seed = 0x0de6_10c5u32;
+    let mut next = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        seed
+    };
+    let (w, h) = (40usize, 40usize);
+    for case in 0..20_000 {
+        // Smooth planes with small steps, so that every filter branch is taken, and some extremes.
+        let base = (next() % 256) as i32;
+        let spread = [2, 6, 20, 255][case % 4];
+        let pix: Vec<u8> = (0..w * h)
+            .map(|_| {
+                let v = base + (next() % (2 * spread + 1)) as i32 - spread as i32;
+                v.clamp(0, 255) as u8
+            })
+            .collect();
+        let strong = next() % 5 == 0;
+        let bs: [u8; 4] = if strong { [4; 4] } else { std::array::from_fn(|_| (next() % 4) as u8) };
+        let e = H264Edge { bs, tc0: std::array::from_fn(|_| (next() % 26) as u8), alpha: (next() % 256) as u8, beta: (next() % 19) as u8 };
+        let (vertical, chroma) = (case % 2 == 0, case % 3 == 0);
+        let (x, y) = (4 + (next() % 16) as usize, 4 + (next() % 16) as usize);
+        let mut want = pix.clone();
+        h264_deblock_at(Level::Scalar, &mut want, w, x, y, vertical, chroma, &e);
+        for &level in levels() {
+            let mut got = pix.clone();
+            h264_deblock_at(level, &mut got, w, x, y, vertical, chroma, &e);
+            assert_eq!(got, want, "{level:?} vertical {vertical} chroma {chroma} at ({x}, {y}) {e:?}");
+        }
+    }
+}

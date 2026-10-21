@@ -19,7 +19,12 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable))]
 
 mod deblock;
+mod h264;
 mod scalar;
+
+#[cfg(target_arch = "aarch64")]
+#[allow(unsafe_code)]
+mod h264_neon;
 
 #[cfg(target_arch = "aarch64")]
 #[allow(unsafe_code)]
@@ -293,6 +298,100 @@ fn cdef_pick(cost: &[i32; 8]) -> (usize, i32) {
         }
     }
     (dir, (best - cost[(dir + 4) & 7]) >> 10)
+}
+
+/// Whether a `w` x `h` block window starting at `win[0]` with rows `ws` apart, and the block
+/// itself in `out` with rows `os` apart, fit their slices.
+fn block_fits(win: &[u8], ws: usize, ww: usize, wh: usize, out: &[u8], os: usize, w: usize, h: usize) -> bool {
+    let need = |len: usize, stride: usize, cols: usize, rows: usize| {
+        rows == 0 || (rows - 1).checked_mul(stride).and_then(|n| n.checked_add(cols)).is_some_and(|n| n <= len)
+    };
+    need(win.len(), ws, ww, wh) && need(out.len(), os, w, h)
+}
+
+/// H.264 luma sample interpolation (8.4.2.2.1) of a `w` x `h` block (`w` and `h` 4, 8 or 16):
+/// `win` holds the (w + 5) x (h + 5) window starting at (x - 2, y - 2), rows `ws` apart, and
+/// (`fx`, `fy`) is the quarter-sample fraction; `out` gets the block, rows `os` apart. The vector
+/// version reads 16 samples from up to 5 past each window row's start (it needs
+/// `(h + 4) * ws + 21` samples, and otherwise the scalar one runs). Blocks that do not fit
+/// `win` or `out` leave `out` unchanged.
+pub fn h264_luma(win: &[u8], ws: usize, fx: u32, fy: u32, w: usize, h: usize, out: &mut [u8], os: usize) {
+    h264_luma_at(level(), win, ws, fx, fy, w, h, out, os);
+}
+
+/// [`h264_luma`] on a given level.
+pub fn h264_luma_at(level: Level, win: &[u8], ws: usize, fx: u32, fy: u32, w: usize, h: usize, out: &mut [u8], os: usize) {
+    if !matches!(w, 4 | 8 | 16) || !matches!(h, 4 | 8 | 16) || fx > 3 || fy > 3 || !block_fits(win, ws, w + 5, h + 5, out, os, w, h) {
+        return;
+    }
+    let done = match level {
+        #[cfg(target_arch = "aarch64")]
+        Level::Neon => h264_neon::luma(win, ws, fx, fy, w, h, out, os),
+        _ => false,
+    };
+    if !done {
+        h264::luma(win, ws, fx, fy, w, h, out, os);
+    }
+}
+
+/// H.264 chroma sample interpolation (8.4.2.2.2) of a `w` x `h` block (`w` and `h` 2, 4 or 8):
+/// `win` holds the (w + 1) x (h + 1) window from the block's integer position, rows `ws` apart,
+/// and (`fx`, `fy`) is the eighth-sample fraction; `out` gets the block, rows `os` apart. The
+/// vector version reads 8 samples from up to 1 past each window row's start (it needs
+/// `h * ws + 9`). Blocks that do not fit `win` or `out` leave `out` unchanged.
+pub fn h264_chroma(win: &[u8], ws: usize, fx: u32, fy: u32, w: usize, h: usize, out: &mut [u8], os: usize) {
+    h264_chroma_at(level(), win, ws, fx, fy, w, h, out, os);
+}
+
+/// [`h264_chroma`] on a given level.
+pub fn h264_chroma_at(level: Level, win: &[u8], ws: usize, fx: u32, fy: u32, w: usize, h: usize, out: &mut [u8], os: usize) {
+    if !matches!(w, 2 | 4 | 8) || !matches!(h, 2 | 4 | 8) || fx > 7 || fy > 7 || !block_fits(win, ws, w + 1, h + 1, out, os, w, h) {
+        return;
+    }
+    let done = match level {
+        #[cfg(target_arch = "aarch64")]
+        Level::Neon => h264_neon::chroma(win, ws, fx, fy, w, h, out, os),
+        _ => false,
+    };
+    if !done {
+        h264::chroma(win, ws, fx, fy, w, h, out, os);
+    }
+}
+
+/// One H.264 deblocking edge (8.7.2): bS and tC0 for each quarter of its lines, and alpha /
+/// beta (8-bit video: alpha < 256, beta < 19, tC0 < 26). bS 4 applies to a whole edge.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct H264Edge {
+    pub bs: [u8; 4],
+    pub tc0: [u8; 4],
+    pub alpha: u8,
+    pub beta: u8,
+}
+
+/// H.264 deblocking (8.7.2) of one edge of 16 luma or 8 chroma (`chroma`) lines of the 8-bit
+/// plane `pix` (rows `stride` apart): a vertical edge (`vertical`) whose q0 column is `x`, for
+/// the lines from row `y`, or a horizontal edge whose q0 row is `y`, for the columns from `x`.
+/// Edges whose samples do not fit `pix` are left unchanged.
+pub fn h264_deblock(pix: &mut [u8], stride: usize, x: usize, y: usize, vertical: bool, chroma: bool, e: &H264Edge) {
+    h264_deblock_at(level(), pix, stride, x, y, vertical, chroma, e);
+}
+
+/// [`h264_deblock`] on a given level.
+pub fn h264_deblock_at(level: Level, pix: &mut [u8], stride: usize, x: usize, y: usize, vertical: bool, chroma: bool, e: &H264Edge) {
+    let done = match level {
+        #[cfg(target_arch = "aarch64")]
+        Level::Neon => h264_neon::deblock(pix, stride, x, y, vertical, chroma, e),
+        _ => false,
+    };
+    if done {
+        return;
+    }
+    match (vertical, chroma) {
+        (true, false) => h264::filter_vertical::<16>(pix, stride, x, y, e, false),
+        (true, true) => h264::filter_vertical::<8>(pix, stride, x, y, e, true),
+        (false, false) => h264::filter_horizontal::<16>(pix, stride, x, y, e, false),
+        (false, true) => h264::filter_horizontal::<8>(pix, stride, x, y, e, true),
+    }
 }
 
 #[cfg(test)]

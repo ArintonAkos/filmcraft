@@ -137,6 +137,7 @@ fn filter8(v: &mut [u8; 8], bs: u8, alpha: i32, beta: i32, tc0: i32, chroma: boo
 }
 
 /// Edge filter parameters for `n` lines; `bs[i]` / `tc0[i]` apply to lines `i * n / 4 .. (i + 1) * n / 4`.
+#[cfg(test)]
 struct EdgeParams {
     bs: [u8; 4],
     tc0: [i32; 4],
@@ -147,6 +148,7 @@ struct EdgeParams {
 /// Filter one edge for `N` lines at once (lane `i` = line `i` across the edge). `s[k][i]` holds
 /// sample p3 p2 p1 p0 q0 q1 q2 q3 (k = 0..8) of line `i`. Branch-free per lane, so the loops
 /// vectorise; bit-exact with [`filter8`] applied to every line (8.7.2.3 / 8.7.2.4).
+#[cfg(test)]
 #[inline(always)]
 fn filter_lanes<const N: usize>(s: &mut [[i16; N]; 8], ep: &EdgeParams, chroma: bool) {
     let per = N / 4;
@@ -226,6 +228,7 @@ fn filter_lanes<const N: usize>(s: &mut [[i16; N]; 8], ep: &EdgeParams, chroma: 
 }
 
 /// Filter a vertical edge whose q0 column is at `x`, for `N` lines starting at row `y`.
+#[cfg(test)]
 #[inline(always)]
 fn filter_vertical<const N: usize>(pix: &mut [u8], stride: usize, x: usize, y: usize, ep: &EdgeParams, chroma: bool) {
     // Each line's eight samples as one little-endian word: byte k = sample k (p3 .. q3).
@@ -254,6 +257,7 @@ fn filter_vertical<const N: usize>(pix: &mut [u8], stride: usize, x: usize, y: u
 }
 
 /// Filter a horizontal edge whose q0 row is `y`, for `N` columns starting at `x`.
+#[cfg(test)]
 #[inline(always)]
 fn filter_horizontal<const N: usize>(pix: &mut [u8], stride: usize, x: usize, y: usize, ep: &EdgeParams, chroma: bool) {
     let base = (y - 4) * stride + x;
@@ -362,7 +366,8 @@ pub fn deblock_mb(pic: &mut PicState, addr: usize, mb_w: usize) {
         let index_a = (qpav + alpha_off).clamp(0, 51) as usize;
         let index_b = (qpav + beta_off).clamp(0, 51) as usize;
         let tc = |b: u8| if (1..4).contains(&b) { TC0[index_a][b as usize - 1] as i32 } else { 0 };
-        EdgeParams { bs: b, tc0: [tc(b[0]), tc(b[1]), tc(b[2]), tc(b[3])], alpha: ALPHA[index_a] as i32, beta: BETA[index_b] as i32 }
+        // 8-bit tables: alpha < 256, beta < 19, tC0 < 26.
+        filmcraft_simd::H264Edge { bs: b, tc0: [tc(b[0]), tc(b[1]), tc(b[2]), tc(b[3])].map(|t| t as u8), alpha: ALPHA[index_a], beta: BETA[index_b] }
     };
     let width = pic.planes.width;
     let cwidth = pic.planes.cwidth;
@@ -380,9 +385,9 @@ pub fn deblock_mb(pic: &mut PicState, addr: usize, mb_w: usize) {
                 continue;
             }
             if dir == 0 {
-                filter_vertical::<16>(&mut pic.planes.y, width, mx * 16 + e * 4, my * 16, &ep, false);
+                filmcraft_simd::h264_deblock(&mut pic.planes.y, width, mx * 16 + e * 4, my * 16, true, false, &ep);
             } else {
-                filter_horizontal::<16>(&mut pic.planes.y, width, mx * 16, my * 16 + e * 4, &ep, false);
+                filmcraft_simd::h264_deblock(&mut pic.planes.y, width, mx * 16, my * 16 + e * 4, false, false, &ep);
             }
         }
     }
@@ -401,9 +406,9 @@ pub fn deblock_mb(pic: &mut PicState, addr: usize, mb_w: usize) {
                 }
                 let plane = if c == 0 { &mut pic.planes.cb } else { &mut pic.planes.cr };
                 if dir == 0 {
-                    filter_vertical::<8>(plane, cwidth, mx * 8 + ce * 4, my * 8, &ep, true);
+                    filmcraft_simd::h264_deblock(plane, cwidth, mx * 8 + ce * 4, my * 8, true, true, &ep);
                 } else {
-                    filter_horizontal::<8>(plane, cwidth, mx * 8, my * 8 + ce * 4, &ep, true);
+                    filmcraft_simd::h264_deblock(plane, cwidth, mx * 8, my * 8 + ce * 4, false, true, &ep);
                 }
             }
         }
