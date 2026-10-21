@@ -297,8 +297,17 @@ fn copy_line<const N: usize>(line: &[u8], x0: i32, out: &mut [u8], w: usize) {
     {
         *dst = *src;
     } else {
-        copy_clamped(line, x0, &mut out[..w]);
+        copy_line_edge(line, x0, &mut out[..w]);
     }
+}
+
+/// [`copy_line`]'s rare case (the window reaches past the picture's left or right edge, or is
+/// wider than `N`), out of line: inlined, the compiler merges the fixed-size copy above with
+/// this variable-length one into a `memcpy` call of a run-time size on every row.
+#[cold]
+#[inline(never)]
+fn copy_line_edge(line: &[u8], x0: i32, out: &mut [u8]) {
+    copy_clamped(line, x0, out);
 }
 
 /// Copy `out.len()` samples of `line` starting at x0, replicating edge samples outside the line.
