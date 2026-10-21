@@ -231,10 +231,15 @@ impl Frame {
     #[inline]
     pub fn luma_window(&self, x0: i32, y0: i32, w: usize, h: usize, out: &mut [u8], os: usize) {
         let (width, height) = (self.width, self.height);
+        // A window spans at most three MB rows: look each up (and wait for it) once.
+        let (mut mb_row, mut lines): (usize, &[u8]) = (usize::MAX, &[]);
         for r in 0..h {
             let yy = (y0 + r as i32).clamp(0, height as i32 - 1) as usize;
-            let row = self.row(yy >> 4);
-            let line = &row.y[(yy & 15) * width..(yy & 15) * width + width];
+            if yy >> 4 != mb_row {
+                mb_row = yy >> 4;
+                lines = &self.row(mb_row).y;
+            }
+            let line = &lines[(yy & 15) * width..(yy & 15) * width + width];
             copy_line::<24>(line, x0, &mut out[r * os..], w);
         }
     }
@@ -243,11 +248,15 @@ impl Frame {
     #[inline]
     pub fn chroma_window(&self, c: usize, x0: i32, y0: i32, w: usize, h: usize, out: &mut [u8], os: usize) {
         let (cw, ch) = (self.cwidth, self.cheight);
+        let (mut mb_row, mut lines): (usize, &[u8]) = (usize::MAX, &[]);
         for r in 0..h {
             let yy = (y0 + r as i32).clamp(0, ch as i32 - 1) as usize;
-            let row = self.row(yy >> 3);
-            let plane = if c == 0 { &row.cb } else { &row.cr };
-            let line = &plane[(yy & 7) * cw..(yy & 7) * cw + cw];
+            if yy >> 3 != mb_row {
+                mb_row = yy >> 3;
+                let row = self.row(mb_row);
+                lines = if c == 0 { &row.cb } else { &row.cr };
+            }
+            let line = &lines[(yy & 7) * cw..(yy & 7) * cw + cw];
             copy_line::<16>(line, x0, &mut out[r * os..], w);
         }
     }
