@@ -92,7 +92,9 @@ pub struct FrameInfo {
 
 /// A decoded frame (also used as reference). Its samples are published one superblock row
 /// ("band") at a time, once loop filtered, so that later frames can predict from the finished
-/// top of a frame while its bottom is still being filtered (frame threading).
+/// top of a frame while its bottom is still being filtered (frame threading). A frame nothing
+/// reads before it is complete is instead finished in whole planes and read in place, rows
+/// `strides[p]` apart, without band lookups.
 pub struct Frame {
     pub info: FrameInfo,
     /// Allocated plane widths (whole superblocks) = row strides.
@@ -102,11 +104,17 @@ pub struct Frame {
     /// Visible (cropped) plane sizes.
     pub vis: [(usize, usize); 3],
     bands: Box<[std::sync::OnceLock<Band>]>,
+    /// The whole planes of a frame finished in place (set before its bands are published).
+    full: std::sync::OnceLock<[Vec<u16>; 3]>,
+    /// Finished in bands, readable before it is complete; else in whole planes.
+    keep_bands: bool,
     pools: std::sync::Arc<Pools>,
 }
 
 impl Frame {
-    pub fn new(info: FrameInfo, pools: std::sync::Arc<Pools>) -> Frame {
+    /// A frame to be finished in bands, readable before it is complete (`keep_bands`), or in whole
+    /// planes ([`Frame::complete`]).
+    pub fn new(info: FrameInfo, pools: std::sync::Arc<Pools>, keep_bands: bool) -> Frame {
         let geo = plane_geometry(info.width, info.height, info.ss_x, info.ss_y);
         let sb_rows = (info.height as usize).div_ceil(64);
         Frame {
@@ -115,6 +123,8 @@ impl Frame {
             band_h: [64, 64 >> info.ss_y as usize, 64 >> info.ss_y as usize],
             vis: geo.map(|g| (g.2, g.3)),
             bands: (0..sb_rows).map(|_| std::sync::OnceLock::new()).collect(),
+            full: std::sync::OnceLock::new(),
+            keep_bands,
             pools,
         }
     }
@@ -134,6 +144,23 @@ impl Frame {
             for p in b.planes {
                 self.pools.bands.put(p);
             }
+        }
+    }
+
+    /// Whether the frame is finished in bands (see [`Frame::new`]).
+    pub fn keeps_bands(&self) -> bool {
+        self.keep_bands
+    }
+
+    /// Complete the frame from its whole planes (every band published without samples).
+    pub fn complete(&self, planes: [Vec<u16>; 3]) {
+        if let Err(planes) = self.full.set(planes) {
+            for p in planes {
+                self.pools.samples.put(p);
+            }
+        }
+        for b in self.bands.iter() {
+            let _ = b.set(Band { planes: Default::default() });
         }
     }
 
@@ -160,19 +187,41 @@ impl Frame {
         }
     }
 
+    /// Plane `p` in one piece (rows `strides[p]` apart) when the frame was finished in place.
+    #[inline]
+    pub fn whole(&self, p: usize) -> Option<&[u16]> {
+        // A frame finished in bands has none: skip the (acquire) load.
+        if self.keep_bands {
+            return None;
+        }
+        self.full.get().map(|f| f[p].as_slice())
+    }
+
     /// Row `y` of plane `p` (all `strides[p]` samples), waiting until it is final.
     #[inline]
     pub fn row(&self, p: usize, y: usize) -> &[u16] {
+        match self.whole(p) {
+            Some(w) => w.get(y * self.strides[p]..(y + 1) * self.strides[p]).unwrap_or_default(),
+            None => self.band_row(p, y),
+        }
+    }
+
+    /// Row `y` of plane `p` of a frame finished in bands.
+    #[inline]
+    pub fn band_row(&self, p: usize, y: usize) -> &[u16] {
         let bh = self.band_h[p];
         let s = self.strides[p];
         let o = (y % bh + BAND_PAD) * s;
-        &self.band(y / bh).planes[p][o..o + s]
+        self.band(y / bh).planes[p].get(o..o + s).unwrap_or_default()
     }
 
-    /// Rows `y0..y1` of plane `p` as one slice with stride `strides[p]` when they lie in one band:
-    /// (band samples, offset of row y0).
+    /// Rows `y0..y1` of plane `p` as one slice with stride `strides[p]`: of the whole planes, or
+    /// of a band when they lie in one: (samples, offset of row y0).
     #[inline]
     pub fn span(&self, p: usize, y0: usize, y1: usize) -> Option<(&[u16], usize)> {
+        if let Some(w) = self.whole(p) {
+            return Some((w, y0 * self.strides[p]));
+        }
         let bh = self.band_h[p];
         let r = y0 / bh;
         if (y1 - 1) / bh != r {
@@ -181,10 +230,18 @@ impl Frame {
         Some((&self.band(r).planes[p], (y0 % bh + BAND_PAD) * self.strides[p]))
     }
 
+    /// A frame finished in whole planes (tests): `planes` sized as the frame's.
+    #[cfg(test)]
+    pub fn from_whole_planes(info: FrameInfo, planes: [&[u16]; 3]) -> Frame {
+        let f = Frame::new(info, Default::default(), false);
+        f.complete(planes.map(|p| p.to_vec()));
+        f
+    }
+
     /// A complete frame from full planes (tests).
     #[cfg(test)]
     pub fn from_planes(info: FrameInfo, planes: [&[u16]; 3]) -> Frame {
-        let f = Frame::new(info, Default::default());
+        let f = Frame::new(info, Default::default(), true);
         for r in 0..f.sb_rows() {
             let mut b = f.new_band();
             for p in 0..3 {
@@ -204,6 +261,9 @@ impl Frame {
 
 impl Drop for Frame {
     fn drop(&mut self) {
+        for p in self.full.take().into_iter().flatten() {
+            self.pools.samples.put(p);
+        }
         for b in std::mem::take(&mut self.bands).into_vec().into_iter().filter_map(|b| b.into_inner()) {
             for p in b.planes {
                 self.pools.bands.put(p);

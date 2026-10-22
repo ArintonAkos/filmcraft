@@ -422,6 +422,8 @@ impl Decoder {
                 intra_only: h.intra_only,
             },
             self.bufs.clone(),
+            // With frame threading the next frames read this one while it is being finished.
+            self.frame_threads(),
         ));
         // Loop filter (8.8), skipped in draft mode for frames nothing can reference.
         let draft = self.draft && h.refresh_frame_flags == 0 && h.show_frame && self.st.lf.level > 0;
@@ -621,6 +623,9 @@ impl Drop for PublishGuard<'_> {
 
 impl PostJob {
     fn run(self) -> Option<Picture> {
+        if !self.frame.keeps_bands() {
+            return self.run_in_place();
+        }
         let f = &*self.frame;
         let _guard = PublishGuard(f);
         let mut pic = self.out.map(|(pts, draft)| PictureBuilder::new(f, pts, draft));
@@ -654,6 +659,67 @@ impl PostJob {
         let strips = std::mem::take(&mut *wave.strips.write().unwrap_or_else(std::sync::PoisonError::into_inner));
         recycle_strip_planes(strips, &wave.pools);
         lock(&wave.pic).take().map(PictureBuilder::finish)
+    }
+}
+
+impl PostJob {
+    /// The post stage of a frame nothing reads before it is complete: the strips become the
+    /// whole planes (moved when there is one, else copied side by side), which are loop
+    /// filtered in place superblock by superblock in raster order (8.8.1) and then complete the
+    /// frame. No bands, scratch rows or wavefront. Superblock row by row (copy, filter, then
+    /// output the row above, which filtering this row finished), so each row stays in cache.
+    fn run_in_place(self) -> Option<Picture> {
+        let f = &*self.frame;
+        let _guard = PublishGuard(f);
+        let mut pic = self.out.map(|(pts, draft)| PictureBuilder::new(f, pts, draft));
+        let mut strips = self.strips;
+        let sizes: [usize; 3] = std::array::from_fn(|p| f.sb_rows() * f.band_h[p] * f.strides[p]);
+        let whole = |s: &Strip| (0..3).all(|p| s.x_off[p] == 0 && s.strides[p] == f.strides[p] && s.planes[p].len() >= sizes[p]);
+        let (mut planes, copy) = match strips.as_mut_slice() {
+            [s] if whole(s) => (std::mem::take(&mut s.planes), false),
+            _ => (std::array::from_fn(|p| self.pools.samples.take_any(sizes[p], 0)), true),
+        };
+        let sb_cols = (f.info.width as usize).div_ceil(64);
+        let output = |pic: &mut Option<PictureBuilder>, planes: &[Vec<u16>; 3], r: usize| {
+            if let Some(pic) = pic {
+                for (p, plane) in planes.iter().enumerate() {
+                    let (fs, bh) = (f.strides[p], f.band_h[p]);
+                    for y in r * bh..((r + 1) * bh).min(f.vis[p].1) {
+                        pic.put_row(p, y, plane.get(y * fs..y * fs + fs).unwrap_or_default());
+                    }
+                }
+            }
+        };
+        for r in 0..f.sb_rows() {
+            if copy {
+                for (p, plane) in planes.iter_mut().enumerate() {
+                    let (fs, bh) = (f.strides[p], f.band_h[p]);
+                    for s in &strips {
+                        let (ss, x0) = (s.strides[p], s.x_off[p]);
+                        let w = ss.min(fs.saturating_sub(x0));
+                        for y in r * bh..(r + 1) * bh {
+                            if let (Some(d), Some(src)) = (plane.get_mut(y * fs + x0..y * fs + x0 + w), s.planes[p].get(y * ss..y * ss + w)) {
+                                d.copy_from_slice(src);
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some(lf) = &self.lf {
+                for c in 0..sb_cols {
+                    let [a, b, d] = &mut planes;
+                    let mut views = [(a, 0), (b, 1), (d, 2)].map(|(data, p)| PlaneView { data, stride: f.strides[p], ox: 0, oy: 0 });
+                    filter_superblock(&mut views, &self.mi, lf, r * 8, c * 8);
+                }
+            }
+            if r > 0 {
+                output(&mut pic, &planes, r - 1);
+            }
+        }
+        output(&mut pic, &planes, f.sb_rows().saturating_sub(1));
+        recycle_strip_planes(strips, &self.pools);
+        f.complete(planes);
+        pic.map(PictureBuilder::finish)
     }
 }
 
@@ -960,18 +1026,29 @@ impl PictureBuilder {
 
     fn add(&mut self, f: &Frame, r: usize, band: &Band) {
         for p in 0..3 {
-            let (w, h) = f.vis[p];
             let (fs, bh) = (f.strides[p], f.band_h[p]);
             let y0 = r * bh;
-            for y in y0..(y0 + bh).min(h) {
-                let src = &band.planes[p][(y - y0 + BAND_PAD) * fs..][..w];
-                match &mut self.planes[p] {
-                    Plane::U8(d) => {
-                        for (d, &s) in d[y * w..y * w + w].iter_mut().zip(src) {
-                            *d = s as u8;
-                        }
+            for y in y0..(y0 + bh).min(f.vis[p].1) {
+                self.put_row(p, y, band.planes[p].get((y - y0 + BAND_PAD) * fs..).unwrap_or_default());
+            }
+        }
+    }
+
+    /// Row `y` of plane `p` from the first visible samples of `src`.
+    fn put_row(&mut self, p: usize, y: usize, src: &[u16]) {
+        let w = self.vis[p].0;
+        let Some(src) = src.get(..w) else { return };
+        match &mut self.planes[p] {
+            Plane::U8(d) => {
+                if let Some(d) = d.get_mut(y * w..y * w + w) {
+                    for (d, &s) in d.iter_mut().zip(src) {
+                        *d = s as u8;
                     }
-                    Plane::U16(d) => d[y * w..y * w + w].copy_from_slice(src),
+                }
+            }
+            Plane::U16(d) => {
+                if let Some(d) = d.get_mut(y * w..y * w + w) {
+                    d.copy_from_slice(src);
                 }
             }
         }
@@ -1007,8 +1084,10 @@ impl PictureBuilder {
 /// The output picture of a complete (or completing) frame (show_existing_frame).
 fn picture_of(f: &Frame, pts: i64, draft: bool) -> Picture {
     let mut b = PictureBuilder::new(f, pts, draft);
-    for r in 0..f.sb_rows() {
-        b.add(f, r, f.band(r));
+    for p in 0..3 {
+        for y in 0..f.vis[p].1 {
+            b.put_row(p, y, f.row(p, y));
+        }
     }
     b.finish()
 }

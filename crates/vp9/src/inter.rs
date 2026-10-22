@@ -23,10 +23,16 @@ pub struct RefPlane<'a> {
     pub last_y: i32,
 }
 
-impl RefPlane<'_> {
+impl<'a> RefPlane<'a> {
+    /// A row reader resolving once whether the reference is in whole planes or in bands.
     #[inline]
-    fn row(&self, y: usize) -> &[u16] {
-        self.frame.row(self.plane, y)
+    fn rows(&self) -> impl Fn(usize) -> &'a [u16] + use<'a> {
+        let (f, p) = (self.frame, self.plane);
+        let (whole, s) = (f.whole(p), f.strides[p]);
+        move |y| match whole {
+            Some(w) => w.get(y * s..y * s + s).unwrap_or_default(),
+            None => f.band_row(p, y),
+        }
     }
 }
 
@@ -39,8 +45,9 @@ pub fn predict_unscaled(r: &RefPlane, x: i32, y: i32, w: usize, h: usize, filter
     let (x0, y0) = (x >> 4, y >> 4);
     let (fx, fy) = ((x & 15) as usize, (y & 15) as usize);
     let inside = x0 - 3 >= 0 && y0 - 3 >= 0 && x0 + w as i32 + 4 <= r.last_x && y0 + h as i32 + 4 <= r.last_y;
-    // Source view with origin at (x0 - 3, y0 - 3): the reference band itself when the window
-    // lies inside the picture and inside one band.
+    // Source view with origin at (x0 - 3, y0 - 3): the reference itself when the window lies
+    // inside the picture (and, while the reference is unfinished, inside one band); a window
+    // copy with the edges clamped only past the picture's edges.
     let span = if inside { r.frame.span(r.plane, (y0 - 3) as usize, (y0 + h as i32 + 5) as usize) } else { None };
     let (src, ss): (&[u16], usize) = match span {
         Some((data, o)) => (data.get(o + (x0 - 3) as usize..).unwrap_or_default(), r.frame.strides[r.plane]),
@@ -91,9 +98,10 @@ fn copy_samples_any(dst: &mut [u16], src: &[u16], n: usize) {
 /// Copy the (w + 7) x (h + 7) source window starting at (x0 - 3, y0 - 3) with edge clamping.
 fn fetch_window(r: &RefPlane, x0: i32, y0: i32, w: usize, h: usize, win: &mut [u16]) -> usize {
     let ws = w + 7;
+    let rows = r.rows();
     for row in 0..h + 7 {
         let yy = (y0 - 3 + row as i32).clamp(0, r.last_y) as usize;
-        let src = r.row(yy);
+        let src = rows(yy);
         let dst = &mut win[row * ws..row * ws + ws];
         let xs = x0 - 3;
         if xs >= 0 && xs + ws as i32 - 1 <= r.last_x {
@@ -114,9 +122,10 @@ fn fetch_window(r: &RefPlane, x0: i32, y0: i32, w: usize, h: usize, win: &mut [u
 pub fn predict_scaled(r: &RefPlane, x: i32, y: i32, step_x: i32, step_y: i32, w: usize, h: usize, filter: u8, bit_depth: u8, out: &mut [u16], tmp: &mut [u16]) {
     let max = (1i32 << bit_depth) - 1;
     let ih = ((((h as i32 - 1) * step_y + 15) >> 4) + 8) as usize;
+    let rows = r.rows();
     for row in 0..ih {
         let yy = ((y >> 4) + row as i32 - 3).clamp(0, r.last_y) as usize;
-        let src = r.row(yy);
+        let src = rows(yy);
         for c in 0..w {
             let p = x + step_x * c as i32;
             let f = taps(filter, (p & 15) as usize);
@@ -180,6 +189,59 @@ mod tests {
                     predict_scaled(&r, x, y, 16, 16, bw, bh, filter, 8, &mut b, &mut tmp);
                     assert_eq!(a, b, "filter {filter} pos ({x},{y}) {bw}x{bh}");
                 }
+            }
+        }
+    }
+
+    /// A reference finished in whole planes predicts as the same picture published in bands:
+    /// blocks inside, across band boundaries (luma 64 and chroma 32 rows) and past every edge,
+    /// all sizes and filter phases.
+    #[test]
+    fn whole_planes_predict_like_bands() {
+        let (w, h) = (150usize, 140usize);
+        let info = crate::frame::FrameInfo {
+            width: w as u32,
+            height: h as u32,
+            ss_x: true,
+            ss_y: true,
+            bit_depth: 10,
+            color_space: 0,
+            color_range: false,
+            render_width: w as u32,
+            render_height: h as u32,
+            key: true,
+            intra_only: false,
+        };
+        // Planes of whole superblocks: 192 x 192 luma, 96 x 96 chroma.
+        let plane = |n: usize, k: usize| (0..n * n).map(|i| ((i * 37 + (i / n) * 11 + k * 101) % 1024) as u16).collect::<Vec<u16>>();
+        let (y, u, v) = (plane(192, 0), plane(96, 1), plane(96, 2));
+        let bands = Frame::from_planes(info, [&y, &u, &v]);
+        let whole = Frame::from_whole_planes(info, [&y, &u, &v]);
+        let mut seed = 0x0bad_f00du32;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        for case in 0..4000 {
+            let p = case % 3;
+            let (pw, ph) = if p == 0 { (w as i32, h as i32) } else { (w.div_ceil(2) as i32, h.div_ceil(2) as i32) };
+            let bw = [4usize, 8, 16, 32, 64][next() as usize % 5];
+            let bh = [4usize, 8, 16, 32, 64][next() as usize % 5];
+            let x = (next() % ((pw as u32 + 40) * 16)) as i32 - 20 * 16;
+            let y = (next() % ((ph as u32 + 40) * 16)) as i32 - 20 * 16;
+            let filter = (next() % 4) as u8;
+            let mut out = [vec![0u16; bw * bh], vec![0u16; bw * bh]];
+            for (f, o) in [&bands, &whole].into_iter().zip(&mut out) {
+                let r = RefPlane { frame: f, plane: p, last_x: pw - 1, last_y: ph - 1 };
+                predict_unscaled(&r, x, y, bw, bh, filter, 10, o, bw, Vp9Out::Put, &mut [0u16; 71 * 71 + 1]);
+            }
+            assert_eq!(out[0], out[1], "plane {p} ({x}, {y}) {bw}x{bh} filter {filter}");
+        }
+        for p in 0..3 {
+            for yy in 0..[192, 96, 96][p] {
+                assert_eq!(bands.row(p, yy), whole.row(p, yy), "plane {p} row {yy}");
             }
         }
     }
