@@ -372,7 +372,7 @@ impl Decoder {
                             predict::predict_subblock(&mut frame.y, ys, px, py, b, bmodes[b], mb_x + 1 == self.mb_w);
                             if nonzero[b] {
                                 let pos = (py + 4 * (b >> 2)) * ys + px + 4 * (b & 3);
-                                transform::add_residue(&mut frame.y, ys, pos, &transform::inverse_dct(&coeffs[b]));
+                                transform::idct_add(&mut frame.y, ys, pos, &coeffs[b]);
                             }
                         }
                     } else {
@@ -393,7 +393,7 @@ impl Decoder {
                         let k = (b - 16) & 3;
                         let pos = (py / 2 + 4 * (k >> 1)) * cs + px / 2 + 4 * (k & 1);
                         let plane = if b < 20 { &mut frame.u } else { &mut frame.v };
-                        transform::add_residue(plane, cs, pos, &transform::inverse_dct(&coeffs[b]));
+                        transform::idct_add(plane, cs, pos, &coeffs[b]);
                     }
                 }
                 // Back to zero for the next macroblock: only blocks with coefficients (tokens
@@ -738,7 +738,7 @@ fn add_luma_residue(plane: &mut [u8], stride: usize, px: usize, py: usize, coeff
     for b in 0..16 {
         if nonzero[b] {
             let pos = (py + 4 * (b >> 2)) * stride + px + 4 * (b & 3);
-            transform::add_residue(plane, stride, pos, &transform::inverse_dct(&coeffs[b]));
+            transform::idct_add(plane, stride, pos, &coeffs[b]);
         }
     }
 }

@@ -59,6 +59,10 @@ mod vp8_mc_neon;
 
 #[cfg(target_arch = "aarch64")]
 #[allow(unsafe_code)]
+mod vp8_itx_neon;
+
+#[cfg(target_arch = "aarch64")]
+#[allow(unsafe_code)]
 mod vp9_neon;
 
 #[cfg(target_arch = "x86_64")]
@@ -588,6 +592,26 @@ pub fn hevc_sao_edge8_at(level: Level, cur: &[u8], a: &[u8], b: &[u8], dst: &mut
         Level::Neon => hevc_sao_neon::edge(cur, a, b, dst, &o),
         _ => {
             let _ = (cur, a, b, dst, o);
+            false
+        }
+    }
+}
+
+/// VP8 inverse DCT (14.4) of the 4x4 block `coefs` (raster order), added to the 8-bit
+/// prediction at `dst[pos..]` (rows `stride` apart) saturating (14.5). Returns false, writing
+/// nothing, when no vector version runs (on the scalar level, or when the block is not all in
+/// `dst`); the caller then runs its scalar version.
+pub fn vp8_idct_add(coefs: &[i16; 16], dst: &mut [u8], pos: usize, stride: usize) -> bool {
+    vp8_idct_add_at(level(), coefs, dst, pos, stride)
+}
+
+/// [`vp8_idct_add`] on a given level.
+pub fn vp8_idct_add_at(level: Level, coefs: &[i16; 16], dst: &mut [u8], pos: usize, stride: usize) -> bool {
+    match level {
+        #[cfg(target_arch = "aarch64")]
+        Level::Neon => vp8_itx_neon::idct_add(coefs, dst, pos, stride),
+        _ => {
+            let _ = (coefs, dst, pos, stride);
             false
         }
     }
