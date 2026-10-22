@@ -784,27 +784,23 @@ fn loop_filter(frame: &mut Frame, mb_w: usize, mb_h: usize, lf_info: &[(u8, bool
             }
             if mb_x > 0 {
                 loopfilter::filter_edge::<16>(&mut frame.y, ys, y0, true, Kind::NormalMb, &prm);
-                loopfilter::filter_edge::<8>(&mut frame.u, cs, c0, true, Kind::NormalMb, &prm);
-                loopfilter::filter_edge::<8>(&mut frame.v, cs, c0, true, Kind::NormalMb, &prm);
+                loopfilter::filter_edge_uv(&mut frame.u, &mut frame.v, cs, c0, true, Kind::NormalMb, &prm);
             }
             if inner {
                 for x in [4, 8, 12] {
                     loopfilter::filter_edge::<16>(&mut frame.y, ys, y0 + x, true, Kind::NormalSub, &prm);
                 }
-                loopfilter::filter_edge::<8>(&mut frame.u, cs, c0 + 4, true, Kind::NormalSub, &prm);
-                loopfilter::filter_edge::<8>(&mut frame.v, cs, c0 + 4, true, Kind::NormalSub, &prm);
+                loopfilter::filter_edge_uv(&mut frame.u, &mut frame.v, cs, c0 + 4, true, Kind::NormalSub, &prm);
             }
             if mb_y > 0 {
                 loopfilter::filter_edge::<16>(&mut frame.y, ys, y0, false, Kind::NormalMb, &prm);
-                loopfilter::filter_edge::<8>(&mut frame.u, cs, c0, false, Kind::NormalMb, &prm);
-                loopfilter::filter_edge::<8>(&mut frame.v, cs, c0, false, Kind::NormalMb, &prm);
+                loopfilter::filter_edge_uv(&mut frame.u, &mut frame.v, cs, c0, false, Kind::NormalMb, &prm);
             }
             if inner {
                 for y in [4, 8, 12] {
                     loopfilter::filter_edge::<16>(&mut frame.y, ys, y0 + y * ys, false, Kind::NormalSub, &prm);
                 }
-                loopfilter::filter_edge::<8>(&mut frame.u, cs, c0 + 4 * cs, false, Kind::NormalSub, &prm);
-                loopfilter::filter_edge::<8>(&mut frame.v, cs, c0 + 4 * cs, false, Kind::NormalSub, &prm);
+                loopfilter::filter_edge_uv(&mut frame.u, &mut frame.v, cs, c0 + 4 * cs, false, Kind::NormalSub, &prm);
             }
         }
     }

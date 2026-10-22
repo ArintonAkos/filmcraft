@@ -51,6 +51,10 @@ mod neon;
 
 #[cfg(target_arch = "aarch64")]
 #[allow(unsafe_code)]
+mod vp8_lf_neon;
+
+#[cfg(target_arch = "aarch64")]
+#[allow(unsafe_code)]
 mod vp9_neon;
 
 #[cfg(target_arch = "x86_64")]
@@ -580,6 +584,66 @@ pub fn hevc_sao_edge8_at(level: Level, cur: &[u8], a: &[u8], b: &[u8], dst: &mut
         Level::Neon => hevc_sao_neon::edge(cur, a, b, dst, &o),
         _ => {
             let _ = (cur, a, b, dst, o);
+            false
+        }
+    }
+}
+
+/// A VP8 loop filter (15.2, 15.3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Vp8Filter {
+    /// The simple filter (15.2): p0 and q0 only, no interior or high edge variance test.
+    Simple,
+    /// The normal subblock (inner) edge filter (15.3 `subblock_filter`).
+    Subblock,
+    /// The normal macroblock edge filter (15.3 `MBfilter`).
+    Macroblock,
+}
+
+/// The limits of a VP8 edge (15.2, 15.4): the edge limit (the macroblock or subblock one), and
+/// for the normal filters the interior limit and the high edge variance threshold.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Vp8Limits {
+    pub edge: i32,
+    pub interior: i32,
+    pub hev_threshold: i32,
+}
+
+/// VP8 loop filter of a 16-line luma edge of 8-bit pixels: q0 of the first line at `d[start]`,
+/// the lines `stride` apart down a vertical edge (`vertical`, p0 at `start - 1`) or 1 apart
+/// along a horizontal one (p0 at `start - stride`). Returns false, writing nothing, when no
+/// vector version runs (on the scalar level, or when p3..q3 of the lines are not all in `d`);
+/// the caller then runs its scalar version.
+pub fn vp8_loop_filter(d: &mut [u8], start: usize, stride: usize, vertical: bool, f: Vp8Filter, l: &Vp8Limits) -> bool {
+    vp8_loop_filter_at(level(), d, start, stride, vertical, f, l)
+}
+
+/// [`vp8_loop_filter`] on a given level.
+pub fn vp8_loop_filter_at(level: Level, d: &mut [u8], start: usize, stride: usize, vertical: bool, f: Vp8Filter, l: &Vp8Limits) -> bool {
+    match level {
+        #[cfg(target_arch = "aarch64")]
+        Level::Neon => vp8_lf_neon::luma(d, start, stride, vertical, f, l),
+        _ => {
+            let _ = (d, start, stride, vertical, f, l);
+            false
+        }
+    }
+}
+
+/// [`vp8_loop_filter`] of the same 8-line edge of both chroma planes `u` and `v` (same layout,
+/// same limits: VP8 filters them alike).
+pub fn vp8_loop_filter_uv(u: &mut [u8], v: &mut [u8], start: usize, stride: usize, vertical: bool, f: Vp8Filter, l: &Vp8Limits) -> bool {
+    vp8_loop_filter_uv_at(level(), u, v, start, stride, vertical, f, l)
+}
+
+/// [`vp8_loop_filter_uv`] on a given level.
+#[allow(clippy::too_many_arguments)]
+pub fn vp8_loop_filter_uv_at(level: Level, u: &mut [u8], v: &mut [u8], start: usize, stride: usize, vertical: bool, f: Vp8Filter, l: &Vp8Limits) -> bool {
+    match level {
+        #[cfg(target_arch = "aarch64")]
+        Level::Neon => vp8_lf_neon::chroma(u, v, start, stride, vertical, f, l),
+        _ => {
+            let _ = (u, v, start, stride, vertical, f, l);
             false
         }
     }
