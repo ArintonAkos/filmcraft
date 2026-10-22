@@ -243,6 +243,9 @@ impl Decoder {
         let mut above_bmodes = vec![[B_DC_PRED; 4]; self.mb_w];
         let mut above_nz = vec![[0u8; 9]; self.mb_w];
         let refs = self.refs.clone();
+        // The dequantized coefficients of a macroblock: zero between macroblocks (each clears
+        // the blocks it wrote).
+        let mut coeffs = [[0i16; 16]; 25];
 
         for mb_y in 0..self.mb_h {
             let mut left_bmodes = [B_DC_PRED; 4];
@@ -296,7 +299,6 @@ impl Decoder {
 
                 // ---- residual (token partition)
                 let has_y2 = info.mode != B_PRED && info.mode != MV_SPLIT;
-                let mut coeffs = [[0i16; 16]; 25];
                 let mut nonzero = [false; 25];
                 let td = &mut token_decoders[part];
                 let mut has_coeffs = false;
@@ -393,6 +395,11 @@ impl Decoder {
                         let plane = if b < 20 { &mut frame.u } else { &mut frame.v };
                         transform::add_residue(plane, cs, pos, &transform::inverse_dct(&coeffs[b]));
                     }
+                }
+                // Back to zero for the next macroblock: only blocks with coefficients (tokens
+                // past the first position, or the Y2 DC) were written.
+                for (c, _) in coeffs.iter_mut().zip(nonzero).filter(|(_, nz)| *nz) {
+                    *c = [0; 16];
                 }
             }
         }
@@ -669,36 +676,60 @@ fn implied_bmode(mode: u8) -> u8 {
 /// Decode the tokens of one block (13), storing dequantized coefficients in raster order.
 /// Returns the position after the last token (where the end of block was read, or 16).
 fn read_coefficients(bd: &mut BoolDecoder, probs: &[[[u8; 11]; 3]; 8], ctx: usize, first: usize, dq: [i32; 2], out: &mut [i16; 16]) -> usize {
+    // Through `&mut` the decoder state would go to memory after every bool; a local copy stays
+    // in registers.
+    let mut local = *bd;
+    let d = &mut local;
     let mut ctx = ctx.min(2);
-    let mut prev_zero = false;
     let mut i = first;
-    while i < 16 {
-        let p = &probs[usize::from(COEFF_BANDS[i])][ctx];
-        let token = if prev_zero { bd.read_tree_from(&COEFF_TREE, p, 2) } else { bd.read_tree(&COEFF_TREE, p) };
-        if token == DCT_EOB {
-            break;
+    // coeff_tree (13.2) as branches: dct_eob, DCT_0 and DCT_1 first, the rarer tokens after.
+    'tokens: while i < 16 {
+        let mut p = &probs[usize::from(COEFF_BANDS[i])][ctx];
+        if !d.read_bool(p[0]) {
+            break; // dct_eob
         }
-        let abs = match token {
-            DCT_0..=DCT_4 => i32::from(token),
-            _ => {
-                let cat = usize::from(token - DCT_CAT1).min(5);
+        // A run of DCT_0; no dct_eob may follow a zero, so the next token starts at node 2.
+        while !d.read_bool(p[1]) {
+            i += 1;
+            if i == 16 {
+                break 'tokens;
+            }
+            p = &probs[usize::from(COEFF_BANDS[i])][0];
+        }
+        let abs = if !d.read_bool(p[2]) {
+            ctx = 1;
+            1
+        } else {
+            ctx = 2;
+            if !d.read_bool(p[3]) {
+                if !d.read_bool(p[4]) {
+                    2
+                } else if !d.read_bool(p[5]) {
+                    3
+                } else {
+                    4
+                }
+            } else {
+                let cat = if !d.read_bool(p[6]) {
+                    usize::from(d.read_bool(p[7]))
+                } else if !d.read_bool(p[8]) {
+                    2 + usize::from(d.read_bool(p[9]))
+                } else {
+                    4 + usize::from(d.read_bool(p[10]))
+                };
+                // dct_cat1 .. dct_cat6: the extra bits at their fixed probabilities
                 let mut extra = 0i32;
                 for &pb in PCAT[cat] {
-                    extra = extra + extra + i32::from(bd.read_bool(pb));
+                    extra = extra + extra + i32::from(d.read_bool(pb));
                 }
                 CAT_BASE[cat] + extra
             }
         };
-        let v = if abs != 0 && bd.read_bool(128) { -abs } else { abs };
-        ctx = match abs {
-            0 => 0,
-            1 => 1,
-            _ => 2,
-        };
-        prev_zero = token == DCT_0;
+        let v = if d.read_half() { -abs } else { abs };
         out[ZIGZAG[i]] = (v * dq[usize::from(i > 0)]) as i16;
         i += 1;
     }
+    *bd = local;
     i
 }
 
@@ -802,6 +833,80 @@ fn loop_filter(frame: &mut Frame, mb_w: usize, mb_h: usize, lf_info: &[(u8, bool
                 }
                 loopfilter::filter_edge_uv(&mut frame.u, &mut frame.v, cs, c0 + 4 * cs, false, Kind::NormalSub, &prm);
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod token_tests {
+    use super::*;
+
+    /// The token loop as the specification's tree walk (13.2, `treed_read` with `coeff_tree`),
+    /// the reference for [`read_coefficients`].
+    fn reference(bd: &mut BoolDecoder, probs: &[[[u8; 11]; 3]; 8], ctx: usize, first: usize, dq: [i32; 2], out: &mut [i16; 16]) -> usize {
+        let mut ctx = ctx.min(2);
+        let mut prev_zero = false;
+        let mut i = first;
+        while i < 16 {
+            let p = &probs[usize::from(COEFF_BANDS[i])][ctx];
+            let token = if prev_zero { bd.read_tree_from(&COEFF_TREE, p, 2) } else { bd.read_tree(&COEFF_TREE, p) };
+            if token == DCT_EOB {
+                break;
+            }
+            let abs = match token {
+                DCT_0..=DCT_4 => i32::from(token),
+                _ => {
+                    let cat = usize::from(token - DCT_CAT1).min(5);
+                    let mut extra = 0i32;
+                    for &pb in PCAT[cat] {
+                        extra = extra + extra + i32::from(bd.read_bool(pb));
+                    }
+                    CAT_BASE[cat] + extra
+                }
+            };
+            let v = if abs != 0 && bd.read_bool(128) { -abs } else { abs };
+            ctx = match abs {
+                0 => 0,
+                1 => 1,
+                _ => 2,
+            };
+            prev_zero = token == DCT_0;
+            out[ZIGZAG[i]] = (v * dq[usize::from(i > 0)]) as i16;
+            i += 1;
+        }
+        i
+    }
+
+    /// The branch-coded token loop reads what the tree walk reads (coefficients, end of block, and
+    /// where the bool decoder stands afterwards) for random data, probabilities from very skewed
+    /// to even, every context and first position.
+    #[test]
+    fn branch_coded_tokens_match_the_tree_walk() {
+        let mut seed = 0x5eed_c0ef_f1c1_e575u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for case in 0..3000 {
+            let data: Vec<u8> = (0..64).map(|_| next() as u8).collect();
+            let skew = [1u64, 30, 128, 225, 254][case % 5];
+            let mut probs = [[[0u8; 11]; 3]; 8];
+            for p in probs.iter_mut().flatten().flatten() {
+                *p = (skew + next() % 31).clamp(1, 255) as u8;
+            }
+            let (ctx, first) = ((next() % 3) as usize, (next() % 2) as usize);
+            let dq = [(next() % 150) as i32 + 1, (next() % 150) as i32 + 1];
+            let (mut a, mut b) = (BoolDecoder::new(&data), BoolDecoder::new(&data));
+            // several blocks in a row, as a partition holds them
+            for blk in 0..4 {
+                let (mut oa, mut ob) = ([0i16; 16], [0i16; 16]);
+                let ea = read_coefficients(&mut a, &probs, ctx, first, dq, &mut oa);
+                let eb = reference(&mut b, &probs, ctx, first, dq, &mut ob);
+                assert_eq!((ea, oa), (eb, ob), "case {case} block {blk}");
+            }
+            assert_eq!(a.read_literal(16), b.read_literal(16), "case {case}: decoder state afterwards");
         }
     }
 }
