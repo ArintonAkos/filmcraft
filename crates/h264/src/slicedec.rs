@@ -558,20 +558,22 @@ impl<'a> SliceDecoder<'a> {
     /// Store motion for a rectangle (4x4 units) of the current MB and mark it decoded.
     fn set_motion(&mut self, x: usize, y: usize, w: usize, h: usize, refs: [i8; 2], mvs: [[i16; 2]; 2]) {
         let st = &mut self.pic.mbs[self.mb_addr];
+        let mvs = [0, 1].map(|l| if refs[l] >= 0 { mvs[l] } else { [0, 0] });
+        // the rectangle's 4x4 blocks of one row, as bits of `mv_done`
+        let row_bits = ((1u16 << w) - 1) << x;
         for yy in y..y + h {
-            for xx in x..x + w {
-                let r = yy * 4 + xx;
-                for l in 0..2 {
-                    st.mv[l][r] = if refs[l] >= 0 { mvs[l] } else { [0, 0] };
+            for l in 0..2 {
+                if let Some(row) = st.mv[l].get_mut(yy * 4 + x..yy * 4 + x + w) {
+                    row.fill(mvs[l]);
                 }
-                self.mv_done |= 1 << r;
             }
+            self.mv_done |= row_bits << (yy * 4);
         }
-        for l in 0..2 {
-            // ref_idx is per 8x8; rectangles never straddle 8x8 blocks with different refs
-            for yy in (y..y + h).step_by(1) {
-                for xx in x..x + w {
-                    st.ref_idx[l][(yy >> 1) * 2 + (xx >> 1)] = refs[l];
+        // ref_idx is per 8x8; rectangles never straddle 8x8 blocks with different refs
+        for by in y >> 1..=(y + h - 1) >> 1 {
+            for bx in x >> 1..=(x + w - 1) >> 1 {
+                for l in 0..2 {
+                    st.ref_idx[l][by * 2 + bx] = refs[l];
                 }
             }
         }
@@ -635,8 +637,8 @@ impl<'a> SliceDecoder<'a> {
                 continue;
             }
             let (x8, y8) = ((b8 & 1) * 2, (b8 >> 1) * 2);
-            let unit = if self.sps.direct_8x8_inference { 2 } else { 1 };
-            for sub in (0..4).filter(|s| unit == 1 || *s == 0) {
+            let (unit, subs): (usize, &[usize]) = if self.sps.direct_8x8_inference { (2, &[0]) } else { (1, &[0, 1, 2, 3]) };
+            for &sub in subs {
                 let (x, y) = (x8 + (sub & 1), y8 + (sub >> 1));
                 let raster = y * 4 + x;
                 let (mv_col, ref_col, id_col) = self.colocated(raster);
