@@ -450,6 +450,33 @@ pub struct H264Edge {
     pub beta: u8,
 }
 
+/// [`h264_chroma`] of the same block of both chroma planes, which share the motion vector, so the
+/// fraction, window stride and destination stride: `win[0]` / `dst[0]` Cb, `win[1]` / `dst[1]`
+/// Cr, both written as `out` (the vector version runs them as one).
+#[allow(clippy::too_many_arguments)]
+pub fn h264_chroma_pair(win: [&[u8]; 2], ws: usize, fx: u32, fy: u32, w: usize, h: usize, dst: [&mut [u8]; 2], ds: usize, out: H264Out) {
+    h264_chroma_pair_at(level(), win, ws, fx, fy, w, h, dst, ds, out);
+}
+
+/// [`h264_chroma_pair`] on a given level.
+#[allow(clippy::too_many_arguments)]
+pub fn h264_chroma_pair_at(level: Level, win: [&[u8]; 2], ws: usize, fx: u32, fy: u32, w: usize, h: usize, dst: [&mut [u8]; 2], ds: usize, out: H264Out) {
+    let [db, dr] = dst;
+    let fit = |win: &[u8], dst: &[u8]| block_fits(win, ws, w + 1, h + 1, dst, ds, w, h);
+    if !matches!(w, 2 | 4 | 8) || !matches!(h, 2 | 4 | 8) || fx > 7 || fy > 7 || !fit(win[0], db) || !fit(win[1], dr) {
+        return;
+    }
+    let done = match level {
+        #[cfg(target_arch = "aarch64")]
+        Level::Neon => h264_neon::chroma_pair(win, ws, fx, fy, w, h, [&mut *db, &mut *dr], ds, out),
+        _ => false,
+    };
+    if !done {
+        h264::chroma_out(win[0], ws, fx, fy, w, h, db, ds, out);
+        h264::chroma_out(win[1], ws, fx, fy, w, h, dr, ds, out);
+    }
+}
+
 /// H.264 deblocking (8.7.2) of one edge of 16 luma or 8 chroma (`chroma`) lines of the 8-bit
 /// plane `pix` (rows `stride` apart): a vertical edge (`vertical`) whose q0 column is `x`, for
 /// the lines from row `y`, or a horizontal edge whose q0 row is `y`, for the columns from `x`.

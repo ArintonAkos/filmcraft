@@ -272,6 +272,19 @@ fn predict_block(f: &Frame, mv: [i16; 2], px: usize, py: usize, bw: usize, bh: u
     let (fx, fy) = ((mv[0] & 7) as u32, (mv[1] & 7) as u32);
     // The bilinear chroma filter reads 1 sample after the block in each direction.
     let direct = planes.and_then(|p| inside(cx, cy, cw + 1, ch + 1, p.cwidth, p.height / 2).map(|o| (p, o)));
+    if out[1] == out[2] {
+        // Cb and Cr written alike: both in one pass
+        match direct {
+            Some((p, o)) => filmcraft_simd::h264_chroma_pair([&p.cb[o..], &p.cr[o..]], p.cwidth, fx, fy, cw, ch, c, cs, out[1]),
+            None => {
+                let (mut wb, mut wr) = ([0u8; 16 * 9], [0u8; 16 * 9]);
+                f.chroma_window(0, cx, cy, cw + 1, ch + 1, &mut wb, 16);
+                f.chroma_window(1, cx, cy, cw + 1, ch + 1, &mut wr, 16);
+                filmcraft_simd::h264_chroma_pair([&wb, &wr], 16, fx, fy, cw, ch, c, cs, out[1]);
+            }
+        }
+        return;
+    }
     for (comp, (dst, out)) in c.into_iter().zip([out[1], out[2]]).enumerate() {
         match direct {
             Some((p, o)) => filmcraft_simd::h264_chroma(&[&p.cb, &p.cr][comp][o..], p.cwidth, fx, fy, cw, ch, dst, cs, out),

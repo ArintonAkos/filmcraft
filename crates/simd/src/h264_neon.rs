@@ -166,19 +166,20 @@ fn combine8<const M: u8>(d: uint8x8_t, p: uint8x8_t, wt: Wt) -> uint8x8_t {
     }
 }
 
-/// One output row of `w` (2, 4 or 8) samples from `o`, written by mode `M`. `dst` holds the row
-/// (`dst_fits`); rows narrower than 8 are read and written as one integer.
+/// One output row of `w` (2, 4 or 8) samples from `o`, written by mode `M`. The kernels' callers
+/// checked that `dst` holds every row (`dst_fits`: o + w <= dst.len()); rows narrower than 8 are
+/// read and written as one integer.
 #[target_feature(enable = "neon")]
 fn out8<const M: u8>(dst: &mut [u8], o: usize, w: usize, p: uint8x8_t, wt: Wt) {
     match w {
         8 => {
-            let Some(d) = dst.get_mut(o..).and_then(|d| d.first_chunk_mut::<8>()) else {
-                return;
-            };
-            // SAFETY: `d` is 8 bytes, the 8 bytes `vld1_u8` reads and `vst1_u8` writes.
+            debug_assert!(o + 8 <= dst.len());
+            // SAFETY: o + 8 <= dst.len() (`dst_fits` for 8-wide blocks), the 8 bytes `vld1_u8`
+            // reads and `vst1_u8` writes.
             unsafe {
-                let old = if M == AVG || M == WEIGHT_BI { vld1_u8(d.as_ptr()) } else { p };
-                vst1_u8(d.as_mut_ptr(), combine8::<M>(old, p, wt));
+                let d = dst.as_mut_ptr().add(o);
+                let old = if M == AVG || M == WEIGHT_BI { vld1_u8(d) } else { p };
+                vst1_u8(d, combine8::<M>(old, p, wt));
             }
         }
         4 => {
@@ -198,25 +199,27 @@ fn out8<const M: u8>(dst: &mut [u8], o: usize, w: usize, p: uint8x8_t, wt: Wt) {
     }
 }
 
+/// One output row of 16 samples from `o` (o + 16 <= dst.len(), checked by `luma` with
+/// `dst_fits`), written by mode `M`.
 #[target_feature(enable = "neon")]
 fn out16<const M: u8>(dst: &mut [u8], o: usize, p: uint8x16_t, wt: Wt) {
-    let Some(d) = dst.get_mut(o..).and_then(|d| d.first_chunk_mut::<16>()) else {
-        return;
-    };
+    debug_assert!(o + 16 <= dst.len());
+    // SAFETY: o + 16 <= dst.len() (see above).
+    let d = unsafe { dst.as_mut_ptr().add(o) };
     if M == PUT {
-        // SAFETY: `d` is 16 bytes, the 16 bytes `vst1q_u8` writes.
-        unsafe { vst1q_u8(d.as_mut_ptr(), p) };
+        // SAFETY: `d` points to the 16 bytes of `dst` that `vst1q_u8` writes.
+        unsafe { vst1q_u8(d, p) };
         return;
     }
-    // SAFETY: `d` is 16 bytes, the 16 bytes `vld1q_u8` reads and `vst1q_u8` writes.
+    // SAFETY: `d` points to the 16 bytes of `dst` that `vld1q_u8` reads and `vst1q_u8` writes.
     unsafe {
-        let old = vld1q_u8(d.as_ptr());
+        let old = vld1q_u8(d);
         let v = if M == AVG {
             vrhaddq_u8(old, p)
         } else {
             vcombine_u8(combine8::<M>(vget_low_u8(old), vget_low_u8(p), wt), combine8::<M>(vget_high_u8(old), vget_high_u8(p), wt))
         };
-        vst1q_u8(d.as_mut_ptr(), v);
+        vst1q_u8(d, v);
     }
 }
 
@@ -330,6 +333,61 @@ fn chroma_neon<const M: u8>(win: &[u8], ws: usize, fx: u32, fy: u32, w: usize, h
         let (o0, o1) = (r * ws, (r + 1) * ws);
         let acc = vmlal_u8(vmlal_u8(vmlal_u8(vmull_u8(ld8(win, o0), a), ld8(win, o0 + 1), b), ld8(win, o1), c), ld8(win, o1 + 1), d);
         out8::<M>(dst, r * ds, w, vrshrn_n_u16::<6>(acc), wt);
+    }
+}
+
+/// See [`crate::h264_chroma_pair`]; false as [`chroma`] for either plane.
+pub(crate) fn chroma_pair(win: [&[u8]; 2], ws: usize, fx: u32, fy: u32, w: usize, h: usize, dst: [&mut [u8]; 2], ds: usize, out: H264Out) -> bool {
+    let Some((m, wt)) = mode(out) else {
+        return false;
+    };
+    let fits = matches!(w, 2 | 4 | 8)
+        && (1..=8).contains(&h)
+        && fx < 8
+        && fy < 8
+        && win.iter().all(|win| h.checked_mul(ws).and_then(|n| n.checked_add(9)).is_some_and(|n| n <= win.len()))
+        && dst.iter().all(|d| dst_fits(d, ds, w, h));
+    if !fits {
+        return false;
+    }
+    // SAFETY: NEON is part of the aarch64 baseline: every core this build runs on has it (every arm).
+    unsafe {
+        match m {
+            PUT => chroma_pair_neon::<PUT>(win, ws, fx, fy, w, h, dst, ds, wt),
+            AVG => chroma_pair_neon::<AVG>(win, ws, fx, fy, w, h, dst, ds, wt),
+            WEIGHT => chroma_pair_neon::<WEIGHT>(win, ws, fx, fy, w, h, dst, ds, wt),
+            _ => chroma_pair_neon::<WEIGHT_BI>(win, ws, fx, fy, w, h, dst, ds, wt),
+        }
+    }
+    true
+}
+
+/// [`chroma_neon`] of Cb (lanes 0..8) and Cr (lanes 8..16) at once; each window row is loaded
+/// once, as the bottom row of one output row and the top row of the next.
+#[target_feature(enable = "neon")]
+#[allow(clippy::too_many_arguments)]
+fn chroma_pair_neon<const M: u8>(win: [&[u8]; 2], ws: usize, fx: u32, fy: u32, w: usize, h: usize, dst: [&mut [u8]; 2], ds: usize, wt: Wt) {
+    let [a, b, c, d] = [(8 - fx) * (8 - fy), fx * (8 - fy), (8 - fx) * fy, fx * fy].map(|v| vdupq_n_u8(v as u8));
+    let [wb, wr] = win;
+    let [db, dr] = dst;
+    // window row r: its samples from columns 0 and 1, Cb and Cr
+    let row = |r: usize| {
+        let o = r * ws;
+        (vcombine_u8(ld8(wb, o), ld8(wr, o)), vcombine_u8(ld8(wb, o + 1), ld8(wr, o + 1)))
+    };
+    let (mut t0, mut t1) = row(0);
+    for r in 0..h {
+        let (b0, b1) = row(r + 1);
+        // weights at most 64: the sums stay below 2^14
+        let lo = vmlal_u8(
+            vmlal_u8(vmlal_u8(vmull_u8(vget_low_u8(t0), vget_low_u8(a)), vget_low_u8(t1), vget_low_u8(b)), vget_low_u8(b0), vget_low_u8(c)),
+            vget_low_u8(b1),
+            vget_low_u8(d),
+        );
+        let hi = vmlal_high_u8(vmlal_high_u8(vmlal_high_u8(vmull_high_u8(t0, a), t1, b), b0, c), b1, d);
+        out8::<M>(db, r * ds, w, vrshrn_n_u16::<6>(lo), wt);
+        out8::<M>(dr, r * ds, w, vrshrn_n_u16::<6>(hi), wt);
+        (t0, t1) = (b0, b1);
     }
 }
 

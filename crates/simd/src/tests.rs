@@ -397,6 +397,52 @@ fn every_level_matches_the_scalar_h264_prediction() {
 }
 
 #[test]
+fn every_level_predicts_a_chroma_pair_as_two_blocks() {
+    let mut seed = 0x0c4a_9a12u32;
+    let mut next = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        seed
+    };
+    let mut ran = 0;
+    for case in 0..12_000 {
+        let sample = |n: u32| match n % 4 {
+            0 => 0u8,
+            1 => 255,
+            _ => (n >> 3) as u8,
+        };
+        // window strides and lengths: long enough for the vector loads or (some) not
+        let ws = [16, 24, 9, 12][case % 4];
+        let short = [0, 0, 3, 8][case / 4 % 4];
+        let mut window = || -> Vec<u8> { (0..ws * 9 - short).map(|_| sample(next())).collect() };
+        let (wb, wr) = (window(), window());
+        let w8 = |n: u32| (n % 256) as i32 - 128;
+        let out = match next() % 6 {
+            0 | 1 => H264Out::Put,
+            2 => H264Out::Avg,
+            3 => H264Out::Weight { w: w8(next()), o: w8(next()), log_wd: next() % 8 },
+            4 => H264Out::Weight { w: (next() % 65) as i32, o: 0, log_wd: 5 },
+            _ => H264Out::WeightBi { w0: w8(next()), w1: w8(next()), o: w8(next()), log_wd: next() % 8 },
+        };
+        let (cw, ch) = [(8, 8), (8, 4), (4, 8), (4, 4), (4, 2), (2, 4), (2, 2)][case % 7];
+        let (fx, fy) = (next() % 8, next() % 8);
+        let mut dst = || -> Vec<u8> { (0..20 * 8).map(|_| sample(next())).collect() };
+        let (db, dr) = (dst(), dst());
+        let (mut want_b, mut want_r) = (db.clone(), dr.clone());
+        h264_chroma_at(Level::Scalar, &wb, ws, fx, fy, cw, ch, &mut want_b, 20, out);
+        h264_chroma_at(Level::Scalar, &wr, ws, fx, fy, cw, ch, &mut want_r, 20, out);
+        for &level in levels() {
+            let (mut got_b, mut got_r) = (db.clone(), dr.clone());
+            h264_chroma_pair_at(level, [&wb, &wr], ws, fx, fy, cw, ch, [&mut got_b, &mut got_r], 20, out);
+            assert_eq!((&got_b, &got_r), (&want_b, &want_r), "{level:?} {cw}x{ch} frac {fx},{fy} {out:?} window {ws} x {}", wb.len());
+            ran += (level != Level::Scalar && got_b != db) as usize;
+        }
+    }
+    assert!(ran > 0 || !cfg!(target_arch = "aarch64"));
+}
+
+#[test]
 fn every_level_matches_the_scalar_h264_deblocking() {
     let mut seed = 0x0de6_10c5u32;
     let mut next = move || {
