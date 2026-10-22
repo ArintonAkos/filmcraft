@@ -108,7 +108,9 @@ struct SbEdges {
 
 impl SbEdges {
     /// The edges of `plane` in the superblock at (`row`, `col`) (MI units): the per-group
-    /// decisions of 8.8.2 taken from the MI of each block, which every group of the block shares.
+    /// decisions of 8.8.2. Every MI of a block holds the block's mode info, so the decisions
+    /// are taken once per block, from its top left 8x8 block in the plane: those that depend
+    /// on the position across an edge once per edge, and the block's groups along it set at once.
     fn new(mi: &MiGrid, f: &LfFrame, plane: usize, row: usize, col: usize) -> SbEdges {
         let (sub_x, sub_y) = if plane > 0 { (f.ss_x, f.ss_y) } else { (0, 0) };
         let (mi_rows, mi_cols) = (f.mi_rows, f.mi_cols);
@@ -121,54 +123,82 @@ impl SbEdges {
         }
         for by in 0..8 >> sub_y {
             let mr = row + (by << sub_y);
-            if mr >= mi_rows {
-                break;
+            if mr < mi_rows {
+                e.lines[0][by] = ((8 * (mi_rows - mr)) >> sub_y).min(8) as u8;
             }
-            e.lines[0][by] = ((8 * (mi_rows - mr)) >> sub_y).min(8) as u8;
-            for bx in 0..8 >> sub_x {
-                let mc = col + (bx << sub_x);
-                if mc >= mi_cols {
-                    break;
+        }
+        // The 8x8 blocks of the plane inside the frame.
+        let nbx = ((mi_cols.saturating_sub(col) + (1 << sub_x) - 1) >> sub_x).min(8 >> sub_x);
+        let nby = ((mi_rows.saturating_sub(row) + (1 << sub_y) - 1) >> sub_y).min(8 >> sub_y);
+        // On a horizontal edge in the last odd chroma column (8.8.2) the 4x4 edges are not
+        // filtered: the bit of that column, if it is in this superblock.
+        let odd_last = match mi_cols.checked_sub(col + 1) {
+            Some(last) if sub_x == 1 && last % 2 == 0 && last / 2 < 8 => 1u64 << (last / 2),
+            _ => 0,
+        };
+        // The 8x8 blocks already covered by a block met earlier, bit by * 8 + bx.
+        let mut done = 0u64;
+        for by in 0..nby {
+            for bx in 0..nbx {
+                if done >> (by * 8 + bx) & 1 == 1 {
+                    continue;
                 }
+                let (mr, mc) = (row + (by << sub_y), col + (bx << sub_x));
                 let m = mi.at(mr, mc);
+                let bs = m.sb_size.min(BLOCK_64X64) as usize;
+                // The block's 8x8 blocks in the plane from here (it starts here: blocks are
+                // aligned to their size and met in raster order).
+                let w = ((NUM_8X8_WIDE[bs] as usize) >> sub_x).clamp(1, nbx - bx);
+                let h = ((NUM_8X8_HIGH[bs] as usize) >> sub_y).clamp(1, nby - by);
+                let row_bits = ((1u64 << w) - 1) << bx;
+                for y in by..by + h {
+                    done |= row_bits << (y * 8);
+                }
                 let lvl = f.level(m);
                 if lvl == 0 {
                     continue;
                 }
-                e.lvl[by * 8 + bx] = lvl;
+                for y in by..by + h {
+                    e.lvl[y * 8 + bx..y * 8 + bx + w].fill(lvl);
+                }
                 let tx_sz = if plane > 0 {
-                    if m.sb_size < BLOCK_8X8 { 0 } else { m.tx_size.min(MAX_TXSIZE[SS_SIZE_LOOKUP[m.sb_size as usize][f.ss_x][f.ss_y].min(12) as usize]) }
+                    if m.sb_size < BLOCK_8X8 { 0 } else { m.tx_size.min(MAX_TXSIZE[SS_SIZE_LOOKUP[bs][f.ss_x][f.ss_y].min(12) as usize]) }
                 } else {
                     m.tx_size
                 };
                 let tx_edges = m.ref_frame[0] <= INTRA_FRAME || !m.skip;
-                // Per pass: (position of the block in 8x8 blocks across, along; MI across; MI
-                // across in the frame; subsampling across; blocks of the prediction block across).
-                for (pass, (b, g, m_at, m_n, sub, wide)) in
-                    [(bx, by, mc, mi_cols, sub_x, &NUM_8X8_WIDE), (by, bx, mr, mi_rows, sub_y, &NUM_8X8_HIGH)].into_iter().enumerate()
+                // Per pass: (the block's first 8x8 block across and its count, its groups along
+                // the edges as bits; the superblock's first MI across, MI across in the frame,
+                // subsampling across, blocks of the prediction block across).
+                for (pass, (b0, n, along, m0, m_n, sub, wide)) in
+                    [(bx, w, ((1u64 << h) - 1) << by, col, mi_cols, sub_x, &NUM_8X8_WIDE), (by, h, row_bits, row, mi_rows, sub_y, &NUM_8X8_HIGH)]
+                        .into_iter()
+                        .enumerate()
                 {
                     let sb_size = if sub == 0 { m.sb_size } else { m.sb_size.max(BLOCK_16X16) } as usize;
-                    let bit = 1u64 << (b * 8 + g);
-                    // The block edge (not on the frame's left or top edge): its offset in luma
-                    // samples is 8 * m_at, so it is a prediction block edge where m_at is a
-                    // multiple of the block's 8x8 count, a transform edge where 2 * b (its
-                    // index in 4-sample edges) is one of the transform's.
-                    if m_at > 0 {
-                        let block_edge = m_at & (wide[sb_size] as usize - 1) == 0;
-                        let tx_ok = tx_edges && (2 * b) & ((1 << tx_sz) - 1) == 0;
-                        if block_edge || tx_ok {
-                            let base = if tx_sz == TX_4X4 && b % 4 == 0 { TX_8X8 } else { tx_sz.min(TX_16X16) };
-                            let size = if base == TX_16X16 && sub == 1 && m_at == m_n - 1 { TX_8X8 } else { base };
-                            e.edge8[pass][size as usize] |= bit;
+                    for b in b0..b0 + n {
+                        let m_at = m0 + (b << sub);
+                        let bits = along << (b * 8);
+                        // The block edge (not on the frame's left or top edge): its offset in luma
+                        // samples is 8 * m_at, so it is a prediction block edge where m_at is a
+                        // multiple of the block's 8x8 count, a transform edge where 2 * b (its
+                        // index in 4-sample edges) is one of the transform's.
+                        if m_at > 0 {
+                            let block_edge = m_at & (wide[sb_size] as usize - 1) == 0;
+                            let tx_ok = tx_edges && (2 * b) & ((1 << tx_sz) - 1) == 0;
+                            if block_edge || tx_ok {
+                                let base = if tx_sz == TX_4X4 && b % 4 == 0 { TX_8X8 } else { tx_sz.min(TX_16X16) };
+                                let size = if base == TX_16X16 && sub == 1 && m_at == m_n - 1 { TX_8X8 } else { base };
+                                e.edge8[pass][size as usize] |= bits;
+                            }
                         }
-                    }
-                    // The edge 4 samples in: never a prediction block edge, a 4x4 transform
-                    // edge if inside the frame (subsampled, that is 8 luma samples in: the next MI).
-                    // On a horizontal one in the last odd chroma column (8.8.2), it is not filtered.
-                    let inside = sub == 0 || m_at + 1 < m_n;
-                    let odd_last = pass == 1 && sub_x == 1 && mc + 1 >= mi_cols;
-                    if tx_edges && tx_sz == TX_4X4 && inside && !odd_last {
-                        e.edge4[pass] |= bit;
+                        // The edge 4 samples in: never a prediction block edge, a 4x4 transform
+                        // edge if inside the frame (subsampled, that is 8 luma samples in: the next MI).
+                        let inside = sub == 0 || m_at + 1 < m_n;
+                        if tx_edges && tx_sz == TX_4X4 && inside {
+                            let skip = if pass == 1 { odd_last } else { 0 };
+                            e.edge4[pass] |= (along & !skip) << (b * 8);
+                        }
                     }
                 }
             }
@@ -616,8 +646,62 @@ mod tests {
         assert!(changed > 10_000, "{changed}");
     }
 
-    /// The edge masks filter every frame as the per-group driver does: random mode info (block
-    /// and transform sizes, skip, references, levels with zeros), frame sizes with odd MI counts,
+    /// Partition the `n` x `n` MI square at (`r`, `c`) at random (6.4.3) into blocks with
+    /// random mode info.
+    fn random_partition(mi: &mut MiGrid, r: usize, c: usize, n: usize, next: &mut dyn FnMut() -> u32) {
+        if r >= mi.rows || c >= mi.cols {
+            return;
+        }
+        let kind = next() % 4;
+        if n == 1 {
+            // 8x8, 8x4, 4x8 and 4x4 blocks are all one MI.
+            return put_block(mi, r, c, 1, 1, [BLOCK_8X8, 2, 1, 0][kind as usize], next);
+        }
+        // The square block size and its HORZ (one smaller) and VERT (two smaller) halves.
+        let sq = match n {
+            8 => BLOCK_64X64,
+            4 => 9,
+            _ => BLOCK_16X16,
+        };
+        let h = n / 2;
+        match kind {
+            0 => put_block(mi, r, c, n, n, sq, next),
+            1 => {
+                put_block(mi, r, c, n, h, sq - 1, next);
+                put_block(mi, r + h, c, n, h, sq - 1, next);
+            }
+            2 => {
+                put_block(mi, r, c, h, n, sq - 2, next);
+                put_block(mi, r, c + h, h, n, sq - 2, next);
+            }
+            _ => {
+                for (dr, dc) in [(0, 0), (0, h), (h, 0), (h, h)] {
+                    random_partition(mi, r + dr, c + dc, h, next);
+                }
+            }
+        }
+    }
+
+    /// A `w` x `h` (MI) block of size `sb_size` at (`r`, `c`) with random mode info.
+    fn put_block(mi: &mut MiGrid, r: usize, c: usize, w: usize, h: usize, sb_size: u8, next: &mut dyn FnMut() -> u32) {
+        let m = MiInfo {
+            sb_size,
+            skip: next().is_multiple_of(2),
+            tx_size: (next() % 4) as u8,
+            y_mode: (next() % 14) as u8,
+            seg_id: (next() % 8) as u8,
+            ref_frame: [(next() % 4) as i8, -1],
+            ..MiInfo::default()
+        };
+        for y in r..(r + h).min(mi.rows) {
+            for x in c..(c + w).min(mi.cols) {
+                mi.mi[y * mi.cols + x] = m;
+            }
+        }
+    }
+
+    /// The edge masks filter every frame as the per-group driver does: random partitions with random
+    /// mode info (block and transform sizes, skip, references, levels with zeros), frame sizes with odd MI counts,
     /// every subsampling and bit depth, with the vector kernels and the group filter.
     #[test]
     fn edge_masks_filter_like_the_group_driver() {
@@ -635,21 +719,14 @@ mod tests {
             let vector = case / 12 % 2 == 0;
             let mi_cols = 1 + next() as usize % 21;
             let mi_rows = 1 + next() as usize % 21;
-            let mi = MiGrid {
-                cols: mi_cols,
-                rows: mi_rows,
-                mi: (0..mi_rows * mi_cols)
-                    .map(|_| MiInfo {
-                        sb_size: (next() % 13) as u8,
-                        skip: next() % 2 == 0,
-                        tx_size: (next() % 4) as u8,
-                        y_mode: (next() % 14) as u8,
-                        seg_id: (next() % 8) as u8,
-                        ref_frame: [(next() % 4) as i8, -1],
-                        ..MiInfo::default()
-                    })
-                    .collect(),
-            };
+            // Random partitions of every superblock into blocks of random mode info, each
+            // block's MI the same (as decoding writes them), clipped by the frame's edges.
+            let mut mi = MiGrid { cols: mi_cols, rows: mi_rows, mi: vec![MiInfo::default(); mi_rows * mi_cols] };
+            for r in (0..mi_rows).step_by(8) {
+                for c in (0..mi_cols).step_by(8) {
+                    random_partition(&mut mi, r, c, 8, &mut next);
+                }
+            }
             let lvl = std::array::from_fn(|_| std::array::from_fn(|_| std::array::from_fn(|_| if next() % 5 == 0 { 0 } else { (next() % 64) as u8 })));
             let limits: [(i32, i32, i32); 64] = std::array::from_fn(|l| {
                 let l = l as i32;
