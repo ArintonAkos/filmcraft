@@ -429,7 +429,7 @@ impl<'a> SliceDecoder<'a> {
         }
     }
 
-    fn chroma_qp(&self, qp: i32, c: usize) -> i32 {
+    pub(crate) fn chroma_qp(&self, qp: i32, c: usize) -> i32 {
         QPC_TABLE[(qp + self.chroma_qp_offset[c]).clamp(0, 51) as usize] as i32
     }
 
