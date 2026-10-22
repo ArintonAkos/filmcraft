@@ -365,9 +365,12 @@ impl Decoder {
             (0..tile_cols).map(|i| (tile_offset(i, mi_cols, h.tile_cols_log2), tile_offset(i + 1, mi_cols, h.tile_cols_log2))).collect();
         let row_bounds: Vec<(usize, usize)> =
             (0..tile_rows).map(|i| (tile_offset(i, mi_rows, h.tile_rows_log2), tile_offset(i + 1, mi_rows, h.tile_rows_log2))).collect();
-        let decode_col = |ci: usize| -> (Strip, Option<Error>) {
+        let decode_col = |ci: usize, strip: Option<Strip>| -> (Strip, Option<Error>) {
             let (cs, ce) = col_bounds[ci];
-            let mut td = TileDecoder::new(&shared, cs, ce);
+            let mut td = match strip {
+                Some(strip) => TileDecoder::in_strip(&shared, cs, ce, strip),
+                None => TileDecoder::new(&shared, cs, ce),
+            };
             let mut err = None;
             if ce > cs {
                 for (ri, &(rs, re)) in row_bounds.iter().enumerate() {
@@ -380,7 +383,22 @@ impl Decoder {
             let e = td.error.take().or(err);
             (td.strip, e)
         };
-        let results: Vec<(Strip, Option<Error>)> = self.run_parallel(tile_cols, &decode_col);
+        let results: Vec<(Strip, Option<Error>)> = if self.parallel(tile_cols) {
+            self.run_parallel(tile_cols, &|ci| decode_col(ci, None))
+        } else {
+            // One after another, the tile columns share a strip of the whole frame.
+            let mut strip = Strip::whole_frame(&shared);
+            let mut error = None;
+            for ci in 0..tile_cols {
+                let (s, e) = decode_col(ci, Some(strip));
+                strip = s;
+                if e.is_some() {
+                    error = e;
+                    break;
+                }
+            }
+            vec![(strip, error)]
+        };
         let mut counts = Counts::default();
         let mut strips = Vec::with_capacity(results.len());
         let mut error = None;
@@ -552,6 +570,16 @@ impl Decoder {
     }
 
     /// Run `f(0..n)`, in parallel when a pool is available.
+    /// Whether `run_parallel` spreads `n` jobs over threads.
+    fn parallel(&self, n: usize) -> bool {
+        #[cfg(feature = "threads")]
+        if self.pool.is_some() && n > 1 {
+            return true;
+        }
+        let _ = n;
+        false
+    }
+
     fn run_parallel<T: Send>(&self, n: usize, f: &(dyn Fn(usize) -> T + Sync)) -> Vec<T> {
         #[cfg(feature = "threads")]
         if let Some(pool) = &self.pool
@@ -992,17 +1020,20 @@ fn band_view<'a>(f: &Frame, d: &'a mut [u16], p: usize, r: usize) -> PlaneView<'
 /// Mode info and segment ids of the whole frame from the tile column strips (whose mode info
 /// buffers go back to the pool).
 fn assemble_mi(strips: &mut [Strip], mi_rows: usize, mi_cols: usize, pools: &Pools) -> (MiGrid, Vec<u8>) {
-    if strips.len() == 1 {
-        let s = &mut strips[0];
+    if let [s] = strips
+        && s.mi_x0 == 0
+        && s.mi_stride == mi_cols
+    {
         return (MiGrid { cols: mi_cols, rows: mi_rows, mi: std::mem::take(&mut s.mi) }, std::mem::take(&mut s.seg_ids));
     }
     let mut mi = pools.mi.take(mi_rows * mi_cols, MiInfo::default());
     let mut seg = vec![0u8; mi_rows * mi_cols];
     for s in strips.iter_mut() {
-        let mw = s.mi_col_end - s.mi_col_start;
+        let (ms, cs, ce) = (s.mi_stride, s.mi_col_start, s.mi_col_end);
+        let o = cs - s.mi_x0;
         for r in 0..mi_rows {
-            mi[r * mi_cols + s.mi_col_start..r * mi_cols + s.mi_col_end].copy_from_slice(&s.mi[r * mw..r * mw + mw]);
-            seg[r * mi_cols + s.mi_col_start..r * mi_cols + s.mi_col_end].copy_from_slice(&s.seg_ids[r * mw..r * mw + mw]);
+            mi[r * mi_cols + cs..r * mi_cols + ce].copy_from_slice(&s.mi[r * ms + o..r * ms + o + ce - cs]);
+            seg[r * mi_cols + cs..r * mi_cols + ce].copy_from_slice(&s.seg_ids[r * ms + o..r * ms + o + ce - cs]);
         }
         pools.mi.put(std::mem::take(&mut s.mi));
     }
