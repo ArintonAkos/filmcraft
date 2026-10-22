@@ -81,7 +81,7 @@ impl<'a> TileDecoder<'a> {
                                 let (stride, x_off) = (self.strip.strides[plane], self.strip.x_off[plane]);
                                 let o = start_y * stride + start_x - x_off;
                                 transform::inverse_transform_add(
-                                    &self.coefs,
+                                    &self.coefs[..],
                                     tx_sz,
                                     tx_type,
                                     self.h.lossless,
@@ -127,13 +127,10 @@ impl<'a> TileDecoder<'a> {
     /// of block position and the number of leading coefficient rows that may be non-zero.
     #[allow(clippy::too_many_arguments)]
     fn tokens(&mut self, bd: &mut BoolDecoder, b: &Blk, plane: usize, start_x: usize, start_y: usize, tx_sz: u8, tx_type: u8) -> (usize, usize) {
-        let seg_eob = 16usize << (tx_sz << 1);
-        let sc = scan(tx_sz, tx_type);
-        let nb = neighbors(tx_sz, tx_type);
-        let bands: &[u8] = if tx_sz == 0 { &COEFBAND_4X4 } else { &COEFBAND_8X8PLUS };
+        let tab = scan_positions(tx_sz, tx_type);
         let ptype = (plane > 0) as usize;
         let rtype = b.is_inter as usize;
-        let probs = &self.fc.coef[tx_sz as usize][ptype][rtype];
+        let (tx, probs) = (tx_sz as usize, &self.fc.coef[tx_sz as usize][ptype][rtype]);
         let (sx, sy) = if plane > 0 { (self.ss_x, self.ss_y) } else { (0, 0) };
         let max_x4 = (2 * self.mi_cols) >> sx;
         let max_y4 = (2 * self.mi_rows) >> sy;
@@ -157,66 +154,67 @@ impl<'a> TileDecoder<'a> {
         let log2n = 2 + tx_sz as usize;
         let bit_depth = self.bit_depth;
         let mut max_row = 0usize;
-        let mut check_eob = true;
         let mut c = 0usize;
-        let tc = &mut self.token_cache;
-        let coefs = &mut self.coefs;
-        let counts = &mut self.strip.counts;
-        while c < seg_eob {
-            let pos = sc[c] as usize;
-            let band = bands[c] as usize;
-            let ctx = if c == 0 {
-                ctx0
-            } else {
-                let (a, bb) = nb[c];
-                ((1 + tc[a as usize] + tc[bb as usize]) >> 1) as usize
-            };
-            let p = &probs[band][ctx];
-            if check_eob {
-                let more = bd.read_bool(p[0]);
-                if counting {
-                    counts.more_coefs[tx_sz as usize][ptype][rtype][band][ctx][more as usize] += 1;
-                }
-                if !more {
-                    break;
-                }
+        let tc = &mut *self.token_cache;
+        let coefs = &mut *self.coefs;
+        let counts = &mut *self.strip.counts;
+        let (more_counts, token_counts) = (&mut counts.more_coefs[tx][ptype][rtype], &mut counts.token[tx][ptype][rtype]);
+        // Through `&mut` the decoder state would go to memory after every bool; a local copy
+        // stays in registers.
+        let mut local = *bd;
+        let d = &mut local;
+        let ctx_of = |tc: &[u8; 1024], e: &ScanPos| ((1 + tc[e.nb[0] as usize & 1023] + tc[e.nb[1] as usize & 1023]) >> 1) as usize;
+        'coefs: while let Some(mut e) = tab.get(c) {
+            let mut band = e.band as usize;
+            let mut ctx = if c == 0 { ctx0 } else { ctx_of(tc, e) };
+            let mut p = &probs[band][ctx];
+            let more = d.read_bool(p[0]);
+            if counting {
+                more_counts[band][ctx][more as usize] += 1;
             }
-            if !bd.read_bool(p[1]) {
-                tc[pos] = 0;
+            if !more {
+                break;
+            }
+            // A run of zero tokens; the coefficient after a zero token has no end of block check.
+            while !d.read_bool(p[1]) {
                 if counting {
-                    counts.token[tx_sz as usize][ptype][rtype][band][ctx][0] += 1;
+                    token_counts[band][ctx][0] += 1;
                 }
-                check_eob = false;
+                tc[e.pos as usize & 1023] = 0;
                 c += 1;
-                continue;
+                let Some(next) = tab.get(c) else { break 'coefs };
+                e = next;
+                band = e.band as usize;
+                ctx = ctx_of(tc, e);
+                p = &probs[band][ctx];
             }
-            check_eob = true;
+            let pos = e.pos as usize & 1023;
             let token: usize;
             let coef: i64;
-            if !bd.read_bool(p[2]) {
+            if !d.read_bool(p[2]) {
                 if counting {
-                    counts.token[tx_sz as usize][ptype][rtype][band][ctx][1] += 1;
+                    token_counts[band][ctx][1] += 1;
                 }
                 token = 1;
                 coef = 1;
             } else {
                 if counting {
-                    counts.token[tx_sz as usize][ptype][rtype][band][ctx][2] += 1;
+                    token_counts[band][ctx][2] += 1;
                 }
                 let pp = &pareto[p[2].max(1) as usize - 1];
-                token = if !bd.read_bool(pp[0]) {
-                    if !bd.read_bool(pp[1]) {
+                token = if !d.read_bool(pp[0]) {
+                    if !d.read_bool(pp[1]) {
                         2
-                    } else if !bd.read_bool(pp[2]) {
+                    } else if !d.read_bool(pp[2]) {
                         3
                     } else {
                         4
                     }
-                } else if !bd.read_bool(pp[3]) {
-                    if !bd.read_bool(pp[4]) { 5 } else { 6 }
-                } else if !bd.read_bool(pp[5]) {
-                    if !bd.read_bool(pp[6]) { 7 } else { 8 }
-                } else if !bd.read_bool(pp[7]) {
+                } else if !d.read_bool(pp[3]) {
+                    if !d.read_bool(pp[4]) { 5 } else { 6 }
+                } else if !d.read_bool(pp[5]) {
+                    if !d.read_bool(pp[6]) { 7 } else { 8 }
+                } else if !d.read_bool(pp[7]) {
                     9
                 } else {
                     10
@@ -226,27 +224,28 @@ impl<'a> TileDecoder<'a> {
                 let mut v = base as i64;
                 if token == 10 {
                     for e in 0..(bit_depth as u32 - 8) {
-                        if bd.read_bool(255) {
+                        if d.read_bool(255) {
                             v += 1 << (5 + bit_depth as u32 - e);
                         }
                     }
                 }
                 let cp = CAT_PROBS[cat as usize];
                 for e in 0..num_extra as usize {
-                    if bd.read_bool(cp[e]) {
+                    if d.read_bool(cp[e]) {
                         v += 1 << (num_extra as usize - 1 - e);
                     }
                 }
                 coef = v;
             }
             tc[pos] = ENERGY_CLASS[token];
-            let sign = bd.read_bool(128);
+            let sign = d.read_half();
             let qv = if pos == 0 { q[0] } else { q[1] } as i64;
-            let d = ((coef * qv) >> dq_shift) as i32;
-            coefs[pos] = if sign { d.wrapping_neg() } else { d };
+            let dq = ((coef * qv) >> dq_shift) as i32;
+            coefs[pos] = if sign { dq.wrapping_neg() } else { dq };
             max_row = max_row.max(pos >> log2n);
             c += 1;
         }
+        *bd = local;
         (c, max_row + 1)
     }
 

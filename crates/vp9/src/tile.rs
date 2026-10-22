@@ -108,8 +108,8 @@ pub struct TileDecoder<'a> {
     near_mv: [Mv; 2],
     best_mv: [Mv; 2],
     // Scratch.
-    coefs: Vec<i32>,
-    token_cache: Vec<u8>,
+    coefs: Box<[i32; 1024]>,
+    token_cache: Box<[u8; 1024]>,
     pred: Vec<u16>,
     mc_tmp: Vec<u16>,
     mc_win: Vec<u16>,
@@ -168,8 +168,8 @@ impl<'a> TileDecoder<'a> {
             nearest_mv: [Mv::ZERO; 2],
             near_mv: [Mv::ZERO; 2],
             best_mv: [Mv::ZERO; 2],
-            coefs: vec![0; 1024],
-            token_cache: vec![0; 1024],
+            coefs: Box::new([0; 1024]),
+            token_cache: Box::new([0; 1024]),
             pred: vec![0; 64 * 64],
             // Scaled prediction reads up to 5x the block height (8.5.2.3), unscaled h + 7 rows.
             mc_tmp: vec![0; if s.refs.iter().flatten().any(|r| r.x_scale != 1 << 14 || r.y_scale != 1 << 14) { 64 * (64 * 5 + 16) } else { 64 * 71 }],
