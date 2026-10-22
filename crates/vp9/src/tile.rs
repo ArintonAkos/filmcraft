@@ -71,14 +71,16 @@ impl Strip {
         let strip_h = h.sb64_rows as usize * 64;
         let px0 = x0 * 8;
         let uv_len = (strip_w >> ss_x) * (strip_h >> ss_y);
-        let planes = [s.pools.samples.take(strip_w * strip_h, 0), s.pools.samples.take(uv_len, 0), s.pools.samples.take(uv_len, 0)];
+        // Unfilled: decoding writes every sample and mode info of the tile area before anything
+        // reads it, and nothing reads past it (predictions clamp to the decoded area).
+        let planes = [s.pools.samples.take_any(strip_w * strip_h, 0), s.pools.samples.take_any(uv_len, 0), s.pools.samples.take_any(uv_len, 0)];
         let mi_w = x1 - x0;
         Strip {
             mi_col_start: cs,
             mi_col_end: ce,
             mi_x0: x0,
             mi_stride: mi_w,
-            mi: s.pools.mi.take(mi_w * mi_rows, MiInfo::default()),
+            mi: s.pools.mi.take_any(mi_w * mi_rows, MiInfo::default()),
             seg_ids: vec![0; mi_w * mi_rows],
             planes,
             strides: [strip_w, strip_w >> ss_x, strip_w >> ss_x],

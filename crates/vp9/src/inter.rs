@@ -107,9 +107,15 @@ fn fetch_window(r: &RefPlane, x0: i32, y0: i32, w: usize, h: usize, win: &mut [u
         if xs >= 0 && xs + ws as i32 - 1 <= r.last_x {
             copy_samples(dst, &src[xs as usize..xs as usize + ws], ws);
         } else {
-            for (c, d) in dst.iter_mut().enumerate() {
-                *d = src[(xs + c as i32).clamp(0, r.last_x) as usize];
+            // Columns left of the picture, inside it, and right of it.
+            let lo = (-xs).clamp(0, ws as i32) as usize;
+            let hi = (r.last_x + 1 - xs).clamp(lo as i32, ws as i32) as usize;
+            let edge = |x: i32| src.get(x as usize).copied().unwrap_or_default();
+            dst[..lo].fill(edge(0));
+            if let Some(inside) = src.get((xs + lo as i32) as usize..(xs + hi as i32) as usize) {
+                dst[lo..hi].copy_from_slice(inside);
             }
+            dst[hi..].fill(edge(r.last_x));
         }
     }
     ws
