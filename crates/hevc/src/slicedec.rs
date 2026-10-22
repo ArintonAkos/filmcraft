@@ -219,14 +219,26 @@ impl<S: Sample> PicState<S> {
     }
 }
 
+/// The bits of 0..32 spread to the even bit positions.
+static SPREAD: [u16; 32] = {
+    let mut t = [0u16; 32];
+    let mut v = 0;
+    while v < 32 {
+        let mut i = 0;
+        while i < 5 {
+            t[v] |= (((v >> i) & 1) << (2 * i)) as u16;
+            i += 1;
+        }
+        v += 1;
+    }
+    t
+};
+
+/// The z-scan (Morton) index of 4x4 block (x, y) of a CTB (x, y < 32): their bits interleaved,
+/// x in the even positions.
 #[inline]
 fn morton(x: u32, y: u32) -> u32 {
-    let mut r = 0;
-    for i in 0..5 {
-        r |= ((x >> i) & 1) << (2 * i);
-        r |= ((y >> i) & 1) << (2 * i + 1);
-    }
-    r
+    SPREAD[(x & 31) as usize] as u32 | (SPREAD[(y & 31) as usize] as u32) << 1
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1583,4 +1595,24 @@ fn default_weights(pwt: &crate::slice::PredWeightTable, f: &MvField, c: usize) -
             wt == 1 << denom && o == 0
         })
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The table-driven z-scan index interleaves the bits as the bit-by-bit definition does.
+    #[test]
+    fn morton_interleaves_the_bits() {
+        for x in 0..32u32 {
+            for y in 0..32u32 {
+                let mut r = 0;
+                for i in 0..5 {
+                    r |= ((x >> i) & 1) << (2 * i);
+                    r |= ((y >> i) & 1) << (2 * i + 1);
+                }
+                assert_eq!(morton(x, y), r, "({x}, {y})");
+            }
+        }
+    }
 }

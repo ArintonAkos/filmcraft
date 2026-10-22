@@ -291,25 +291,31 @@ impl Frame {
         let Some(x) = usize::try_from(x0).ok().filter(|&x| x.saturating_add(w) <= pw) else { return false };
         let mask = (1usize << sh) - 1;
         let max_y = ph as i32 - 1;
-        let mut cur: Option<(usize, &'f [S])> = None;
-        for (r, slot) in rows.iter_mut().enumerate() {
-            let yy = y0.saturating_add(r as i32).min(max_y).max(0) as usize;
-            let plane = match cur {
-                Some((i, p)) if i == yy >> sh => p,
-                _ => {
-                    let Some(row) = self.row::<S>(yy >> sh) else { return false };
-                    let p: &'f [S] = match c {
-                        0 => &row.y,
-                        1 => &row.cb,
-                        _ => &row.cr,
-                    };
-                    cur = Some((yy >> sh, p));
-                    p
-                }
-            };
-            let off = (yy & mask) * pw;
-            let Some(run) = plane.get(off + x..off + pw) else { return false };
-            *slot = run;
+        let plane_of = |ctb_row: usize| -> Option<&'f [S]> {
+            let row = self.row::<S>(ctb_row)?;
+            Some(match c {
+                0 => &row.y,
+                1 => &row.cb,
+                _ => &row.cr,
+            })
+        };
+        let n = rows.len();
+        let mut r = 0;
+        while r < n {
+            let y = y0.saturating_add(r as i32);
+            let yy = y.clamp(0, max_y.max(0)) as usize;
+            let Some(plane) = plane_of(yy >> sh) else { return false };
+            // Lines inside the picture: the rest of this CTB row's in one go, each CTB row
+            // looked up once; lines replicated from the top or bottom edge one at a time.
+            let lines = if y == yy as i32 { (n - r).min((mask + 1) - (yy & mask)).min(ph - yy) } else { 1 };
+            // (offsets stepped rather than `chunks`, whose zip with the rows divides by pw)
+            let mut o = (yy & mask) * pw + x;
+            for slot in &mut rows[r..r + lines] {
+                let Some(run) = plane.get(o..o - x + pw) else { return false };
+                *slot = run;
+                o += pw;
+            }
+            r += lines;
         }
         true
     }
