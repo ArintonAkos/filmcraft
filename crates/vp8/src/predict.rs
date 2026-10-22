@@ -23,39 +23,52 @@ fn edge(plane: &[u8], stride: usize, x: isize, y: isize) -> u8 {
 /// Predict a whole `size`x`size` block (16x16 luma or 8x8 chroma) at `(x0, y0)` with a
 /// macroblock-level mode (12.2, 12.3), writing the prediction into the plane.
 pub fn predict_block(plane: &mut [u8], stride: usize, x0: usize, y0: usize, size: usize, mode: u8) {
-    let (xi, yi) = (x0 as isize, y0 as isize);
-    let mut above = [0u8; 16];
-    let mut left = [0u8; 16];
-    for i in 0..size {
-        above[i] = edge(plane, stride, xi + i as isize, yi - 1);
-        left[i] = edge(plane, stride, xi - 1, yi + i as isize);
+    if size == 16 {
+        predict_block_n::<16>(plane, stride, x0, y0, mode);
+    } else {
+        predict_block_n::<8>(plane, stride, x0, y0, mode);
     }
-    let p = i32::from(edge(plane, stride, xi - 1, yi - 1));
-    let shift = size.trailing_zeros();
-    let fill = |plane: &mut [u8], f: &dyn Fn(usize, usize) -> u8| {
-        for r in 0..size {
-            let start = (y0 + r) * stride + x0;
-            if let Some(row) = plane.get_mut(start..start + size) {
-                for (c, px) in row.iter_mut().enumerate() {
-                    *px = f(r, c);
-                }
-            }
+}
+
+/// [`predict_block`] of an `N`x`N` block: each row built as an array and stored whole (a vector
+/// store, not a library fill per row).
+fn predict_block_n<const N: usize>(plane: &mut [u8], stride: usize, x0: usize, y0: usize, mode: u8) {
+    // The edges: the row above (127 above the frame) and the column left (129 left of it).
+    let above: [u8; N] = match y0.checked_sub(1).and_then(|y| plane.get(y * stride + x0..)).and_then(|r| r.first_chunk::<N>()) {
+        Some(r) => *r,
+        None => [127; N],
+    };
+    let mut left = [129u8; N];
+    if x0 > 0 {
+        for (i, l) in left.iter_mut().enumerate() {
+            *l = plane.get((y0 + i) * stride + x0 - 1).copied().unwrap_or(127);
+        }
+    }
+    let p = i32::from(edge(plane, stride, x0 as isize - 1, y0 as isize - 1));
+    let row_of = |r: usize| -> [u8; N] {
+        match mode {
+            V_PRED => above,
+            H_PRED => [left[r]; N],
+            TM_PRED => std::array::from_fn(|c| (i32::from(left[r]) + i32::from(above[c]) - p).clamp(0, 255) as u8),
+            _ => [0; N],
         }
     };
-    match mode {
-        V_PRED => fill(plane, &|_, c| above[c]),
-        H_PRED => fill(plane, &|r, _| left[r]),
-        TM_PRED => fill(plane, &|r, c| (i32::from(left[r]) + i32::from(above[c]) - p).clamp(0, 255) as u8),
-        _ => {
-            // DC_PRED: only the genuinely available edges count
-            let sum = |v: &[u8]| v[..size].iter().map(|&x| u32::from(x)).sum::<u32>();
-            let dc = match (y0 > 0, x0 > 0) {
-                (true, true) => (sum(&above) + sum(&left) + (1 << shift)) >> (shift + 1),
-                (true, false) => (sum(&above) + (1 << (shift - 1))) >> shift,
-                (false, true) => (sum(&left) + (1 << (shift - 1))) >> shift,
-                (false, false) => 128,
-            } as u8;
-            fill(plane, &|_, _| dc);
+    let dc_row = (mode != V_PRED && mode != H_PRED && mode != TM_PRED).then(|| {
+        // DC_PRED: only the genuinely available edges count
+        let shift = N.trailing_zeros();
+        let sum = |v: &[u8; N]| v.iter().map(|&x| u32::from(x)).sum::<u32>();
+        let dc = match (y0 > 0, x0 > 0) {
+            (true, true) => (sum(&above) + sum(&left) + (1 << shift)) >> (shift + 1),
+            (true, false) => (sum(&above) + (1 << (shift - 1))) >> shift,
+            (false, true) => (sum(&left) + (1 << (shift - 1))) >> shift,
+            (false, false) => 128,
+        } as u8;
+        [dc; N]
+    });
+    for r in 0..N {
+        let row = dc_row.unwrap_or_else(|| row_of(r));
+        if let Some(d) = plane.get_mut((y0 + r) * stride + x0..).and_then(|d| d.first_chunk_mut::<N>()) {
+            *d = row;
         }
     }
 }
