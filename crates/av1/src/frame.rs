@@ -151,6 +151,11 @@ pub struct RowBand<'a> {
 
 impl RowBand<'_> {
     #[inline(always)]
+    pub fn row(&self, y: usize) -> &[u16] {
+        let o = (y - self.y0) * self.stride;
+        &self.data[o..o + self.stride]
+    }
+    #[inline(always)]
     pub fn set(&mut self, x: usize, y: usize, v: u16) {
         self.data[(y - self.y0) * self.stride + x] = v;
     }
@@ -244,6 +249,10 @@ impl Mv {
     }
 }
 
+/// Recycled mode info storage (see [`MiInfo::recycle`]).
+static MI_POOL: std::sync::Mutex<Vec<MiInfo>> = std::sync::Mutex::new(Vec::new());
+const MI_POOL_MAX: usize = 4;
+
 /// Mode info stored for every 4x4 luma position (the arrays the spec indexes by
 /// `[ row ][ col ]` in mode-info units).
 #[derive(Clone, Default)]
@@ -287,37 +296,48 @@ impl MiInfo {
         MiInfo::region(cols, rows, 0, 0, cols, rows, palette)
     }
 
-    /// Storage for the w x h mode info units at (ox, oy) of a cols x rows frame.
+    /// Storage for the w x h mode info units at (ox, oy) of a cols x rows frame (the memory of
+    /// a recycled one when there is any).
     pub fn region(cols: usize, rows: usize, ox: usize, oy: usize, w: usize, h: usize, palette: bool) -> MiInfo {
+        fn fill<T: Clone>(v: &mut Vec<T>, n: usize, x: T) {
+            v.clear();
+            v.resize(n, x);
+        }
         let n = w * h;
         let np = if palette { n } else { 0 };
-        MiInfo {
-            cols,
-            rows,
-            ox,
-            oy,
-            stride: w,
-            region_rows: h,
-            y_mode: vec![0; n],
-            uv_mode: vec![0; n],
-            ref_frame: vec![[0, -1]; n],
-            mv: vec![[Mv::ZERO; 2]; n],
-            is_inter: vec![false; n],
-            skip_mode: vec![false; n],
-            skip: vec![false; n],
-            tx_size: vec![0; n],
-            inter_tx_size: vec![0; n],
-            mi_size: vec![0; n],
-            segment_id: vec![0; n],
-            palette_size: [vec![0; np], vec![0; np]],
-            palette_colors: [vec![[0; 8]; np], vec![[0; 8]; np]],
-            delta_lf: vec![[0; 4]; n],
-            comp_group_idx: vec![0; n],
-            compound_idx: vec![0; n],
-            interp_filter: vec![[0; 2]; n],
-            motion_mode: vec![0; n],
-            tx_type: vec![0; n],
-            written: vec![false; n],
+        let mut m = MI_POOL.lock().unwrap_or_else(|e| e.into_inner()).pop().unwrap_or_default();
+        (m.cols, m.rows, m.ox, m.oy, m.stride, m.region_rows) = (cols, rows, ox, oy, w, h);
+        fill(&mut m.y_mode, n, 0);
+        fill(&mut m.uv_mode, n, 0);
+        fill(&mut m.ref_frame, n, [0, -1]);
+        fill(&mut m.mv, n, [Mv::ZERO; 2]);
+        fill(&mut m.is_inter, n, false);
+        fill(&mut m.skip_mode, n, false);
+        fill(&mut m.skip, n, false);
+        fill(&mut m.tx_size, n, 0);
+        fill(&mut m.inter_tx_size, n, 0);
+        fill(&mut m.mi_size, n, 0);
+        fill(&mut m.segment_id, n, 0);
+        for k in 0..2 {
+            fill(&mut m.palette_size[k], np, 0);
+            fill(&mut m.palette_colors[k], np, [0; 8]);
+        }
+        fill(&mut m.delta_lf, n, [0; 4]);
+        fill(&mut m.comp_group_idx, n, 0);
+        fill(&mut m.compound_idx, n, 0);
+        fill(&mut m.interp_filter, n, [0; 2]);
+        fill(&mut m.motion_mode, n, 0);
+        fill(&mut m.tx_type, n, 0);
+        fill(&mut m.written, n, false);
+        m
+    }
+
+    /// Keep this storage for a later frame's [`MiInfo::region`] (fresh allocations of megabytes
+    /// cost page faults and kernel calls every frame).
+    pub fn recycle(self) {
+        let mut pool = MI_POOL.lock().unwrap_or_else(|e| e.into_inner());
+        if pool.len() < MI_POOL_MAX {
+            pool.push(self);
         }
     }
 

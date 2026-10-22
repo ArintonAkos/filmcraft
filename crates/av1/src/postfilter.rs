@@ -28,21 +28,26 @@ pub(crate) fn apply(fs: &mut FrameState, stats: &mut DecodeStats, pool: &crate::
         loop_filter(fs, pool);
     }
     stats.add(Stage::LoopFilter, t.lap());
-    let cdef = if draft { None } else { crate::cdef::apply(fs, pool) };
+    let mut cur = std::mem::take(&mut fs.cur);
+    let f: &FrameState = fs;
+    let superres = f.fh.use_superres;
+    // The rows of UpscaledCurrFrame loop restoration reads around its stripes, before CDEF
+    // filters the frame in place.
+    let edges = (f.fh.lr.uses_lr && !draft).then(|| {
+        if superres { crate::restoration::save_stripe_edges(f, &crate::restoration::upscale(f, &cur)) } else { crate::restoration::save_stripe_edges(f, &cur) }
+    });
+    if !draft {
+        crate::cdef::apply(f, &mut cur, pool);
+    }
     stats.add(Stage::Cdef, t.lap());
-    let (up_cur, up_cdef) = if fs.fh.use_superres {
-        let c = crate::restoration::upscale(fs, &fs.cur);
-        let d = cdef.as_ref().map(|f| crate::restoration::upscale(fs, f));
-        (c, d)
-    } else {
-        (std::mem::take(&mut fs.cur), cdef)
-    };
+    if superres {
+        cur = crate::restoration::upscale(f, &cur);
+    }
     stats.add(Stage::Superres, t.lap());
-    fs.cur = if fs.fh.lr.uses_lr && !draft {
-        crate::restoration::loop_restoration(fs, &up_cur, up_cdef.as_ref().unwrap_or(&up_cur), pool)
-    } else {
-        up_cdef.unwrap_or(up_cur)
-    };
+    if let Some(edges) = &edges {
+        crate::restoration::loop_restoration(f, &mut cur, edges, pool);
+    }
+    fs.cur = cur;
     stats.add(Stage::Restoration, t.lap());
 }
 

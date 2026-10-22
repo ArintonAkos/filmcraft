@@ -55,7 +55,9 @@ pub(crate) struct RefFrame {
     pub mi_rows: usize,
     pub film_grain_present: bool,
     pub color: (u8, u8, u8, bool),
-    /// SavedRefFrames / SavedMvs (MfRefFrames / MfMvs of 7.19), mi units.
+    /// SavedRefFrames / SavedMvs (MfRefFrames / MfMvs of 7.19) at the mode info position
+    /// (2 * y8 + 1, 2 * x8 + 1) of each 8x8 block, the only ones projection reads; `mi_cols / 2`
+    /// per row.
     pub saved_ref_frames: Vec<i8>,
     pub saved_mvs: Vec<[i32; 2]>,
 }
@@ -767,6 +769,7 @@ fn decode_frame(job: &FrameJob, pool: &Pool, stats: &mut DecodeStats) -> Result<
         saved_ref_frames: mf_refs,
         saved_mvs: mf_mvs,
     });
+    std::mem::take(&mut fs.mi).recycle();
     let pic = fh.show_frame.then(|| {
         let mut p = output_picture(seq, &rf, fh.upscaled_width as usize, fh.frame_height as usize, &fh.film_grain, job.apply_film_grain, job.pts);
         p.draft = job.draft;
@@ -864,25 +867,32 @@ fn output_picture(seq: &SequenceHeader, rf: &RefFrame, w: usize, h: usize, grain
     pic
 }
 
-/// Motion field motion vector storage process (7.19): (MfRefFrames, MfMvs).
+/// Motion field motion vector storage process (7.19), at the positions the projection process
+/// (7.9.2) reads: (2 * y8 + 1, 2 * x8 + 1) of every 8x8 block. Returns (MfRefFrames, MfMvs),
+/// `mi_cols / 2` per row.
 fn motion_vector_storage(fs: &FrameState) -> (Vec<i8>, Vec<[i32; 2]>) {
     let mi = &fs.mi;
-    let n = mi.rows * mi.cols;
-    let mut refs = vec![-1i8; n];
-    let mut mvs = vec![[0i32; 2]; n];
+    let (w8, h8) = (mi.cols >> 1, mi.rows >> 1);
     let fh = &fs.fh;
-    for i in 0..n {
-        for list in 0..2 {
-            let r = mi.ref_frame[i][list];
-            if r > INTRA_FRAME as i8 {
-                let ref_idx = fh.ref_frame_idx[r as usize - LAST_FRAME];
-                let dist = crate::header::relative_dist(&fs.seq, fs.ref_info[ref_idx].order_hint, fh.order_hint);
-                if dist < 0 {
+    // Whether each reference frame comes before this one (a negative distance).
+    let mut before = [false; NUM_REF_FRAMES];
+    for (r, b) in before.iter_mut().enumerate().take(ALTREF_FRAME + 1).skip(LAST_FRAME) {
+        let ref_idx = fh.ref_frame_idx[r - LAST_FRAME];
+        *b = crate::header::relative_dist(&fs.seq, fs.ref_info[ref_idx].order_hint, fh.order_hint) < 0;
+    }
+    let mut refs = vec![-1i8; w8 * h8];
+    let mut mvs = vec![[0i32; 2]; w8 * h8];
+    for y8 in 0..h8 {
+        for x8 in 0..w8 {
+            let i = mi.idx(2 * y8 + 1, 2 * x8 + 1);
+            for list in 0..2 {
+                let r = mi.ref_frame[i][list];
+                if r > INTRA_FRAME as i8 && before[r as usize] {
                     let m = mi.mv[i][list];
                     let (row, col) = (m.row as i32, m.col as i32);
                     if row.abs() <= REFMVS_LIMIT as i32 && col.abs() <= REFMVS_LIMIT as i32 {
-                        refs[i] = r;
-                        mvs[i] = [row, col];
+                        refs[y8 * w8 + x8] = r;
+                        mvs[y8 * w8 + x8] = [row, col];
                     }
                 }
             }
@@ -953,18 +963,16 @@ fn project(fs: &mut FrameState, src: usize, dst_sign: i32) -> bool {
     }
     let Some(rf) = fs.refs[src_idx].clone() else { return false };
     let rd = |a: u32, b: u32| crate::header::relative_dist(&seq, a, b);
-    let mi_cols = fh.mi_cols as usize;
     for y8 in 0..h8 {
         for x8 in 0..w8 {
-            let row = (2 * y8 + 1) as usize;
-            let col = (2 * x8 + 1) as usize;
-            let src_ref = rf.saved_ref_frames[row * mi_cols + col];
+            let at = (y8 * w8 + x8) as usize;
+            let src_ref = rf.saved_ref_frames[at];
             if src_ref > INTRA_FRAME as i8 {
                 let ref_to_cur = rd(fh.order_hints[src], fh.order_hint);
                 let ref_offset = rd(fh.order_hints[src], ri.saved_order_hints[src_ref as usize]);
                 let pos_valid = ref_to_cur.abs() <= MAX_FRAME_DISTANCE as i32 && ref_offset.abs() <= MAX_FRAME_DISTANCE as i32 && ref_offset > 0;
                 if pos_valid {
-                    let mv = rf.saved_mvs[row * mi_cols + col];
+                    let mv = rf.saved_mvs[at];
                     let proj = get_mv_projection(mv, ref_to_cur * dst_sign, ref_offset);
                     let py = project_pos(y8, proj[0], dst_sign, h8, MAX_OFFSET_HEIGHT as i32);
                     let px = project_pos(x8, proj[1], dst_sign, w8, MAX_OFFSET_WIDTH as i32);
