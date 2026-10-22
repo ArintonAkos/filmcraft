@@ -476,6 +476,27 @@ pub fn h264_deblock_at(level: Level, pix: &mut [u8], stride: usize, x: usize, y:
     }
 }
 
+/// [`h264_deblock`] of the same chroma edge of the Cb plane `cb` and the Cr plane `cr`, which
+/// share `stride` and the edge parameters `e` (their chroma QPs are equal): one vector pass for
+/// both.
+pub fn h264_deblock_chroma_pair(cb: &mut [u8], cr: &mut [u8], stride: usize, x: usize, y: usize, vertical: bool, e: &H264Edge) {
+    h264_deblock_chroma_pair_at(level(), cb, cr, stride, x, y, vertical, e);
+}
+
+/// [`h264_deblock_chroma_pair`] on a given level.
+#[allow(clippy::too_many_arguments)]
+pub fn h264_deblock_chroma_pair_at(level: Level, cb: &mut [u8], cr: &mut [u8], stride: usize, x: usize, y: usize, vertical: bool, e: &H264Edge) {
+    let done = match level {
+        #[cfg(target_arch = "aarch64")]
+        Level::Neon => h264_neon::deblock_pair(cb, cr, stride, x, y, vertical, e),
+        _ => false,
+    };
+    if !done {
+        h264_deblock_at(level, cb, stride, x, y, vertical, true, e);
+        h264_deblock_at(level, cr, stride, x, y, vertical, true, e);
+    }
+}
+
 #[cfg(test)]
 mod tests;
 

@@ -399,25 +399,31 @@ pub fn deblock_mb(pic: &mut PicState, addr: usize, mb_w: usize) {
             }
         }
     }
-    // chroma (4:2:0): edges at chroma samples 0 and 4 use the bS of luma edges 0 and 2
-    for c in 0..2 {
-        for dir in 0..2 {
-            for ce in 0..2 {
-                let e = ce * 2;
-                if bs[dir][e] == [0; 4] {
-                    continue;
+    // chroma (4:2:0): edges at chroma samples 0 and 4 use the bS of luma edges 0 and 2; the Cb and
+    // Cr edges are filtered together when their QPs (so their parameters) are the same
+    for dir in 0..2 {
+        for ce in 0..2 {
+            let e = ce * 2;
+            if bs[dir][e] == [0; 4] {
+                continue;
+            }
+            let (x, y) = if dir == 0 { (mx * 8 + ce * 4, my * 8) } else { (mx * 8, my * 8 + ce * 4) };
+            let qpp = |c: usize| if e == 0 { p_qp[dir].map(|p| p.1[c]).unwrap_or(q_qpc[c]) } else { q_qpc[c] } as i32;
+            let (qpp, qpq) = ([qpp(0), qpp(1)], [q_qpc[0] as i32, q_qpc[1] as i32]);
+            if qpp[0] == qpp[1] && qpq[0] == qpq[1] {
+                let ep = params(qpp[0], qpq[0], bs[dir][e]);
+                if ep.alpha != 0 && ep.beta != 0 {
+                    filmcraft_simd::h264_deblock_chroma_pair(&mut pic.planes.cb, &mut pic.planes.cr, cwidth, x, y, dir == 0, &ep);
                 }
-                let qpp = if e == 0 { p_qp[dir].map(|p| p.1[c]).unwrap_or(q_qpc[c]) } else { q_qpc[c] } as i32;
-                let ep = params(qpp, q_qpc[c] as i32, bs[dir][e]);
+                continue;
+            }
+            for c in 0..2 {
+                let ep = params(qpp[c], qpq[c], bs[dir][e]);
                 if ep.alpha == 0 || ep.beta == 0 {
                     continue;
                 }
                 let plane = if c == 0 { &mut pic.planes.cb } else { &mut pic.planes.cr };
-                if dir == 0 {
-                    filmcraft_simd::h264_deblock(plane, cwidth, mx * 8 + ce * 4, my * 8, true, true, &ep);
-                } else {
-                    filmcraft_simd::h264_deblock(plane, cwidth, mx * 8, my * 8 + ce * 4, false, true, &ep);
-                }
+                filmcraft_simd::h264_deblock(plane, cwidth, x, y, dir == 0, true, &ep);
             }
         }
     }
@@ -483,6 +489,34 @@ mod tests {
             };
             assert_eq!(&got[..], &want[..n], "iteration {iter}: bs {bs:?} indexA {index_a} indexB {index_b}");
         }
+    }
+
+    /// Cb and Cr with different chroma QPs are each filtered with their own parameters (as when
+    /// both planes have that QP), not paired.
+    #[test]
+    fn chroma_planes_with_different_qps() {
+        use crate::picture::Frame;
+        let run = |qpc: [u8; 2]| {
+            let mut pic = PicState::new(std::sync::Arc::new(Frame::new(1, 0, 2, 1)));
+            let mut seed = 0x5eed_c0deu32;
+            for p in [&mut pic.planes.y, &mut pic.planes.cb, &mut pic.planes.cr] {
+                for v in p.iter_mut() {
+                    seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    // small steps, which the filters smooth
+                    *v = 120 + (seed >> 29) as u8;
+                }
+            }
+            pic.slices.push(SliceInfo { disable_deblocking_filter_idc: 0, alpha_offset: 0, beta_offset: 0, ref_ids: [vec![], vec![]] });
+            for m in &mut pic.mbs {
+                *m = MbState { slice_num: 0, kind: MbKind::I16x16, qp: 30, qpc, ..MbState::default() };
+            }
+            deblock_mb(&mut pic, 1, 2);
+            (pic.planes.cb, pic.planes.cr)
+        };
+        let ((cb, cr), (cb_a, cr_a), (_, cr_b)) = (run([18, 27]), run([18, 18]), run([27, 27]));
+        assert_ne!(cr_a, cr_b, "the two QPs must filter differently for the test to mean anything");
+        assert_eq!(cb, cb_a);
+        assert_eq!(cr, cr_b);
     }
 }
 

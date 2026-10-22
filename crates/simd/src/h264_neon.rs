@@ -444,14 +444,16 @@ fn delta(p1: uint8x16_t, p0: uint8x16_t, q0: uint8x16_t, q1: uint8x16_t, tc: uin
     vcombine_s8(lo, hi)
 }
 
-/// [`crate::h264::filter_lanes`] on 16 lanes of bytes (chroma: the first 8).
+/// [`crate::h264::filter_lanes`] on 16 lanes of bytes: 16 luma lines, or 8 chroma lines in the
+/// first 8 lanes, or (`pair`) the 8 lines of the Cb edge and then those of the Cr edge.
 #[target_feature(enable = "neon")]
-fn filter(s: &mut [uint8x16_t; 8], e: &crate::H264Edge, chroma: bool) {
+fn filter(s: &mut [uint8x16_t; 8], e: &crate::H264Edge, chroma: bool, pair: bool) {
     let [p3, p2, p1, p0, q0, q1, q2, q3] = *s;
     let per = if chroma { 2 } else { 4 };
     let (mut on_b, mut tc_b) = ([0u8; 16], [0u8; 16]);
     for i in 0..16 {
-        if let (Some(&b), Some(&t)) = (e.bs.get(i / per), e.tc0.get(i / per)) {
+        let seg = if pair { (i & 7) / per } else { i / per };
+        if let (Some(&b), Some(&t)) = (e.bs.get(seg), e.tc0.get(seg)) {
             on_b[i] = if b != 0 { 0xff } else { 0 };
             tc_b[i] = t;
         }
@@ -518,7 +520,7 @@ fn deblock_neon(pix: &mut [u8], stride: usize, x: usize, y: usize, vertical: boo
         for k in 0..8 {
             s[k] = vcombine_u8(lo[k], hi[k]);
         }
-        filter(&mut s, e, chroma);
+        filter(&mut s, e, chroma, false);
         let lo = transpose8(s.map(|v| vget_low_u8(v)));
         for (i, v) in lo.into_iter().enumerate() {
             put8(pix, (y + i) * stride + x - 4, v);
@@ -534,7 +536,7 @@ fn deblock_neon(pix: &mut [u8], stride: usize, x: usize, y: usize, vertical: boo
         for (k, v) in s.iter_mut().enumerate() {
             *v = if chroma { vcombine_u8(px8(pix, base + k * stride), zero) } else { px16(pix, base + k * stride) };
         }
-        filter(&mut s, e, chroma);
+        filter(&mut s, e, chroma, false);
         // Only p2 .. q2 (luma) or p0, q0 (chroma) can change.
         if chroma {
             for k in 3..5 {
@@ -544,6 +546,54 @@ fn deblock_neon(pix: &mut [u8], stride: usize, x: usize, y: usize, vertical: boo
             for k in 1..7 {
                 put16(pix, base + k * stride, s[k]);
             }
+        }
+    }
+}
+
+/// See [`crate::h264_deblock_chroma_pair`]; false when the edge's samples do not fit both planes.
+pub(crate) fn deblock_pair(cb: &mut [u8], cr: &mut [u8], stride: usize, x: usize, y: usize, vertical: bool, e: &crate::H264Edge) -> bool {
+    // the last byte read or written, as in `deblock` for 8 chroma lines
+    let end = if vertical {
+        if x < 4 { None } else { (y + 7).checked_mul(stride).and_then(|o| o.checked_add(x + 4)) }
+    } else if y < 4 {
+        None
+    } else {
+        (y + 3).checked_mul(stride).and_then(|o| o.checked_add(x + 8))
+    };
+    let fits = end.is_some_and(|end| end <= cb.len() && end <= cr.len());
+    if fits {
+        // SAFETY: NEON is part of the aarch64 baseline: every core this build runs on has it.
+        unsafe { deblock_pair_neon(cb, cr, stride, x, y, vertical, e) };
+    }
+    fits
+}
+
+/// The Cb edge in lanes 0..8 and the Cr edge in lanes 8..16 of one [`filter`].
+#[target_feature(enable = "neon")]
+fn deblock_pair_neon(cb: &mut [u8], cr: &mut [u8], stride: usize, x: usize, y: usize, vertical: bool, e: &crate::H264Edge) {
+    let mut s = [vdupq_n_u8(0); 8];
+    if vertical {
+        let rows = |pix: &[u8]| transpose8(std::array::from_fn(|i| px8(pix, (y + i) * stride + x - 4)));
+        let (lo, hi) = (rows(cb), rows(cr));
+        for k in 0..8 {
+            s[k] = vcombine_u8(lo[k], hi[k]);
+        }
+        filter(&mut s, e, true, true);
+        let (lo, hi) = (transpose8(s.map(|v| vget_low_u8(v))), transpose8(s.map(|v| vget_high_u8(v))));
+        for i in 0..8 {
+            put8(cb, (y + i) * stride + x - 4, lo[i]);
+            put8(cr, (y + i) * stride + x - 4, hi[i]);
+        }
+    } else {
+        let base = (y - 4) * stride + x;
+        for (k, v) in s.iter_mut().enumerate() {
+            *v = vcombine_u8(px8(cb, base + k * stride), px8(cr, base + k * stride));
+        }
+        filter(&mut s, e, true, true);
+        // only p0 and q0 can change
+        for k in 3..5 {
+            put8(cb, base + k * stride, vget_low_u8(s[k]));
+            put8(cr, base + k * stride, vget_high_u8(s[k]));
         }
     }
 }

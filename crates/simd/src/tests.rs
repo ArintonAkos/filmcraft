@@ -431,6 +431,41 @@ fn every_level_matches_the_scalar_h264_deblocking() {
     }
 }
 
+#[test]
+fn every_level_deblocks_a_chroma_pair_as_two_edges() {
+    let mut seed = 0x0c4b_c4c5u32;
+    let mut next = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        seed
+    };
+    let (w, h) = (24usize, 24usize);
+    let mut ran = 0;
+    for case in 0..20_000 {
+        let base = (next() % 256) as i32;
+        let spread = [2, 6, 20, 255][case % 4];
+        let mut plane = || -> Vec<u8> { (0..w * h).map(|_| (base + (next() % (2 * spread + 1)) as i32 - spread as i32).clamp(0, 255) as u8).collect() };
+        let (cb, cr) = (plane(), plane());
+        let strong = next() % 5 == 0;
+        let bs: [u8; 4] = if strong { [4; 4] } else { std::array::from_fn(|_| (next() % 4) as u8) };
+        let e = H264Edge { bs, tc0: std::array::from_fn(|_| (next() % 26) as u8), alpha: (next() % 256) as u8, beta: (next() % 19) as u8 };
+        let vertical = case % 2 == 0;
+        // some edges too close to the plane's start or end for the vector loads
+        let (x, y) = ((next() % 20) as usize, (next() % 20) as usize);
+        let (mut want_b, mut want_r) = (cb.clone(), cr.clone());
+        h264_deblock_at(Level::Scalar, &mut want_b, w, x, y, vertical, true, &e);
+        h264_deblock_at(Level::Scalar, &mut want_r, w, x, y, vertical, true, &e);
+        for &level in levels() {
+            let (mut got_b, mut got_r) = (cb.clone(), cr.clone());
+            h264_deblock_chroma_pair_at(level, &mut got_b, &mut got_r, w, x, y, vertical, &e);
+            assert_eq!((&got_b, &got_r), (&want_b, &want_r), "{level:?} vertical {vertical} at ({x}, {y}) {e:?}");
+            ran += (level != Level::Scalar && got_b != cb) as usize;
+        }
+    }
+    assert!(ran > 0 || !cfg!(target_arch = "aarch64"));
+}
+
 /// 8.5.2.4 with a step of 16 as the spec writes it: 32-bit sums, Round2(sum, 7) clipped per pass.
 #[allow(clippy::too_many_arguments)]
 fn spec_vp9_predict(
