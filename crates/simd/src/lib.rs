@@ -20,12 +20,18 @@
 
 mod deblock;
 mod h264;
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+mod hevc_itx;
 mod scalar;
 mod vp9;
 
 #[cfg(target_arch = "aarch64")]
 #[allow(unsafe_code)]
 mod h264_neon;
+
+#[cfg(target_arch = "aarch64")]
+#[allow(unsafe_code)]
+mod hevc_itx_neon;
 
 #[cfg(target_arch = "aarch64")]
 #[allow(unsafe_code)]
@@ -483,6 +489,49 @@ pub fn hevc_luma8_at(level: Level, rows: &[&[u8]], fh: Option<&[i8; 8]>, fv: Opt
         Level::Neon => hevc_neon::predict::<8>(rows, fh, fv, w, h, dst),
         _ => {
             let _ = (rows, fh, fv, w, h, dst);
+            false
+        }
+    }
+}
+
+/// HEVC inverse transform (8.6.4.2) of an `n` x `n` block (4, 8, 16 or 32; `dst_type`: the
+/// 4x4 DST-VII) of scaled coefficients `coefs` (`coefs[y * n + x]`, within 16 bits; larger
+/// values saturate, as the scaling process clips them), added to the 8-bit prediction samples
+/// in `dst` (rows `ds` apart) with Clip1 (8.6.7). Only coefficient rows up to `max_y` and columns
+/// up to `max_x` rounded up to a multiple of 8 (of 4 for 4x4 blocks) are read: the others must be
+/// zero, as must those read past `max_x`. Returns false, writing nothing, when no vector version
+/// runs (on the scalar level, or for arguments that do not fit); the caller then runs its scalar
+/// version.
+pub fn hevc_idct_add8(coefs: &[i32], n: usize, dst_type: bool, max_x: usize, max_y: usize, dst: &mut [u8], ds: usize) -> bool {
+    hevc_idct_add8_at(level(), coefs, n, dst_type, max_x, max_y, dst, ds)
+}
+
+/// [`hevc_idct_add8`] on a given level.
+pub fn hevc_idct_add8_at(level: Level, coefs: &[i32], n: usize, dst_type: bool, max_x: usize, max_y: usize, dst: &mut [u8], ds: usize) -> bool {
+    match level {
+        #[cfg(target_arch = "aarch64")]
+        Level::Neon => hevc_itx_neon::idct_add(coefs, n, dst_type, max_x, max_y, dst, ds),
+        _ => {
+            let _ = (coefs, n, dst_type, max_x, max_y, dst, ds);
+            false
+        }
+    }
+}
+
+/// Add the residual `r` (of a DC-only block, every sample the same) to the `n` x `n` 8-bit
+/// prediction samples in `dst` (rows `ds` apart) with Clip1. Returns false, writing nothing, as
+/// [`hevc_idct_add8`] does.
+pub fn hevc_dc_add8(r: i32, n: usize, dst: &mut [u8], ds: usize) -> bool {
+    hevc_dc_add8_at(level(), r, n, dst, ds)
+}
+
+/// [`hevc_dc_add8`] on a given level.
+pub fn hevc_dc_add8_at(level: Level, r: i32, n: usize, dst: &mut [u8], ds: usize) -> bool {
+    match level {
+        #[cfg(target_arch = "aarch64")]
+        Level::Neon => hevc_itx_neon::dc_add(r, n, dst, ds),
+        _ => {
+            let _ = (r, n, dst, ds);
             false
         }
     }
