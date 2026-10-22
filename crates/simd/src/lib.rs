@@ -31,6 +31,10 @@ mod h264_neon;
 
 #[cfg(target_arch = "aarch64")]
 #[allow(unsafe_code)]
+mod hevc_dbk_neon;
+
+#[cfg(target_arch = "aarch64")]
+#[allow(unsafe_code)]
 mod hevc_itx_neon;
 
 #[cfg(target_arch = "aarch64")]
@@ -489,6 +493,39 @@ pub fn hevc_luma8_at(level: Level, rows: &[&[u8]], fh: Option<&[i8; 8]>, fv: Opt
         Level::Neon => hevc_neon::predict::<8>(rows, fh, fv, w, h, dst),
         _ => {
             let _ = (rows, fh, fv, w, h, dst);
+            false
+        }
+    }
+}
+
+/// The two 4-line segments of an 8-line HEVC luma edge (8.7.2.5): whether each is filtered
+/// (bS > 0 and the edge enabled), its tC and beta (8.7.2.5.3, for 8-bit samples), and whether its
+/// p or q samples are left as they are (pcm_loop_filter_disabled_flag, cu_transquant_bypass).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HevcLumaEdge {
+    pub on: [bool; 2],
+    pub tc: [i32; 2],
+    pub beta: [i32; 2],
+    pub no_p: [bool; 2],
+    pub no_q: [bool; 2],
+}
+
+/// HEVC luma deblocking (8.7.2.5.3 decisions, 8.7.2.5.7 filtering) of an 8-line edge of 8-bit
+/// samples: q0 of the first line at `d[o]`, the lines `stride` apart down a vertical edge
+/// (`vertical`, p0 at `o - 1`) or 1 apart along a horizontal one (p0 at `o - stride`). Returns
+/// false, writing nothing, when no vector version runs (on the scalar level, or when p3..q3 of
+/// the lines are not all in `d`); the caller then runs its scalar version.
+pub fn hevc_deblock_luma8(d: &mut [u8], o: usize, stride: usize, vertical: bool, e: &HevcLumaEdge) -> bool {
+    hevc_deblock_luma8_at(level(), d, o, stride, vertical, e)
+}
+
+/// [`hevc_deblock_luma8`] on a given level.
+pub fn hevc_deblock_luma8_at(level: Level, d: &mut [u8], o: usize, stride: usize, vertical: bool, e: &HevcLumaEdge) -> bool {
+    match level {
+        #[cfg(target_arch = "aarch64")]
+        Level::Neon => hevc_dbk_neon::luma(d, o, stride, vertical, e),
+        _ => {
+            let _ = (d, o, stride, vertical, e);
             false
         }
     }

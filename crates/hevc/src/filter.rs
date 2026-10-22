@@ -5,9 +5,10 @@
 //! of row r for intra prediction); SAO of row r runs once row r+1 is deblocked; then row r is final.
 
 use crate::picture::{ColMv, FrameRow, Sample};
-use crate::slicedec::{E_PU_H, E_PU_V, E_TU_H, E_TU_V, F_CBF, F_CODED, F_INTRA, F_NOFILTER, MvField, PicState};
+use crate::slicedec::{Blk, E_PU_H, E_PU_V, E_TU_H, E_TU_V, F_CBF, F_CODED, F_INTRA, F_NOFILTER, MvField, PicState};
 use crate::spec_tables::{BETA_TABLE, TC_TABLE};
 use crate::tables::qpc_420;
+use filmcraft_simd::HevcLumaEdge;
 
 /// Called after each decoded CTB of CTB row `ry`.
 pub fn ctb_decoded<S: Sample>(pic: &mut PicState<S>, ry: usize) {
@@ -141,27 +142,34 @@ fn deblock_row<S: Sample>(pic: &mut PicState<S>, r: usize) {
     let (w, w4) = (pic.width, pic.w4);
     let (bd, bdc) = (pic.bd_y, pic.bd_c);
     let (cb_off, cr_off) = (pic.pps.cb_qp_offset, pic.pps.cr_qp_offset);
-    // vertical edges
+    // vertical edges, 8 lines (two 4-line segments) at a time: picture heights are multiples of
+    // the minimum coding block size, 8
     let mut bs_v = vec![0i8; w4 * ((y1 - y0) / 4)];
-    for by in y0 / 4..y1 / 4 {
-        for bx in (2..w4).step_by(2) {
-            let qi = by * w4 + bx;
-            let e = pic.blk[qi].edges;
-            if e & (E_TU_V | E_PU_V) == 0 || pic.blk[qi].flags & F_CODED == 0 {
+    let ww = w4.div_ceil(64);
+    for by0 in (y0 / 4..y1 / 4).step_by(2) {
+        for bx in edge_columns(&pic.vedges, ww, by0, (by0 + 2).min(y1 / 4)) {
+            if bx == 0 {
                 continue;
             }
-            let (x, y) = (bx * 4, by * 4);
-            let Some((tc_off, beta_off, ps, qs)) = edge_params(pic, x - 1, y, x, y) else { continue };
-            let bs = boundary_strength(pic, qi - 1, qi, e & E_TU_V != 0, ps, qs);
-            bs_v[(by - y0 / 4) * w4 + bx] = bs as i8;
-            if bs == 0 {
-                continue;
+            // Both segments have p and q in the same two CTBs (CTBs are at least 16 high).
+            let Some((tc_off, beta_off, ps, qs)) = edge_params(pic, bx * 4 - 1, by0 * 4, bx * 4, by0 * 4) else { continue };
+            let mut edge = HevcLumaEdge::default();
+            for (k, by) in (by0..(by0 + 2).min(y1 / 4)).enumerate() {
+                let qi = by * w4 + bx;
+                let e = pic.blk[qi].edges;
+                if e & (E_TU_V | E_PU_V) == 0 || pic.blk[qi].flags & F_CODED == 0 {
+                    continue;
+                }
+                let bs = boundary_strength(pic, qi - 1, qi, e & E_TU_V != 0, ps, qs);
+                bs_v[(by - y0 / 4) * w4 + bx] = bs as i8;
+                if bs == 0 {
+                    continue;
+                }
+                segment(&mut edge, k, &pic.blk[qi - 1], &pic.blk[qi], bs, tc_off, beta_off, bd);
             }
-            let (p, q) = (&pic.blk[qi - 1], &pic.blk[qi]);
-            let qpl = (p.qp as i32 + q.qp as i32 + 1) >> 1;
-            let (tc, beta) = tc_beta(qpl, bs, tc_off, beta_off, bd);
-            let (nfp, nfq) = (p.flags & F_NOFILTER != 0, q.flags & F_NOFILTER != 0);
-            filter_luma(&mut pic.planes[0], y * w + x, 1, w, tc, beta, nfp, nfq, bd);
+            if edge.on != [false; 2] {
+                luma_edge(&mut pic.planes[0], by0 * 4 * w + bx * 4, 1, w, &edge, bd);
+            }
         }
     }
     // chroma vertical edges (8x8 chroma grid = 16 luma samples), bS == 2 only
@@ -186,26 +194,29 @@ fn deblock_row<S: Sample>(pic: &mut PicState<S>, r: usize) {
     }
     // horizontal edges with the q side in this row
     let mut bs_h = vec![0i8; w4 * ((y1 - y0) / 4)];
+    // (8 samples, two segments, at a time: picture widths are multiples of 8 too)
     for by in (y0 / 4..y1 / 4).filter(|b| b % 2 == 0 && *b > 0) {
-        for bx in 0..w4 {
-            let qi = by * w4 + bx;
-            let e = pic.blk[qi].edges;
-            if e & (E_TU_H | E_PU_H) == 0 || pic.blk[qi].flags & F_CODED == 0 {
-                continue;
+        for bx0 in edge_columns(&pic.hedges, ww, by, by + 1) {
+            // Both segments have p and q in the same two CTBs (CTBs are at least 16 wide).
+            let Some((tc_off, beta_off, ps, qs)) = edge_params(pic, bx0 * 4, by * 4 - 1, bx0 * 4, by * 4) else { continue };
+            let mut edge = HevcLumaEdge::default();
+            for (k, bx) in (bx0..(bx0 + 2).min(w4)).enumerate() {
+                let qi = by * w4 + bx;
+                let e = pic.blk[qi].edges;
+                if e & (E_TU_H | E_PU_H) == 0 || pic.blk[qi].flags & F_CODED == 0 {
+                    continue;
+                }
+                let pi = qi - w4;
+                let bs = boundary_strength(pic, pi, qi, e & E_TU_H != 0, ps, qs);
+                bs_h[(by - y0 / 4) * w4 + bx] = bs as i8;
+                if bs == 0 {
+                    continue;
+                }
+                segment(&mut edge, k, &pic.blk[pi], &pic.blk[qi], bs, tc_off, beta_off, bd);
             }
-            let (x, y) = (bx * 4, by * 4);
-            let Some((tc_off, beta_off, ps, qs)) = edge_params(pic, x, y - 1, x, y) else { continue };
-            let pi = qi - w4;
-            let bs = boundary_strength(pic, pi, qi, e & E_TU_H != 0, ps, qs);
-            bs_h[(by - y0 / 4) * w4 + bx] = bs as i8;
-            if bs == 0 {
-                continue;
+            if edge.on != [false; 2] {
+                luma_edge(&mut pic.planes[0], by * 4 * w + bx0 * 4, w, 1, &edge, bd);
             }
-            let (p, q) = (&pic.blk[pi], &pic.blk[qi]);
-            let qpl = (p.qp as i32 + q.qp as i32 + 1) >> 1;
-            let (tc, beta) = tc_beta(qpl, bs, tc_off, beta_off, bd);
-            let (nfp, nfq) = (p.flags & F_NOFILTER != 0, q.flags & F_NOFILTER != 0);
-            filter_luma(&mut pic.planes[0], y * w + x, w, 1, tc, beta, nfp, nfq, bd);
         }
     }
     for by in (y0 / 4..y1 / 4).filter(|b| b % 4 == 0 && *b > 0) {
@@ -224,6 +235,57 @@ fn deblock_row<S: Sample>(pic: &mut PicState<S>, r: usize) {
                 let tc = (TC_TABLE[qt as usize] as i32) << (bdc - 8);
                 filter_chroma(&mut pic.planes[c], (y / 2) * cw + x / 2, cw, 1, tc, nfp, nfq, bdc);
             }
+        }
+    }
+}
+
+/// The even 4x4 block columns bx (the 8x8 grid) of the edge bitmap rows `r0..r1` (`ww` words
+/// each) where bx or bx + 1 has an edge in some row: the 8-sample edges to look at, in order.
+fn edge_columns(bits: &[u64], ww: usize, r0: usize, r1: usize) -> impl Iterator<Item = usize> + '_ {
+    (0..ww).flat_map(move |i| {
+        let mut m = 0u64;
+        for r in r0..r1 {
+            m |= bits.get(r * ww + i).copied().unwrap_or(0);
+        }
+        // bx and bx + 1 onto the even bit
+        let mut m = (m | (m >> 1)) & 0x5555_5555_5555_5555;
+        std::iter::from_fn(move || {
+            if m == 0 {
+                return None;
+            }
+            let b = m.trailing_zeros() as usize;
+            m &= m - 1;
+            Some(i * 64 + b)
+        })
+    })
+}
+
+/// Segment `k` of an 8-line luma edge between blocks `p` and `q` with boundary strength `bs`
+/// (> 0): its tC and beta (8.7.2.5.3) and the sides left unfiltered.
+#[allow(clippy::too_many_arguments)]
+fn segment(edge: &mut HevcLumaEdge, k: usize, p: &Blk, q: &Blk, bs: i32, tc_off: i32, beta_off: i32, bd: u32) {
+    let qpl = (p.qp as i32 + q.qp as i32 + 1) >> 1;
+    let (tc, beta) = tc_beta(qpl, bs, tc_off, beta_off, bd);
+    edge.on[k] = true;
+    edge.tc[k] = tc;
+    edge.beta[k] = beta;
+    edge.no_p[k] = p.flags & F_NOFILTER != 0;
+    edge.no_q[k] = q.flags & F_NOFILTER != 0;
+}
+
+/// Filter the segments of an 8-line luma edge that are on (q0 of the first line at `o`, `step`
+/// across the edge, `along` between lines): 8-bit samples by the vector kernel, else (or when it
+/// declines) one segment at a time.
+fn luma_edge<S: Sample>(plane: &mut [S], o: usize, step: usize, along: usize, e: &HevcLumaEdge, bd: u32) {
+    if bd == 8
+        && let Some(d) = S::as_u8_mut(plane)
+        && filmcraft_simd::hevc_deblock_luma8(d, o, step.max(along), step == 1, e)
+    {
+        return;
+    }
+    for k in 0..2 {
+        if e.on[k] {
+            filter_luma(plane, o + 4 * k * along, step, along, e.tc[k], e.beta[k], e.no_p[k], e.no_q[k], bd);
         }
     }
 }
@@ -747,5 +809,68 @@ mod luma_filter_tests {
             }
         }
         assert!(filtered > 1000, "only {filtered} edges filtered");
+    }
+
+    /// The 8-line vector kernel filters as the segment-by-segment scalar filter does: both edge
+    /// directions, every combination of segments on and of unfiltered sides, tC and beta over their
+    /// 8-bit range, on smooth ramps with steps (strong, weak and unfiltered lines) and noise.
+    #[test]
+    fn vector_luma_edges_match_the_scalar_filter() {
+        let mut seed = 0x1234_abcd_9876_5431u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let (w, h) = (32usize, 24usize);
+        let mut ran = 0;
+        for &level in filmcraft_simd::levels() {
+            for case in 0..4000 {
+                let vertical = case % 2 == 0;
+                let base = (next() % 256) as i32;
+                let slope = (next() % 7) as i32 - 3;
+                let step = [0i32, 2, 6, 20, 60][(next() % 5) as usize];
+                let noise = [0u64, 1, 3, 9][(next() % 4) as usize];
+                // the edge between columns (rows) 15 and 16, lines 8..16
+                let plane: Vec<u8> = (0..w * h)
+                    .map(|i| {
+                        let (x, y) = ((i % w) as i32, (i / w) as i32);
+                        let a = if vertical { x } else { y };
+                        let v = base + slope * a + if a >= 16 { step } else { 0 } + (next() % (noise + 1)) as i32;
+                        match next() % 50 {
+                            0 => 0,
+                            1 => 255,
+                            _ => v.clamp(0, 255) as u8,
+                        }
+                    })
+                    .collect();
+                let mut e = filmcraft_simd::HevcLumaEdge::default();
+                for k in 0..2 {
+                    e.on[k] = next() % 8 != 0;
+                    let q = (next() % 54) as usize;
+                    e.tc[k] = TC_TABLE[q] as i32;
+                    e.beta[k] = BETA_TABLE[q.min(51)] as i32;
+                    e.no_p[k] = next() % 10 == 0;
+                    e.no_q[k] = next() % 10 == 0;
+                }
+                let (o, st, al) = if vertical { (8 * w + 16, 1, w) } else { (16 * w + 8, w, 1) };
+                let mut want = plane.clone();
+                for k in 0..2 {
+                    if e.on[k] {
+                        filter_luma(&mut want, o + 4 * k * al, st, al, e.tc[k], e.beta[k], e.no_p[k], e.no_q[k], 8);
+                    }
+                }
+                let mut got = plane.clone();
+                if !filmcraft_simd::hevc_deblock_luma8_at(level, &mut got, o, w, vertical, &e) {
+                    assert_eq!(got, plane, "nothing written when declined");
+                    continue;
+                }
+                ran += 1;
+                assert_eq!(got, want, "{level:?} case {case} vertical {vertical} {e:?}");
+            }
+        }
+        // (only aarch64 has a vector version so far)
+        assert!(ran > 0 || !cfg!(target_arch = "aarch64"));
     }
 }

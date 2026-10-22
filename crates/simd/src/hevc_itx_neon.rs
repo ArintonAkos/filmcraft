@@ -127,8 +127,8 @@ fn mla(acc: (int32x4_t, int32x4_t), b: int16x8_t, s: i16) -> (int32x4_t, int32x4
 fn block<const N: usize, const DT: bool>(c: &[i32], max_x: usize, max_y: usize, dst: &mut [u8], ds: usize) {
     // Lanes per vector: 4 for 4-point transforms, else 8.
     let l = N.min(8);
-    // First pass into t[y * N + x] (columns past the last non-zero one stay zero).
-    let mut t = [0i16; 32 * 32];
+    // First pass into t[y][x] (columns past the last non-zero one stay zero).
+    let mut t = [[0i16; N]; N];
     let zero = (vdupq_n_s32(0), vdupq_n_s32(0));
     let cols = (max_x + 1).next_multiple_of(l);
     let mut rows = [vdupq_n_s16(0); 32];
@@ -143,13 +143,12 @@ fn block<const N: usize, const DT: bool>(c: &[i32], max_x: usize, max_y: usize, 
                 acc = mla(acc, r, basis::<N, DT>(j, y));
             }
             let v = vcombine_s16(vqrshrn_n_s32::<7>(acc.0), vqrshrn_n_s32::<7>(acc.1));
-            // SAFETY: y * N + x + l <= N * N <= t.len() (x + l <= cols <= N); a 4-point row
-            // stores its first 4 lanes.
+            // SAFETY: x + l <= cols <= N = t[y].len(); a 4-point row stores its first 4 lanes.
             unsafe {
                 if N == 4 {
-                    vst1_s16(t.as_mut_ptr().add(y * N + x), vget_low_s16(v));
+                    vst1_s16(t[y].as_mut_ptr().add(x), vget_low_s16(v));
                 } else {
-                    vst1q_s16(t.as_mut_ptr().add(y * N + x), v);
+                    vst1q_s16(t[y].as_mut_ptr().add(x), v);
                 }
             }
         }
@@ -157,7 +156,7 @@ fn block<const N: usize, const DT: bool>(c: &[i32], max_x: usize, max_y: usize, 
     }
     // Second pass: each row of t times the basis rows, added to the prediction.
     for y in 0..N {
-        let g = &t[y * N..y * N + N];
+        let g = &t[y];
         let mut x = 0;
         while x < N {
             let mut acc = zero;
