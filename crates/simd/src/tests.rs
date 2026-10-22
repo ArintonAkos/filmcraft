@@ -525,3 +525,108 @@ fn vp9_wraps_only_where_16_bit_sums_are_exact() {
     assert!(!vp9_wraps(&[0, 0, 0, 193, 0, 0, 0, 0]));
     assert!(!vp9_wraps(&[0, 0, 0, 128, 0, 0, -65, 0]));
 }
+
+/// HEVC luma (8.5.3.3.3.1) and chroma (8.5.3.3.3.2) filters, as the specification lists them.
+const HEVC_LUMA: [[i8; 8]; 4] = [[0, 0, 0, 64, 0, 0, 0, 0], [-1, 4, -10, 58, 17, -5, 1, 0], [-1, 4, -11, 40, 40, -11, 4, -1], [0, 1, -5, 17, 58, -10, 4, -1]];
+const HEVC_CHROMA: [[i8; 4]; 8] =
+    [[0, 64, 0, 0], [-2, 58, 10, -2], [-4, 54, 16, -2], [-6, 46, 28, -4], [-4, 36, 36, -4], [-4, 28, 46, -6], [-2, 16, 54, -4], [-2, 10, 58, -2]];
+
+/// 8.5.3.3.3 for 8-bit samples as the specification writes it (shift1 = 0, shift2 = 6,
+/// shift3 = 6): the predSamplesLX of the block at (m, m) of the window.
+fn spec_hevc_pred<const T: usize>(rows: &[&[u8]], fh: Option<&[i8; T]>, fv: Option<&[i8; T]>, w: usize, h: usize) -> Vec<i16> {
+    let m = T / 2 - 1;
+    let s = |y: usize, x: usize| rows[y][x] as i32;
+    let hf = |y: usize, x: usize, f: &[i8; T]| (0..T).map(|t| f[t] as i32 * s(y, x + t)).sum::<i32>();
+    let mut p = vec![0i16; w * h];
+    for y in 0..h {
+        for x in 0..w {
+            p[y * w + x] = match (fh, fv) {
+                (None, None) => s(y + m, x + m) << 6,
+                (Some(f), None) => hf(y + m, x, f),
+                (None, Some(g)) => (0..T).map(|t| g[t] as i32 * s(y + t, x + m)).sum::<i32>(),
+                (Some(f), Some(g)) => (0..T).map(|t| g[t] as i32 * hf(y + t, x, f)).sum::<i32>() >> 6,
+            } as i16;
+        }
+    }
+    p
+}
+
+/// The HEVC 8-bit prediction kernels against the specification's formulas: every fraction,
+/// every width the vector version covers, uni-, bi- and 14-bit output, extreme samples, and
+/// window rows exactly as long as the kernels may read.
+#[test]
+fn hevc_predict8_matches_the_formulas() {
+    let mut seed = 0x4e5f_6071u32;
+    let mut next = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        seed
+    };
+    fn check<const T: usize>(level: Level, filters: &[[i8; T]], next: &mut dyn FnMut() -> u32) {
+        let run = |rows: &[&[u8]], fh: Option<&[i8; T]>, fv: Option<&[i8; T]>, w: usize, h: usize, dst: HevcDst| {
+            if T == 8 {
+                hevc_luma8_at(level, rows, fh.map(|f| f.first_chunk::<8>().unwrap()), fv.map(|f| f.first_chunk::<8>().unwrap()), w, h, dst)
+            } else {
+                hevc_chroma8_at(level, rows, fh.map(|f| f.first_chunk::<4>().unwrap()), fv.map(|f| f.first_chunk::<4>().unwrap()), w, h, dst)
+            }
+        };
+        for w in (4usize..=64).step_by(4) {
+            for h in [1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64] {
+                let (fx, fy) = (next() as usize % filters.len(), next() as usize % filters.len());
+                let (fh, fv) = ((fx != 0).then(|| &filters[fx]), (fy != 0).then(|| &filters[fy]));
+                let last = if w.is_multiple_of(8) { w - 8 } else { w - 4 };
+                let len = last + 16;
+                let data: Vec<Vec<u8>> = (0..h + T - 1)
+                    .map(|_| {
+                        (0..len)
+                            .map(|_| match next() % 8 {
+                                0 => 0,
+                                1 => 255,
+                                _ => next() as u8,
+                            })
+                            .collect()
+                    })
+                    .collect();
+                let rows: Vec<&[u8]> = data.iter().map(|r| &r[..]).collect();
+                let want = spec_hevc_pred(&rows, fh, fv, w, h);
+                let ctx = format!("T {T} w {w} h {h} fx {fx} fy {fy}");
+                let mut got = vec![0i16; w * h];
+                // Levels without a vector version decline (and write nothing): the caller's
+                // scalar version runs.
+                if !cfg!(target_arch = "aarch64") || level != Level::Neon {
+                    assert!(!run(&rows, fh, fv, w, h, HevcDst::Pred(&mut got)), "{ctx}");
+                    assert!(got.iter().all(|&v| v == 0), "{ctx}");
+                    continue;
+                }
+                assert!(run(&rows, fh, fv, w, h, HevcDst::Pred(&mut got)), "{ctx}");
+                assert_eq!(got, want, "pred {ctx}");
+                let ds = w + 5;
+                let mut d = vec![7u8; ds * h];
+                assert!(run(&rows, fh, fv, w, h, HevcDst::Put(&mut d, ds)), "{ctx}");
+                let first: Vec<i16> = (0..w * h).map(|_| (next() % 22000) as i16 - 4000).collect();
+                let mut b = vec![7u8; ds * h];
+                assert!(run(&rows, fh, fv, w, h, HevcDst::Bi(&first, &mut b, ds)), "{ctx}");
+                for y in 0..h {
+                    for x in 0..ds {
+                        let (put, bi) = if x < w {
+                            let p = want[y * w + x] as i32;
+                            (((p + 32) >> 6).clamp(0, 255) as u8, ((first[y * w + x] as i32 + p + 64) >> 7).clamp(0, 255) as u8)
+                        } else {
+                            (7, 7)
+                        };
+                        assert_eq!(d[y * ds + x], put, "put {ctx} at {x},{y}");
+                        assert_eq!(b[y * ds + x], bi, "bi {ctx} at {x},{y}");
+                    }
+                }
+                // One sample short of what the vector loads read: no vector version.
+                let short: Vec<&[u8]> = data.iter().map(|r| &r[..len - 1]).collect();
+                assert!(!run(&short, fh, fv, w, h, HevcDst::Pred(&mut got)), "short {ctx}");
+            }
+        }
+    }
+    for &level in levels() {
+        check::<8>(level, &HEVC_LUMA, &mut next);
+        check::<4>(level, &HEVC_CHROMA, &mut next);
+    }
+}

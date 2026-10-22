@@ -29,6 +29,10 @@ mod h264_neon;
 
 #[cfg(target_arch = "aarch64")]
 #[allow(unsafe_code)]
+mod hevc_neon;
+
+#[cfg(target_arch = "aarch64")]
+#[allow(unsafe_code)]
 mod neon;
 
 #[cfg(target_arch = "aarch64")]
@@ -448,6 +452,59 @@ pub fn h264_deblock_at(level: Level, pix: &mut [u8], stride: usize, x: usize, y:
 
 #[cfg(test)]
 mod tests;
+
+/// Where an HEVC inter prediction of 8-bit samples goes (8.5.3.3.4.2, default weighting).
+pub enum HevcDst<'a> {
+    /// The 14-bit prediction samples themselves (predSamplesLX of 8.5.3.3.3), rows `w` apart:
+    /// the first prediction of a bi-predicted block, or the input of explicit weighting.
+    Pred(&'a mut [i16]),
+    /// Uni-prediction into the picture (rows `.1` apart): Clip3(0, 255, (p + 32) >> 6) (8-262).
+    Put(&'a mut [u8], usize),
+    /// Bi-prediction into the picture (rows `.2` apart) with the first prediction `.0` (rows `w`
+    /// apart): Clip3(0, 255, (p0 + p + 64) >> 7) (8-263).
+    Bi(&'a [i16], &'a mut [u8], usize),
+}
+
+/// HEVC luma sample interpolation (8.5.3.3.3.1) of a `w` x `h` block of 8-bit samples, written
+/// as `dst` says. `rows` are the h + 7 window rows from (x - 3, y - 3), each starting at the
+/// window's first column (the reference picture's own lines, or an edge-replicated copy); `fh`
+/// and `fv` are the filters of the horizontal and vertical fractions (None at whole samples).
+/// Returns false, writing nothing, when no vector version runs: on the scalar level, for widths
+/// that are not a multiple of 4, or when a row holds fewer than 16 samples past the start of the
+/// block's last strip of 8 (or 4) columns; the caller then runs its scalar version.
+pub fn hevc_luma8(rows: &[&[u8]], fh: Option<&[i8; 8]>, fv: Option<&[i8; 8]>, w: usize, h: usize, dst: HevcDst) -> bool {
+    hevc_luma8_at(level(), rows, fh, fv, w, h, dst)
+}
+
+/// [`hevc_luma8`] on a given level.
+pub fn hevc_luma8_at(level: Level, rows: &[&[u8]], fh: Option<&[i8; 8]>, fv: Option<&[i8; 8]>, w: usize, h: usize, dst: HevcDst) -> bool {
+    match level {
+        #[cfg(target_arch = "aarch64")]
+        Level::Neon => hevc_neon::predict::<8>(rows, fh, fv, w, h, dst),
+        _ => {
+            let _ = (rows, fh, fv, w, h, dst);
+            false
+        }
+    }
+}
+
+/// HEVC chroma sample interpolation (8.5.3.3.3.2) of a `w` x `h` block of 8-bit samples, as
+/// [`hevc_luma8`] with 4-tap filters: `rows` are the h + 3 window rows from (x - 1, y - 1).
+pub fn hevc_chroma8(rows: &[&[u8]], fh: Option<&[i8; 4]>, fv: Option<&[i8; 4]>, w: usize, h: usize, dst: HevcDst) -> bool {
+    hevc_chroma8_at(level(), rows, fh, fv, w, h, dst)
+}
+
+/// [`hevc_chroma8`] on a given level.
+pub fn hevc_chroma8_at(level: Level, rows: &[&[u8]], fh: Option<&[i8; 4]>, fv: Option<&[i8; 4]>, w: usize, h: usize, dst: HevcDst) -> bool {
+    match level {
+        #[cfg(target_arch = "aarch64")]
+        Level::Neon => hevc_neon::predict::<4>(rows, fh, fv, w, h, dst),
+        _ => {
+            let _ = (rows, fh, fv, w, h, dst);
+            false
+        }
+    }
+}
 
 /// How a VP9 inter prediction is written into the picture.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

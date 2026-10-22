@@ -6,16 +6,30 @@ use crate::spec_tables::{CHROMA_FILTER, LUMA_FILTER};
 /// Max prediction block size + filter margin.
 const WIN: usize = 64 + 7;
 
-/// Reference windows and first-pass rows, reused between blocks (no per-block zeroing).
+/// Reference windows, first-pass rows and a prediction block, reused between blocks (no
+/// per-block zeroing).
 pub struct McScratch {
     win: Vec<i16>,
     tmp: Vec<i16>,
+    pred: Vec<i16>,
 }
 
 impl Default for McScratch {
     fn default() -> Self {
-        McScratch { win: vec![0; WIN * WIN], tmp: vec![0; WIN * WIN] }
+        McScratch { win: vec![0; WIN * WIN], tmp: vec![0; WIN * WIN], pred: vec![0; 64 * 64] }
     }
+}
+
+/// Where a block's prediction goes.
+pub enum McOut<'a, S> {
+    /// The 14-bit prediction samples (predSamplesLX), rows `w` apart: the first of a
+    /// bi-predicted block, or the input of explicit weighting.
+    Pred(&'a mut [i16]),
+    /// Default weighted uni-prediction (8-262) into the picture, rows `.1` apart.
+    Put(&'a mut [S], usize),
+    /// Default weighted bi-prediction (8-263) with the first prediction `.0` (rows `w` apart)
+    /// into the picture, rows `.2` apart.
+    Bi(&'a [i16], &'a mut [S], usize),
 }
 
 /// A sample the interpolation filters read: reference samples (`u8` / `u16`) or 16-bit window
@@ -193,11 +207,14 @@ fn interpolate<P: Px, const T: usize>(
     }
 }
 
-/// Prediction samples of a w x h block of plane `c` whose filter window (`T`-tap filters) starts
-/// at (x0, y0): read straight from the reference lines when the window is inside the picture
-/// horizontally, else from an edge-replicated copy.
+/// Prediction of a w x h block of plane `c` whose filter window (`T`-tap filters) starts at
+/// (x0, y0), written as `out` says: read straight from the reference lines when the window is
+/// inside the picture horizontally (by the vector kernels for 8-bit samples), else from an
+/// edge-replicated copy.
+/// `R` is the most window rows a block can have (64 + 7 luma, 32 + 3 chroma): the array of
+/// row slices is that long, so smaller blocks set up no more of it than they can use.
 #[allow(clippy::too_many_arguments)]
-fn predict_block<S: Sample, const T: usize>(
+fn predict_block<S: Sample, const T: usize, const R: usize>(
     f: &Frame,
     c: usize,
     (x0, y0): (i32, i32),
@@ -205,17 +222,21 @@ fn predict_block<S: Sample, const T: usize>(
     filters: (&[i8; T], &[i8; T]),
     (w, h): (usize, usize),
     (shift1, shift3): (u32, u32),
-    out: &mut [i16],
+    out: McOut<S>,
     sc: &mut McScratch,
 ) {
     let (ww, wh) = (w + T - 1, h + T - 1);
-    let McScratch { win, tmp } = sc;
-    let mut rows: [&[S]; WIN] = [&[]; WIN];
+    let McScratch { win, tmp, pred } = sc;
+    let mut rows: [&[S]; R] = [&[]; R];
     if let Some(rows) = rows.get_mut(..wh)
         && f.window_rows(c, x0, y0, ww, rows)
     {
-        interpolate::<S, T>(rows, tmp, fx, fy, filters.0, filters.1, w, h, shift1, shift3, out);
-        return;
+        let mut out = out;
+        if shift1 == 0 && shift3 == 6 && vector8::<S, T>(rows, (fx, fy), filters, (w, h), &mut out) {
+            return;
+        }
+        let rows: &[&[S]] = rows;
+        return finish(out, pred, w, h, 14 - shift3, |p| interpolate::<S, T>(rows, tmp, fx, fy, filters.0, filters.1, w, h, shift1, shift3, p));
     }
     if c == 0 {
         f.luma_window::<S>(x0, y0, ww, wh, win, WIN);
@@ -226,33 +247,81 @@ fn predict_block<S: Sample, const T: usize>(
     for (r, row) in wrows.iter_mut().zip(win.chunks(WIN)).take(wh) {
         *r = row;
     }
-    interpolate::<i16, T>(&wrows[..wh.min(WIN)], tmp, fx, fy, filters.0, filters.1, w, h, shift1, shift3, out);
+    let wrows = &wrows[..wh.min(WIN)];
+    finish(out, pred, w, h, 14 - shift3, |p| interpolate::<i16, T>(wrows, tmp, fx, fy, filters.0, filters.1, w, h, shift1, shift3, p));
+}
+
+/// The prediction by the 8-bit vector kernels (`filmcraft_simd`), if they cover the block: the
+/// window `rows` of 8-bit samples (bit depth 8: shift1 0, shift3 6).
+fn vector8<S: Sample, const T: usize>(
+    rows: &[&[S]],
+    (fx, fy): (usize, usize),
+    (hf, vf): (&[i8; T], &[i8; T]),
+    (w, h): (usize, usize),
+    out: &mut McOut<S>,
+) -> bool {
+    use filmcraft_simd::HevcDst;
+    let Some(rows) = S::as_u8(rows) else { return false };
+    let dst = match out {
+        McOut::Pred(p) => HevcDst::Pred(p),
+        McOut::Put(d, ds) => match S::as_u8_mut(d) {
+            Some(d) => HevcDst::Put(d, *ds),
+            None => return false,
+        },
+        McOut::Bi(p0, d, ds) => match S::as_u8_mut(d) {
+            Some(d) => HevcDst::Bi(p0, d, *ds),
+            None => return false,
+        },
+    };
+    let (fh, fv) = ((fx != 0).then_some(hf), (fy != 0).then_some(vf));
+    // T is 8 (luma) or 4 (chroma): the filters as the kernels' fixed-size arrays.
+    if T == 8 {
+        filmcraft_simd::hevc_luma8(rows, fh.and_then(|f| f.first_chunk()), fv.and_then(|f| f.first_chunk()), w, h, dst)
+    } else {
+        filmcraft_simd::hevc_chroma8(rows, fh.and_then(|f| f.first_chunk()), fv.and_then(|f| f.first_chunk()), w, h, dst)
+    }
+}
+
+/// Run `interpolate` into the prediction buffer `out` names (`pred` for the picture outputs)
+/// and write those as `out` says, at bit depth `bd`.
+fn finish<S: Sample>(out: McOut<S>, pred: &mut [i16], w: usize, h: usize, bd: u32, interpolate: impl FnOnce(&mut [i16])) {
+    match out {
+        McOut::Pred(p) => interpolate(p),
+        McOut::Put(d, ds) => {
+            interpolate(pred);
+            put_uni(pred, w, h, bd, d, ds);
+        }
+        McOut::Bi(p0, d, ds) => {
+            interpolate(pred);
+            put_bi(p0, pred, w, h, bd, d, ds);
+        }
+    }
 }
 
 /// Luma prediction samples (14-bit intermediate precision) of a w x h block at (x, y) displaced by the
-/// quarter-sample motion vector `mv`, into `out` (stride w).
+/// quarter-sample motion vector `mv`, written as `out` says.
 #[allow(clippy::too_many_arguments)]
-pub fn mc_luma<S: Sample>(f: &Frame, x: i32, y: i32, mv: [i16; 2], w: usize, h: usize, out: &mut [i16], sc: &mut McScratch) {
+pub fn mc_luma<S: Sample>(f: &Frame, x: i32, y: i32, mv: [i16; 2], w: usize, h: usize, out: McOut<S>, sc: &mut McScratch) {
     let bd = f.bit_depth;
     let (fx, fy) = ((mv[0] & 3) as usize, (mv[1] & 3) as usize);
     let xi = x + (mv[0] as i32 >> 2);
     let yi = y + (mv[1] as i32 >> 2);
     let shift1 = bd.min(12) - 8;
     let shift3 = 14 - bd;
-    predict_block::<S, 8>(f, 0, (xi - 3, yi - 3), (fx, fy), (&LUMA_FILTER[fx], &LUMA_FILTER[fy]), (w, h), (shift1, shift3), out, sc);
+    predict_block::<S, 8, WIN>(f, 0, (xi - 3, yi - 3), (fx, fy), (&LUMA_FILTER[fx], &LUMA_FILTER[fy]), (w, h), (shift1, shift3), out, sc);
 }
 
 /// Chroma prediction samples of a w x h chroma block at chroma position (x, y) with a 1/8-sample
 /// vector (4:2:0).
 #[allow(clippy::too_many_arguments)]
-pub fn mc_chroma<S: Sample>(f: &Frame, c: usize, x: i32, y: i32, mv: [i16; 2], w: usize, h: usize, out: &mut [i16], sc: &mut McScratch) {
+pub fn mc_chroma<S: Sample>(f: &Frame, c: usize, x: i32, y: i32, mv: [i16; 2], w: usize, h: usize, out: McOut<S>, sc: &mut McScratch) {
     let bd = f.bit_depth_c;
     let (fx, fy) = ((mv[0] & 7) as usize, (mv[1] & 7) as usize);
     let xi = x + (mv[0] as i32 >> 3);
     let yi = y + (mv[1] as i32 >> 3);
     let shift1 = bd.min(12) - 8;
     let shift3 = 14 - bd;
-    predict_block::<S, 4>(f, c + 1, (xi - 1, yi - 1), (fx, fy), (&CHROMA_FILTER[fx], &CHROMA_FILTER[fy]), (w, h), (shift1, shift3), out, sc);
+    predict_block::<S, 4, { 32 + 3 }>(f, c + 1, (xi - 1, yi - 1), (fx, fy), (&CHROMA_FILTER[fx], &CHROMA_FILTER[fy]), (w, h), (shift1, shift3), out, sc);
 }
 
 /// Calls `$f::<_, W>(args)` with `W` the prediction block width `$w` as a constant (block widths are
@@ -525,7 +594,7 @@ mod tests {
             let (mut in_place, mut copied) = (0, 0);
             for _ in 0..2000 {
                 let c = rng.range(0, 2) as usize;
-                let (w, h) = ([4usize, 8, 12, 16, 24, 32][rng.range(0, 5) as usize], [4usize, 8, 16, 32][rng.range(0, 3) as usize]);
+                let (w, h) = ([4usize, 8, 12, 16, 24, 32, 48, 64][rng.range(0, 7) as usize], [4usize, 8, 12, 16, 24, 32, 48, 64][rng.range(0, 7) as usize]);
                 let (w, h) = if c == 0 { (w, h) } else { (w / 2, h / 2) };
                 let (x, y) = (rng.range(-12, 100), rng.range(-12, 70));
                 let mv = [rng.range(-64, 64) as i16, rng.range(-64, 64) as i16];
@@ -550,14 +619,31 @@ mod tests {
                     f.chroma_window::<S>(c - 1, x0, y0, w + t - 1, h + t - 1, &mut win, WIN);
                 }
                 let wrows: Vec<&[i16]> = win.chunks(WIN).take(h + t - 1).collect();
+                let run = |out: McOut<S>, sc: &mut McScratch| {
+                    if c == 0 {
+                        mc_luma::<S>(&f, x, y, mv, w, h, out, sc);
+                    } else {
+                        mc_chroma::<S>(&f, c - 1, x, y, mv, w, h, out, sc);
+                    }
+                };
+                run(McOut::Pred(&mut a), &mut sc);
                 if c == 0 {
-                    mc_luma::<S>(&f, x, y, mv, w, h, &mut a, &mut sc);
                     interpolate::<i16, 8>(&wrows, &mut tmp, fx, fy, &LUMA_FILTER[fx], &LUMA_FILTER[fy], w, h, shift1, shift3, &mut b);
                 } else {
-                    mc_chroma::<S>(&f, c - 1, x, y, mv, w, h, &mut a, &mut sc);
                     interpolate::<i16, 4>(&wrows, &mut tmp, fx, fy, &CHROMA_FILTER[fx], &CHROMA_FILTER[fy], w, h, shift1, shift3, &mut b);
                 }
-                assert_eq!(a, b, "plane {c} bd {bd} at ({x}, {y}) mv {mv:?} {w}x{h}");
+                let at = format!("plane {c} bd {bd} at ({x}, {y}) mv {mv:?} {w}x{h}");
+                assert_eq!(a, b, "{at}");
+                // Written into the picture: uni- and bi-prediction (8-262, 8-263).
+                let ds = w + 3;
+                let first: Vec<i16> = (0..w * h).map(|_| rng.range(-4000, 18000) as i16).collect();
+                let (mut got, mut want) = (vec![S::default(); ds * h], vec![S::default(); ds * h]);
+                run(McOut::Put(&mut got, ds), &mut sc);
+                put_uni(&b, w, h, bd, &mut want, ds);
+                assert_eq!(got, want, "put {at}");
+                run(McOut::Bi(&first, &mut got, ds), &mut sc);
+                put_bi(&first, &b, w, h, bd, &mut want, ds);
+                assert_eq!(got, want, "bi {at}");
             }
             assert!(in_place > 500 && copied > 100, "{in_place} in place, {copied} copied");
         }
@@ -579,7 +665,7 @@ mod tests {
                 let (x, y) = (rng.range(-40, 80), rng.range(-40, 70));
                 let mut pred = vec![0i16; w * h];
                 let (mut a, mut b) = (vec![S::default(); w * h], vec![S::default(); w * h]);
-                mc_luma::<S>(&f, 0, 0, [(x * 4) as i16, (y * 4) as i16], w, h, &mut pred, &mut sc);
+                mc_luma::<S>(&f, 0, 0, [(x * 4) as i16, (y * 4) as i16], w, h, McOut::Pred(&mut pred), &mut sc);
                 put_uni(&pred, w, h, bd, &mut a, w);
                 f.copy_block(0, x, y, w, h, &mut b, w);
                 assert_eq!(a, b, "luma bd {bd} at ({x}, {y}) {w}x{h}");
@@ -587,7 +673,7 @@ mod tests {
                 assert!(a.iter().any(|&v| v != S::default()) || w * h < 8);
                 for c in 1..3 {
                     let (cw, ch) = (w / 2, h / 2);
-                    mc_chroma::<S>(&f, c - 1, 0, 0, [(x * 8) as i16, (y * 8) as i16], cw, ch, &mut pred, &mut sc);
+                    mc_chroma::<S>(&f, c - 1, 0, 0, [(x * 8) as i16, (y * 8) as i16], cw, ch, McOut::Pred(&mut pred), &mut sc);
                     let (mut a, mut b) = (vec![S::default(); cw * ch], vec![S::default(); cw * ch]);
                     put_uni(&pred, cw, ch, bd, &mut a, cw);
                     f.copy_block(c, x, y, cw, ch, &mut b, cw);
