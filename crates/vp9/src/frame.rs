@@ -247,13 +247,13 @@ impl<T: Clone> Pool<T> {
     /// A buffer of `len` elements with unspecified contents (recycled memory when available;
     /// `fill` only initialises fresh memory).
     pub fn take_any(&self, len: usize, fill: T) -> Vec<T> {
-        let found = {
-            let mut b = self.bufs.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            b.iter().position(|v| v.len() >= len).map(|i| b.swap_remove(i))
-        };
-        match found {
+        match self.best_fit(len) {
             Some(mut v) => {
-                v.truncate(len);
+                if v.len() >= len {
+                    v.truncate(len);
+                } else {
+                    v.resize(len, fill);
+                }
                 v
             }
             None => vec![fill; len],
@@ -262,11 +262,7 @@ impl<T: Clone> Pool<T> {
 
     /// A buffer of `len` copies of `fill` (recycled memory when available).
     pub fn take(&self, len: usize, fill: T) -> Vec<T> {
-        let found = {
-            let mut b = self.bufs.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            b.iter().position(|v| v.capacity() >= len).map(|i| b.swap_remove(i))
-        };
-        match found {
+        match self.best_fit(len) {
             Some(mut v) => {
                 v.clear();
                 v.resize(len, fill);
@@ -274,6 +270,14 @@ impl<T: Clone> Pool<T> {
             }
             None => vec![fill; len],
         }
+    }
+
+    /// The pooled buffer of the least capacity of at least `len`, so that buffers of one size
+    /// (a plane's band, say) keep serving that size rather than being cut down for smaller ones.
+    fn best_fit(&self, len: usize) -> Option<Vec<T>> {
+        let mut b = self.bufs.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let i = b.iter().enumerate().filter(|(_, v)| v.capacity() >= len).min_by_key(|(_, v)| v.capacity()).map(|(i, _)| i)?;
+        Some(b.swap_remove(i))
     }
 
     pub fn put(&self, v: Vec<T>) {
@@ -298,5 +302,38 @@ pub struct Pools {
 impl Default for Pools {
     fn default() -> Self {
         Pools { samples: Pool::default(), bands: Pool::with_max(1024), mi: Pool::default() }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Buffers of two sizes taken and returned in turns (a luma and a chroma band, say) are each
+    /// reused at their own size: the large one is not cut down for the small request and lost
+    /// for the next large one.
+    #[test]
+    fn pool_reuses_buffers_by_best_fit() {
+        let pool = Pool::<u16>::default();
+        pool.put(vec![0; 1000]);
+        pool.put(vec![0; 250]);
+        for _ in 0..3 {
+            let small = pool.take_any(250, 0);
+            let large = pool.take_any(1000, 0);
+            assert_eq!((small.capacity(), large.capacity()), (250, 1000));
+            assert_eq!((small.len(), large.len()), (250, 1000));
+            pool.put(small);
+            pool.put(large);
+        }
+        // A smaller request served by the only buffer keeps its capacity for a later full one.
+        let only = Pool::<u16>::default();
+        only.put(vec![0; 1000]);
+        let v = only.take_any(10, 0);
+        assert_eq!((v.len(), v.capacity()), (10, 1000));
+        only.put(v);
+        let v = only.take_any(1000, 7);
+        assert_eq!((v.len(), v.capacity()), (1000, 1000));
+        let v = only.take(5, 3);
+        assert_eq!(v, vec![3; 5]);
     }
 }
