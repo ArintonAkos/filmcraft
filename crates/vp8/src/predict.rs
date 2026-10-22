@@ -275,10 +275,49 @@ pub fn predict_inter(
     let x0 = bx as isize + (mvx >> 3) as isize;
     let y0 = by as isize + (mvy >> 3) as isize;
     let (fx, fy) = ((mvx & 7) as usize, (mvy & 7) as usize);
+    let full_inside = x0 >= 2 && y0 >= 2 && x0 + w as isize + 3 <= reference.width as isize && y0 + h as isize + 3 <= reference.height as isize;
+    // Inside the reference: read in place, whole pixels copied and sub-pixel positions filtered
+    // by the vector kernel straight into the picture.
+    if full_inside
+        && let Some(win) = reference.data.get((y0 as usize - 2) * reference.stride + x0 as usize - 2..)
+        && let Some(out) = dst.get_mut(by * dst_stride + bx..)
+    {
+        if fx == 0 && fy == 0 {
+            copy_rows(win, reference.stride, out, dst_stride, w, h);
+            return;
+        }
+        let tap6 = |f: usize| -> [i16; 6] { std::array::from_fn(|k| filters.get(f * 6 + k).map_or(0, |&t| t as i16)) };
+        let (hf, vf) = (tap6(fx), tap6(fy));
+        let (fh, fv) = ((fx != 0).then_some(&hf), (fy != 0).then_some(&vf));
+        if filmcraft_simd::vp8_predict(win, reference.stride, fh, fv, w, h, out, dst_stride) {
+            return;
+        }
+    }
+    predict_inter_window(reference, dst, dst_stride, bx, by, w, h, mvx, mvy, filters);
+}
+
+/// [`predict_inter`] from a copy of the source window (edges replicated where it leaves the
+/// reference), by the scalar filters.
+#[allow(clippy::too_many_arguments)]
+fn predict_inter_window(
+    reference: &RefPlane,
+    dst: &mut [u8],
+    dst_stride: usize,
+    bx: usize,
+    by: usize,
+    w: usize,
+    h: usize,
+    mvx: i32,
+    mvy: i32,
+    filters: &[i32; 48],
+) {
+    let x0 = bx as isize + (mvx >> 3) as isize;
+    let y0 = by as isize + (mvy >> 3) as isize;
+    let (fx, fy) = ((mvx & 7) as usize, (mvy & 7) as usize);
+    let full_inside = x0 >= 2 && y0 >= 2 && x0 + w as isize + 3 <= reference.width as isize && y0 + h as isize + 3 <= reference.height as isize;
     // source window: 2 before, 3 after in each direction
     const MAX: usize = 16 + 5;
     let mut src = [[0u8; MAX]; MAX];
-    let full_inside = x0 >= 2 && y0 >= 2 && x0 + w as isize + 3 <= reference.width as isize && y0 + h as isize + 3 <= reference.height as isize;
     for r in 0..h + 5 {
         let yy = y0 + r as isize - 2;
         if full_inside {
@@ -339,5 +378,69 @@ pub fn predict_inter(
                 *d = round(v) as u8;
             }
         }
+    }
+}
+
+/// Copy the `w` x `h` block at (2, 2) of the window `win` (rows `ws` apart) into `out` (rows
+/// `os` apart), a fixed-size copy per row for the block widths.
+fn copy_rows(win: &[u8], ws: usize, out: &mut [u8], os: usize, w: usize, h: usize) {
+    fn rows<const N: usize>(win: &[u8], ws: usize, out: &mut [u8], os: usize, h: usize) {
+        for r in 0..h {
+            if let (Some(s), Some(d)) =
+                (win.get((r + 2) * ws + 2..).and_then(|s| s.first_chunk::<N>()), out.get_mut(r * os..).and_then(|d| d.first_chunk_mut::<N>()))
+            {
+                *d = *s;
+            }
+        }
+    }
+    match w {
+        16 => rows::<16>(win, ws, out, os, h),
+        8 => rows::<8>(win, ws, out, os, h),
+        _ => rows::<4>(win, ws, out, os, h),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::spec_tables::{BILINEAR_FILTERS, SIXTAP_FILTERS};
+
+    /// Inter prediction read in place (whole-pixel copies and the vector filters) gives what the
+    /// scalar filters give from a copied window: both filter sets, every fraction, every block
+    /// size, inside the reference and next to (and past) its edges.
+    #[test]
+    fn in_place_prediction_matches_the_window_filters() {
+        let mut seed = 0x0dd5_eed5_2468_ace1u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let (rw, rh) = (64usize, 48usize);
+        let data: Vec<u8> = (0..rw * rh)
+            .map(|_| match next() % 8 {
+                0 => 0,
+                1 => 255,
+                _ => next() as u8,
+            })
+            .collect();
+        let reference = RefPlane { data: &data, stride: rw, width: rw, height: rh };
+        let (dw, dh) = (rw, rh);
+        let mut inside = 0;
+        for case in 0..20000 {
+            let filters = if case % 2 == 0 { &SIXTAP_FILTERS } else { &BILINEAR_FILTERS };
+            let w = [16usize, 8, 4][(next() % 3) as usize];
+            let (bx, by) = (((next() as usize) % (dw - w + 1)) & !3, ((next() as usize) % (dh - w + 1)) & !3);
+            let (mvx, mvy) = ((next() % 160) as i32 - 80, (next() % 160) as i32 - 80);
+            let mut got = vec![9u8; dw * dh];
+            let mut want = got.clone();
+            predict_inter(&reference, &mut got, dw, bx, by, w, w, mvx, mvy, filters);
+            predict_inter_window(&reference, &mut want, dw, bx, by, w, w, mvx, mvy, filters);
+            let (x0, y0) = (bx as i32 + (mvx >> 3), by as i32 + (mvy >> 3));
+            inside += usize::from(x0 >= 2 && y0 >= 2 && x0 + w as i32 + 3 <= rw as i32 && y0 + w as i32 + 3 <= rh as i32);
+            assert_eq!(got, want, "case {case} {w}x{w} at ({bx}, {by}) mv ({mvx}, {mvy})");
+        }
+        assert!(inside > 5000, "{inside} blocks inside");
     }
 }

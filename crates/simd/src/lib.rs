@@ -55,6 +55,10 @@ mod vp8_lf_neon;
 
 #[cfg(target_arch = "aarch64")]
 #[allow(unsafe_code)]
+mod vp8_mc_neon;
+
+#[cfg(target_arch = "aarch64")]
+#[allow(unsafe_code)]
 mod vp9_neon;
 
 #[cfg(target_arch = "x86_64")]
@@ -587,6 +591,54 @@ pub fn hevc_sao_edge8_at(level: Level, cur: &[u8], a: &[u8], b: &[u8], dst: &mut
             false
         }
     }
+}
+
+/// VP8 inter prediction (18.3) of a `w` x `h` block (`w` 16, 8 or 4, `h` 1..=16) of 8-bit pixels
+/// into `dst` (rows `ds` apart). `src` is the reference window from (x - 2, y - 2), rows `ss`
+/// apart (the reference itself, read in place); `fh` and `fv` are the six-tap (or bilinear, as six
+/// taps) filters of the horizontal and vertical fractions (None at whole pixels). Each pass is
+/// (sum + 64) >> 7 clipped to 0..=255. Returns false, writing nothing, when no vector version runs:
+/// on the scalar level, for filters whose sums could leave 16 bits ([`vp8_wraps`]), or when the
+/// vector loads (16 pixels from each strip of 8 columns, h + 5 rows) do not fit `src`; the caller
+/// then runs its scalar version.
+#[allow(clippy::too_many_arguments)]
+pub fn vp8_predict(src: &[u8], ss: usize, fh: Option<&[i16; 6]>, fv: Option<&[i16; 6]>, w: usize, h: usize, dst: &mut [u8], ds: usize) -> bool {
+    vp8_predict_at(level(), src, ss, fh, fv, w, h, dst, ds)
+}
+
+/// [`vp8_predict`] on a given level.
+#[allow(clippy::too_many_arguments)]
+pub fn vp8_predict_at(
+    level: Level,
+    src: &[u8],
+    ss: usize,
+    fh: Option<&[i16; 6]>,
+    fv: Option<&[i16; 6]>,
+    w: usize,
+    h: usize,
+    dst: &mut [u8],
+    ds: usize,
+) -> bool {
+    if !fh.is_none_or(vp8_wraps) || !fv.is_none_or(vp8_wraps) {
+        return false;
+    }
+    match level {
+        #[cfg(target_arch = "aarch64")]
+        Level::Neon => vp8_mc_neon::predict(src, ss, fh, fv, w, h, dst, ds),
+        _ => {
+            let _ = (src, ss, w, h, dst, ds);
+            false
+        }
+    }
+}
+
+/// Whether 8-bit sums of the six-tap filter `f` may be kept modulo 2^16: its positive taps add up
+/// to at most 192 and its negative ones to at least -64 (VP8's six-tap filters: 160 and -32; the
+/// bilinear ones: 128 and 0).
+pub fn vp8_wraps(f: &[i16; 6]) -> bool {
+    let pos: i32 = f.iter().map(|&c| (c as i32).max(0)).sum();
+    let neg: i32 = f.iter().map(|&c| (c as i32).min(0)).sum();
+    pos <= 192 && neg >= -64
 }
 
 /// A VP8 loop filter (15.2, 15.3).
