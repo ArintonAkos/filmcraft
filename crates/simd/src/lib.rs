@@ -39,6 +39,10 @@ mod hevc_itx_neon;
 
 #[cfg(target_arch = "aarch64")]
 #[allow(unsafe_code)]
+mod hevc_sao_neon;
+
+#[cfg(target_arch = "aarch64")]
+#[allow(unsafe_code)]
 mod hevc_neon;
 
 #[cfg(target_arch = "aarch64")]
@@ -526,6 +530,56 @@ pub fn hevc_deblock_luma8_at(level: Level, d: &mut [u8], o: usize, stride: usize
         Level::Neon => hevc_dbk_neon::luma(d, o, stride, vertical, e),
         _ => {
             let _ = (d, o, stride, vertical, e);
+            false
+        }
+    }
+}
+
+/// HEVC SAO band offset (8.7.3, SaoTypeIdx 1) of a run of 8-bit samples `src` into `dst`:
+/// `table[band]` (band = sample >> 3; the four offsets at their bands, 0 elsewhere) added with
+/// Clip1. Returns false, writing nothing, when no vector version runs (on the scalar level, runs
+/// shorter than 16, offsets outside -128..=127, or `dst` shorter than `src`).
+pub fn hevc_sao_band8(src: &[u8], dst: &mut [u8], table: &[i32; 32]) -> bool {
+    hevc_sao_band8_at(level(), src, dst, table)
+}
+
+/// [`hevc_sao_band8`] on a given level.
+pub fn hevc_sao_band8_at(level: Level, src: &[u8], dst: &mut [u8], table: &[i32; 32]) -> bool {
+    let mut t = [0i8; 32];
+    for (t, &v) in t.iter_mut().zip(table) {
+        let Ok(v) = i8::try_from(v) else { return false };
+        *t = v;
+    }
+    match level {
+        #[cfg(target_arch = "aarch64")]
+        Level::Neon => hevc_sao_neon::band(src, dst, &t),
+        _ => {
+            let _ = (src, dst, t);
+            false
+        }
+    }
+}
+
+/// HEVC SAO edge offset (8.7.3, SaoTypeIdx 2) of a run of 8-bit samples `cur` with their two
+/// neighbours along the edge class `a` and `b` (all usable) into `dst`: `offsets[2 + sum]` added
+/// with Clip1, sum the signs of `cur - a` and `cur - b` (`offsets[2]`, edgeIdx 0, is 0). Returns
+/// false, writing nothing, as [`hevc_sao_band8`] does.
+pub fn hevc_sao_edge8(cur: &[u8], a: &[u8], b: &[u8], dst: &mut [u8], offsets: &[i32; 5]) -> bool {
+    hevc_sao_edge8_at(level(), cur, a, b, dst, offsets)
+}
+
+/// [`hevc_sao_edge8`] on a given level.
+pub fn hevc_sao_edge8_at(level: Level, cur: &[u8], a: &[u8], b: &[u8], dst: &mut [u8], offsets: &[i32; 5]) -> bool {
+    let mut o = [0i8; 5];
+    for (o, &v) in o.iter_mut().zip(offsets) {
+        let Ok(v) = i8::try_from(v) else { return false };
+        *o = v;
+    }
+    match level {
+        #[cfg(target_arch = "aarch64")]
+        Level::Neon => hevc_sao_neon::edge(cur, a, b, dst, &o),
+        _ => {
+            let _ = (cur, a, b, dst, o);
             false
         }
     }

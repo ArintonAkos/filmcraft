@@ -34,6 +34,8 @@ pub trait Sample: Copy + Default + PartialEq + std::fmt::Debug + Send + Sync + '
     fn as_u8<'a>(rows: &'a [&'a [Self]]) -> Option<&'a [&'a [u8]]>;
     /// `d` as 8-bit samples, if this is the 8-bit storage type.
     fn as_u8_mut(d: &mut [Self]) -> Option<&mut [u8]>;
+    /// `s` as 8-bit samples, if this is the 8-bit storage type.
+    fn as_u8_ref(s: &[Self]) -> Option<&[u8]>;
 }
 
 impl Sample for u8 {
@@ -75,6 +77,10 @@ impl Sample for u8 {
     fn as_u8_mut(d: &mut [u8]) -> Option<&mut [u8]> {
         Some(d)
     }
+    #[inline(always)]
+    fn as_u8_ref(s: &[u8]) -> Option<&[u8]> {
+        Some(s)
+    }
 }
 
 impl Sample for u16 {
@@ -114,6 +120,10 @@ impl Sample for u16 {
     }
     #[inline(always)]
     fn as_u8_mut(_: &mut [u16]) -> Option<&mut [u8]> {
+        None
+    }
+    #[inline(always)]
+    fn as_u8_ref(_: &[u16]) -> Option<&[u8]> {
         None
     }
 }

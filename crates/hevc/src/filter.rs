@@ -469,7 +469,7 @@ fn sao_ctb<S: Sample>(
     let offs = p.offsets[c].map(|v| v as i32);
     // samples of CUs that must not be modified
     let nofilter = |pic: &PicState<S>, x: usize, y: usize| pic.blk[((y << sc) >> 2) * pic.w4 + ((x << sc) >> 2)].flags & F_NOFILTER != 0;
-    let any_nofilter = {
+    let any_nofilter = pic.any_nofilter && {
         let mut a = false;
         for by in ((y0 << sc) >> 2)..(((y1 << sc) + 3) >> 2).min(pic.h4) {
             for bx in ((x0 << sc) >> 2)..(((x1 << sc) + 3) >> 2).min(pic.w4) {
@@ -564,8 +564,12 @@ fn sao_ctb<S: Sample>(
     // (same arithmetic) for them, the general path for the CTB border.
     let (mx, my) = ((hp[0] != 0) as usize, (vp[0] != 0) as usize);
     let plane = &pic.planes[c];
+    // The top (bottom) row's neighbours above (below), except at the corners, lie in the CTB
+    // above (below): usable or not as a whole.
+    let above_ok = my == 0 || (y0 > 0 && cross_ok(pic, x0, y0 - 1));
+    let below_ok = my == 0 || (y1 < h && cross_ok(pic, x0, y1));
     for y in y0..y1 {
-        let inner_row = !any_nofilter && y >= y0 + my && y + my < y1 && x1 - x0 > 2 * mx;
+        let inner_row = !any_nofilter && (y >= y0 + my || above_ok) && (y + my < y1 || below_ok) && x1 - x0 > 2 * mx;
         if !inner_row {
             for x in x0..x1 {
                 if let Some(v) = general(x, y) {
@@ -598,6 +602,13 @@ const SAO_LANES: usize = 16;
 /// vectorises; bit-exact with the per-sample form.
 #[inline(always)]
 fn sao_edge_run<S: Sample>(cur: &[S], na: &[S], nb: &[S], out: &mut [S], by_sum: &[i32; 5], max: i32) {
+    if max == 255
+        && let (Some(c), Some(a), Some(b)) = (S::as_u8_ref(cur), S::as_u8_ref(na), S::as_u8_ref(nb))
+        && let Some(d) = S::as_u8_mut(out)
+        && filmcraft_simd::hevc_sao_edge8(c, a, b, d, by_sum)
+    {
+        return;
+    }
     let o = by_sum.map(|v| v as i16);
     let max = max as i16;
     let lane = |v: i16, a: i16, b: i16| -> S {
@@ -636,6 +647,18 @@ fn lanes_mut<S>(s: &mut [S], i: usize) -> Option<&mut [S; SAO_LANES]> {
 /// four offsets per lane.
 #[inline(always)]
 fn sao_band_run<S: Sample>(src: &[S], out: &mut [S], shift: u32, (band_pos, offs): (i32, [i32; 4]), max: i32) {
+    if max == 255
+        && let Some(s) = S::as_u8_ref(src)
+        && let Some(d) = S::as_u8_mut(out)
+    {
+        let mut table = [0i32; 32];
+        for (k, &o) in offs.iter().enumerate() {
+            table[(k + band_pos as usize) & 31] = o;
+        }
+        if filmcraft_simd::hevc_sao_band8(s, d, &table) {
+            return;
+        }
+    }
     let o = offs.map(|v| v as i16);
     let (bp, max) = (band_pos as i16, max as i16);
     let lane = |v: i16| -> S {
@@ -872,5 +895,44 @@ mod luma_filter_tests {
         }
         // (only aarch64 has a vector version so far)
         assert!(ran > 0 || !cfg!(target_arch = "aarch64"));
+    }
+
+    /// SAO runs of 8-bit samples (the vector kernels where they run) give what the scalar lanes
+    /// give (the same samples as `u16`, which always take the scalar path): edge offset with any
+    /// offsets, band offset at every band position (wrapping past 31), runs of any length,
+    /// samples near 0 and 255.
+    #[test]
+    fn sao_runs_match_the_scalar_lanes() {
+        let mut seed = 0x0bad_5eed_1234_5678u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for case in 0..3000 {
+            let n = 1 + (next() % 80) as usize;
+            let sample = |next: &mut dyn FnMut() -> u64| match next() % 8 {
+                0 => (next() % 8) as u8,
+                1 => 255 - (next() % 8) as u8,
+                _ => next() as u8,
+            };
+            let cur: Vec<u8> = (0..n).map(|_| sample(&mut next)).collect();
+            let a: Vec<u8> = cur.iter().map(|&v| if next() % 3 == 0 { v } else { sample(&mut next) }).collect();
+            let b: Vec<u8> = cur.iter().map(|&v| if next() % 3 == 0 { v } else { sample(&mut next) }).collect();
+            let offs: [i32; 4] = std::array::from_fn(|_| (next() % 15) as i32 - 7);
+            let wide = |v: &[u8]| v.iter().map(|&x| x as u16).collect::<Vec<u16>>();
+            // edge offset
+            let by_sum = [offs[0], offs[1], 0, offs[2], offs[3]];
+            let (mut got, mut want) = (vec![0u8; n], vec![0u16; n]);
+            sao_edge_run(&cur, &a, &b, &mut got, &by_sum, 255);
+            sao_edge_run(&wide(&cur), &wide(&a), &wide(&b), &mut want, &by_sum, 255);
+            assert_eq!(wide(&got), want, "edge case {case} n {n} {by_sum:?}");
+            // band offset
+            let band_pos = (next() % 32) as i32;
+            sao_band_run(&cur, &mut got, 3, (band_pos, offs), 255);
+            sao_band_run(&wide(&cur), &mut want, 3, (band_pos, offs), 255);
+            assert_eq!(wide(&got), want, "band case {case} n {n} pos {band_pos} {offs:?}");
+        }
     }
 }

@@ -137,6 +137,9 @@ pub struct PicState<S> {
     /// Scaling factors [sizeId][matrixId] when scaling lists are enabled.
     pub scaling: Option<Arc<Vec<Vec<u8>>>>,
     pub deblocking_enabled_anywhere: bool,
+    /// Whether some block of the picture keeps its samples through the in-loop filters
+    /// (`F_NOFILTER`: pcm_loop_filter_disabled_flag or cu_transquant_bypass).
+    pub any_nofilter: bool,
     /// Draft mode: no deblocking or SAO.
     pub draft: bool,
 }
@@ -185,6 +188,7 @@ impl<S: Sample> PicState<S> {
             ds_ctx: None,
             scaling,
             deblocking_enabled_anywhere: false,
+            any_nofilter: false,
             draft: false,
         }
     }
@@ -660,6 +664,7 @@ impl<'a, S: Sample> SliceDecoder<'a, S> {
         }
         // CU-level block state: depth, skip, coded; CU edges are transform and prediction edges
         let bypass = self.cu_transquant_bypass;
+        self.pic.any_nofilter |= bypass;
         let qp = self.qp_y as i8;
         self.fill_blk(x0, y0, n, n, |b| {
             b.depth = depth as u8;
@@ -690,6 +695,7 @@ impl<'a, S: Sample> SliceDecoder<'a, S> {
             if pcm {
                 self.pcm_sample(x0, y0, log2)?;
                 if self.sps.pcm_loop_filter_disabled {
+                    self.pic.any_nofilter = true;
                     self.fill_blk(x0, y0, n, n, |b| b.flags |= F_NOFILTER);
                 }
                 self.finish_cu(x0, y0, n);
