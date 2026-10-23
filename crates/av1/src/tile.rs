@@ -1725,6 +1725,10 @@ impl<'a, 'f> TileDecoder<'a, 'f> {
             let sig_off: [usize; SIG_REF_DIFF_OFFSET_NUM] = std::array::from_fn(|i| sig[i][0] as usize * stride + sig[i][1] as usize);
             let magr = &MAG_REF_OFFSET_WITH_TX_CLASS[tx_class];
             let mag_off: [usize; 3] = std::array::from_fn(|i| magr[i][0] as usize * stride + magr[i][1] as usize);
+            // The nonzero list grows without a branch on the level (as random as the symbols).
+            let mut nz = std::mem::take(&mut self.nonzero);
+            nz.resize(eob, 0);
+            let mut count = 0usize;
             for c in (0..eob).rev() {
                 let pos = scan[c] as usize;
                 let row = pos >> bwl;
@@ -1757,10 +1761,13 @@ impl<'a, 'f> TileDecoder<'a, 'f> {
                 }
                 self.quant[pos] = level;
                 lev[li] = level as u8;
-                if level != 0 {
-                    self.nonzero.push(pos as u16);
+                if let Some(e) = nz.get_mut(count) {
+                    *e = pos as u16;
                 }
+                count += (level != 0) as usize;
             }
+            nz.truncate(count);
+            self.nonzero = nz;
             self.levels = lev;
             // Signs and Golomb remainders of the nonzero coefficients, in scan order (the
             // reverse of the level pass's); zero ones have neither. The scans start at 0.
