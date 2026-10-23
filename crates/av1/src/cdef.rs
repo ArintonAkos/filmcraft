@@ -1,10 +1,10 @@
 //! CDEF (7.15), in place.
 //!
-//! Every block reads CurrFrame up to 2 samples around itself, so filtering in place keeps
-//! copies of the few unfiltered samples a block's neighbours have already overwritten: the
-//! last 2 rows of the block row above (saved before that row is filtered), and the rows on
-//! either side of a band (saved before the bands run in parallel). A block's output is written
-//! once the block to its right has read its samples.
+//! Every block reads CurrFrame up to 2 samples around itself, so filtering in place delays
+//! writes until the neighbours have read: a block's output is written once the block to its
+//! right has read its samples, except its last 2 rows, which wait until the next block row has
+//! been read. Only the rows on either side of a band are copies (saved before the bands run in
+//! parallel).
 
 use crate::frame::{FrameBuf, RowBand};
 use crate::par::Pool;
@@ -50,29 +50,54 @@ struct Pending {
     out: [u16; 64],
 }
 
-impl Pending {
-    fn write(&self, dst: &mut RowBand) {
-        // Rows of a fixed length (a call to memmove otherwise).
-        fn put<const W: usize>(p: &Pending, dst: &mut RowBand) {
-            for (i, o) in p.out.as_chunks::<W>().0.iter().take(p.h).enumerate() {
-                if let Some(d) = dst.row_mut(p.y0 + i).get_mut(p.x0..).and_then(|d| d.first_chunk_mut::<W>()) {
-                    *d = *o;
-                }
+/// Rows `rows` of `out` (w samples each) into `dst` from row `y0`, column `x0`.
+fn put_rows(out: &[u16], w: usize, rows: std::ops::Range<usize>, x0: usize, y0: usize, dst: &mut RowBand) {
+    // Rows of a fixed length (a call to memmove otherwise).
+    fn put<const W: usize>(out: &[u16], rows: std::ops::Range<usize>, x0: usize, y0: usize, dst: &mut RowBand) {
+        for i in rows {
+            let o = out.get(i * W..).and_then(|o| o.first_chunk::<W>());
+            if let (Some(o), Some(d)) = (o, dst.row_mut(y0 + i).get_mut(x0..).and_then(|d| d.first_chunk_mut::<W>())) {
+                *d = *o;
             }
         }
-        if self.w == 8 {
-            put::<8>(self, dst);
-        } else {
-            put::<4>(self, dst);
-        }
+    }
+    if w == 8 {
+        put::<8>(out, rows, x0, y0, dst);
+    } else {
+        put::<4>(out, rows, x0, y0, dst);
+    }
+}
+
+impl Pending {
+    /// Writes all but the last 2 rows; those (which the next block row reads unfiltered) go to
+    /// `tails`.
+    fn write(&self, dst: &mut RowBand, tails: &mut Vec<Tail>) {
+        let body = self.h - 2;
+        put_rows(&self.out, self.w, 0..body, self.x0, self.y0, dst);
+        let mut t = Tail { x0: self.x0, y0: self.y0 + body, w: self.w, out: [0; 16] };
+        t.out[..2 * self.w].copy_from_slice(&self.out[body * self.w..self.h * self.w]);
+        tails.push(t);
+    }
+}
+
+/// The last 2 rows of a filtered block, written once the next block row has been read.
+struct Tail {
+    x0: usize,
+    y0: usize,
+    w: usize,
+    out: [u16; 16],
+}
+
+impl Tail {
+    fn write(&self, dst: &mut RowBand) {
+        put_rows(&self.out, self.w, 0..2, self.x0, self.y0, dst);
     }
 }
 
 /// CurrFrame as a block row of one plane sees it while the band is filtered in place.
 struct Src<'a> {
     band: &'a RowBand<'a>,
-    /// First row of the block row: the rows above it come from `above`.
-    y0: usize,
+    /// The 2 rows above the band.
     above: &'a [u16],
     /// The rows from the band's end on.
     below: &'a [u16],
@@ -83,8 +108,8 @@ impl Src<'_> {
     #[inline(always)]
     fn row(&self, y: usize) -> &[u16] {
         let st = self.band.stride;
-        if y < self.y0 {
-            let i = y + 2 - self.y0;
+        if y < self.band.y0 {
+            let i = y + 2 - self.band.y0;
             self.above.get(i * st..(i + 1) * st).unwrap_or(&[])
         } else if y >= self.end {
             let i = y - self.end;
@@ -99,37 +124,37 @@ impl Src<'_> {
 fn filter_band(fs: &FrameState, band: &mut [RowBand; 3], (start, end): (usize, usize), edges: &[BandEdges; 3]) {
     let (mi_rows, mi_cols) = (fs.fh.mi_rows as usize, fs.fh.mi_cols as usize);
     let np = fs.num_planes;
-    let sub_y = |p: usize| if p == 0 { 0 } else { fs.ssy };
-    let mut above: [Vec<u16>; 3] = std::array::from_fn(|p| edges[p][0].clone());
-    let mut next_above: [Vec<u16>; 3] = Default::default();
     let mut pending: [Option<Pending>; 3] = Default::default();
+    // The last rows of this block row's filtered blocks, and of the previous one's.
+    let (mut tails, mut prev_tails): ([Vec<Tail>; 3], [Vec<Tail>; 3]) = Default::default();
+    // The first row past each plane's band (where `Src` switches to the saved rows below).
+    let ends: [usize; 3] = std::array::from_fn(|p| band[p].y0 + band[p].data.len() / band[p].stride.max(1));
     let mut r = start / 4;
     while r < mi_rows.min(end / 4) {
-        // The unfiltered last 2 rows of this block row, for the next one.
-        for p in 0..np {
-            let (b, h) = (&band[p], 8 >> sub_y(p));
-            let y = ((r * 4) >> sub_y(p)) + h - 2;
-            next_above[p].clear();
-            if y >= b.y0 {
-                let o = (y - b.y0) * b.stride;
-                next_above[p].extend_from_slice(b.data.get(o..o + 2 * b.stride).unwrap_or(&[]));
-            }
-        }
         let mut c = 0;
         while c < mi_cols {
             let idx = fs.cdef_idx(r & !15, c & !15);
             if idx >= 0 {
-                cdef_block(fs, band, &above, edges, &mut pending, r, c, idx as usize);
+                cdef_block(fs, band, edges, &mut pending, &mut tails, &ends, r, c, idx as usize);
             }
             c += 2;
         }
         for p in 0..np {
             if let Some(b) = pending[p].take() {
-                b.write(&mut band[p]);
+                b.write(&mut band[p], &mut tails[p]);
+            }
+            // This block row has read the previous one's last rows.
+            for t in prev_tails[p].drain(..) {
+                t.write(&mut band[p]);
             }
         }
-        std::mem::swap(&mut above, &mut next_above);
+        std::mem::swap(&mut tails, &mut prev_tails);
         r += 2;
+    }
+    for p in 0..np {
+        for t in prev_tails[p].drain(..) {
+            t.write(&mut band[p]);
+        }
     }
 }
 
@@ -137,13 +162,20 @@ fn filter_band(fs: &FrameState, band: &mut [RowBand; 3], (start, end): (usize, u
 fn cdef_block(
     fs: &FrameState,
     band: &mut [RowBand; 3],
-    above: &[Vec<u16>; 3],
     edges: &[BandEdges; 3],
     pending: &mut [Option<Pending>; 3],
+    tails: &mut [Vec<Tail>; 3],
+    ends: &[usize; 3],
     r: usize,
     c: usize,
     idx: usize,
 ) {
+    let cp = &fs.fh.cdef;
+    let chroma = fs.num_planes > 1;
+    if cp.y_pri[idx] == 0 && cp.y_sec[idx] == 0 && (!chroma || (cp.uv_pri[idx] == 0 && cp.uv_sec[idx] == 0)) {
+        // No plane filters (CdefFrame = CurrFrame), and the direction would go unused.
+        return;
+    }
     let mi = &fs.mi;
     let sk = |rr: usize, cc: usize| -> bool { if rr < mi.rows && cc < mi.cols { mi.skip[mi.idx(rr, cc)] } else { true } };
     let skip = sk(r, c) && sk(r + 1, c) && sk(r, c + 1) && sk(r + 1, c + 1);
@@ -151,11 +183,16 @@ fn cdef_block(
         return;
     }
     let coeff_shift = fs.bit_depth - 8;
-    let cp = &fs.fh.cdef;
     let mut run = |plane: usize, pri0: i32, sec: i32, damping: i32, dir: Option<usize>| -> (usize, i32) {
-        let sub_y = if plane == 0 { 0 } else { fs.ssy };
+        if let Some(d) = dir
+            && pri0 == 0
+            && sec == 0
+        {
+            // Nothing to filter and no direction to find.
+            return (d, 0);
+        }
         let b = &band[plane];
-        let src = Src { band: b, y0: (r * 4) >> sub_y, above: &above[plane], below: &edges[plane][1], end: b.y0 + b.data.len() / b.stride.max(1) };
+        let src = Src { band: b, above: &edges[plane][0], below: &edges[plane][1], end: ends[plane] };
         let (dir, var) = match dir {
             Some(d) => (d, 0),
             None => direction(fs, &src, r, c),
@@ -173,14 +210,17 @@ fn cdef_block(
         if let Some(o) = out
             && let Some(old) = pending[plane].replace(o)
         {
-            old.write(&mut band[plane]);
+            old.write(&mut band[plane], &mut tails[plane]);
         }
         (dir, var)
     };
     let pri = (cp.y_pri[idx] << coeff_shift) as i32;
     let sec = (cp.y_sec[idx] << coeff_shift) as i32;
     let damping = cp.damping as i32 + coeff_shift as i32;
-    let (y_dir, _) = run(0, pri, sec, damping, None);
+    // The direction search only matters through a primary strength: luma filters along
+    // direction 0 without one (its variance only scales that strength), and so does chroma.
+    let needs_dir = pri != 0 || (chroma && cp.uv_pri[idx] != 0);
+    let (y_dir, _) = run(0, pri, sec, damping, if needs_dir { None } else { Some(0) });
     if fs.num_planes == 1 {
         return;
     }
