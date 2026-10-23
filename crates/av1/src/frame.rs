@@ -105,6 +105,18 @@ impl Plane {
         let o = (y - self.oy) * self.stride;
         &self.data[o + x - self.ox..o + self.stride]
     }
+    /// The samples from (x, y) to the end of the plane (rows `stride` apart); empty outside it.
+    #[inline(always)]
+    pub fn tail(&self, x: usize, y: usize) -> &[u16] {
+        let o = y.checked_sub(self.oy).and_then(|r| r.checked_mul(self.stride)).zip(x.checked_sub(self.ox)).map(|(r, c)| r + c);
+        o.and_then(|o| self.data.get(o..)).unwrap_or(&[])
+    }
+    /// [`Plane::tail`], writable.
+    #[inline(always)]
+    pub fn tail_mut(&mut self, x: usize, y: usize) -> &mut [u16] {
+        let o = y.checked_sub(self.oy).and_then(|r| r.checked_mul(self.stride)).zip(x.checked_sub(self.ox)).map(|(r, c)| r + c);
+        o.and_then(|o| self.data.get_mut(o..)).unwrap_or(&mut [])
+    }
     #[inline(always)]
     pub fn row_from_mut(&mut self, y: usize, x: usize) -> &mut [u16] {
         let o = (y - self.oy) * self.stride;

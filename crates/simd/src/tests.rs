@@ -711,3 +711,162 @@ fn hevc_predict8_matches_the_formulas() {
         check::<4>(level, &HEVC_CHROMA, &mut next);
     }
 }
+
+/// 7.11.3.4 sample by sample: the intermediate rows rounded by InterRound0, then the output
+/// rounded by InterRound1.
+#[allow(clippy::too_many_arguments)]
+fn spec_av1_mc(src: &[u16], ss: usize, hf: &[i16; 8], vf: &[i16; 8], w: usize, h: usize, r0: u32, r1: u32) -> Vec<i32> {
+    let round2 = |x: i32, n: u32| (x + (1 << n >> 1)) >> n;
+    let mut tmp = vec![0i32; (h + 7) * w];
+    for r in 0..h + 7 {
+        for c in 0..w {
+            let s: i32 = (0..8).map(|t| hf[t] as i32 * src[r * ss + c + t] as i32).sum();
+            tmp[r * w + c] = round2(s, r0);
+        }
+    }
+    let mut out = vec![0i32; h * w];
+    for r in 0..h {
+        for c in 0..w {
+            let s: i32 = (0..8).map(|t| vf[t] as i32 * tmp[(r + t) * w + c]).sum();
+            out[r * w + c] = round2(s, r1);
+        }
+    }
+    out
+}
+
+/// Random taps adding up to 128 (the identity now and then), their positive ones at most
+/// `pos` and negative ones at least `neg` in sum.
+fn random_taps(pos: i32, neg: i32, next: &mut dyn FnMut() -> u32) -> [i16; 8] {
+    if next().is_multiple_of(5) {
+        return [0, 0, 0, 128, 0, 0, 0, 0];
+    }
+    loop {
+        let mut f = [0i16; 8];
+        let mut rest = 128i32;
+        // all 8 taps, taps 1..7 (AV1's regular and smooth filters) or 2..6 (its 4-tap ones)
+        let free: &[usize] = match next() % 3 {
+            0 => &[0, 1, 2, 5, 6, 7],
+            1 => &[1, 2, 5, 6],
+            _ => &[2, 5],
+        };
+        for &t in free {
+            let v = (next() % 49) as i32 - 24;
+            f[t] = v as i16;
+            rest -= v;
+        }
+        let split = (next() % 129) as i32;
+        f[3] = split as i16;
+        f[4] = (rest - split) as i16;
+        let p: i32 = f.iter().map(|&c| (c as i32).max(0)).sum();
+        let n: i32 = f.iter().map(|&c| (c as i32).min(0)).sum();
+        if p <= pos && n >= neg {
+            return f;
+        }
+    }
+}
+
+#[test]
+fn every_level_matches_the_spec_av1_inter_prediction() {
+    let mut seed = 0x0a1_3c5u32;
+    let mut next = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        seed
+    };
+    let mut ran = 0;
+    for &level in levels() {
+        for bd in [8u32, 10, 12] {
+            for compound in [false, true] {
+                let r0 = if bd == 12 { 5 } else { 3 };
+                let r1 = match (compound, bd) {
+                    (true, _) => 7,
+                    (false, 12) => 9,
+                    _ => 11,
+                };
+                let max = (1u32 << bd) - 1;
+                for w in [2usize, 4, 8, 16, 32, 64, 128] {
+                    for h in [1usize, 2, 4, 8, 16, 32, 64, 128] {
+                        // 8-bit sometimes with taps past the 16-bit envelope (the 32-bit pass runs)
+                        let (pos, neg) = if bd == 8 && next().is_multiple_of(4) { (300, -100) } else { (192, -64) };
+                        let (hf, vf) = (random_taps(pos, neg, &mut next), random_taps(192, -64, &mut next));
+                        let ss = w + 8 + (next() % 5) as usize;
+                        let src: Vec<u16> = (0..(h + 7) * ss + 8)
+                            .map(|_| match next() % 6 {
+                                0 => 0,
+                                1 => max as u16,
+                                _ => (next() % (max + 1)) as u16,
+                            })
+                            .collect();
+                        let want = spec_av1_mc(&src, ss, &hf, &vf, w, h, r0, r1);
+                        let ctx = format!("{level:?} bd {bd} compound {compound} {w}x{h} hf {hf:?} vf {vf:?}");
+                        let ds = w + 3;
+                        if compound && next().is_multiple_of(2) {
+                            // the second prediction of an average, with a random first one
+                            let shift = if bd == 12 { 3 } else { 5 };
+                            let first: Vec<i32> = (0..ds * h).map(|_| (next() % 40000) as i32 - 8000).collect();
+                            let mut got = vec![7u16; ds * h];
+                            let out = Av1McOut::Avg { first: &first, fs: ds, dst: &mut got, ds, max: max as u16, shift };
+                            if !av1_mc_at(level, &src, ss, &hf, &vf, w, h, bd, r0, r1, out) {
+                                assert!(got.iter().all(|&v| v == 7), "{ctx}");
+                                assert!(level != Level::Neon || w == 2, "{ctx}");
+                                continue;
+                            }
+                            for y in 0..h {
+                                let row: Vec<u16> =
+                                    (0..w).map(|x| ((first[y * ds + x] + want[y * w + x] + (1 << (shift - 1))) >> shift).clamp(0, max as i32) as u16).collect();
+                                assert_eq!(&got[y * ds..y * ds + w], &row[..], "avg {ctx} row {y}");
+                                assert!(got[y * ds + w..y * ds + ds].iter().all(|&v| v == 7), "{ctx} row {y}");
+                            }
+                        } else if compound {
+                            let mut got = vec![7i32; ds * h];
+                            let done = av1_mc_at(level, &src, ss, &hf, &vf, w, h, bd, r0, r1, Av1McOut::Pred { out: &mut got, os: ds });
+                            if !done {
+                                assert!(got.iter().all(|&v| v == 7), "{ctx}");
+                                assert!(level != Level::Neon || w == 2, "{ctx}");
+                                continue;
+                            }
+                            for y in 0..h {
+                                assert_eq!(&got[y * ds..y * ds + w], &want[y * w..y * w + w], "{ctx} row {y}");
+                                assert!(got[y * ds + w..y * ds + ds].iter().all(|&v| v == 7), "{ctx} row {y}");
+                            }
+                        } else {
+                            let mut got = vec![7u16; ds * h];
+                            let done = av1_mc_at(level, &src, ss, &hf, &vf, w, h, bd, r0, r1, Av1McOut::Put { dst: &mut got, ds, max: max as u16 });
+                            if !done {
+                                assert!(got.iter().all(|&v| v == 7), "{ctx}");
+                                assert!(level != Level::Neon || w == 2, "{ctx}");
+                                continue;
+                            }
+                            for y in 0..h {
+                                let row: Vec<u16> = want[y * w..y * w + w].iter().map(|&v| v.clamp(0, max as i32) as u16).collect();
+                                assert_eq!(&got[y * ds..y * ds + w], &row[..], "{ctx} row {y}");
+                                assert!(got[y * ds + w..y * ds + ds].iter().all(|&v| v == 7), "{ctx} row {y}");
+                            }
+                        }
+                        ran += 1;
+                    }
+                }
+            }
+        }
+    }
+    assert!(ran > 0 || !cfg!(target_arch = "aarch64"));
+}
+
+#[test]
+fn av1_inter_prediction_declines_blocks_whose_loads_leave_the_source() {
+    for &level in levels() {
+        let (w, h, ss) = (16usize, 8usize, 24usize);
+        let taps = [0, 2, -6, 126, 8, -2, 0, 0];
+        // One sample short of the last row's 16-sample load.
+        let src = vec![100u16; (h + 6) * ss + (w - 8) + 15];
+        let mut dst = vec![7u16; w * h];
+        assert!(!av1_mc_at(level, &src, ss, &taps, &taps, w, h, 8, 3, 11, Av1McOut::Put { dst: &mut dst, ds: w, max: 255 }));
+        assert!(dst.iter().all(|&v| v == 7));
+        // A destination one sample short.
+        let src = vec![100u16; (h + 6) * ss + w + 8];
+        let mut dst = vec![7u16; w * h - 1];
+        assert!(!av1_mc_at(level, &src, ss, &taps, &taps, w, h, 8, 3, 11, Av1McOut::Put { dst: &mut dst, ds: w, max: 255 }));
+        assert!(dst.iter().all(|&v| v == 7));
+    }
+}

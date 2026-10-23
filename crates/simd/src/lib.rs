@@ -27,6 +27,10 @@ mod vp9;
 
 #[cfg(target_arch = "aarch64")]
 #[allow(unsafe_code)]
+mod av1_mc_neon;
+
+#[cfg(target_arch = "aarch64")]
+#[allow(unsafe_code)]
 mod h264_neon;
 
 #[cfg(target_arch = "aarch64")]
@@ -292,6 +296,57 @@ pub fn subpel_h_at(level: Level, src: &[u16], taps: &[i16; 8], out: &mut [i16], 
 /// count as zero.
 pub fn subpel_v(rows: &[i16], stride: usize, taps: &[i16; 8], out: &mut [i32], shift: u32) {
     subpel_v_at(level(), rows, stride, taps, out, shift);
+}
+
+/// Where [`av1_mc`] writes a block's prediction.
+pub enum Av1McOut<'a> {
+    /// A single prediction, into the picture: Round2(sum, InterRound1) clamped to 0..=max.
+    Put { dst: &'a mut [u16], ds: usize, max: u16 },
+    /// One of a compound's predictions: Round2(sum, InterRound1), rows `os` apart.
+    Pred { out: &'a mut [i32], os: usize },
+    /// The second prediction of a compound average, into the picture: Round2(first + this
+    /// prediction, `shift`) clamped to 0..=max, `first` the first prediction (rows `fs` apart).
+    Avg { first: &'a [i32], fs: usize, dst: &'a mut [u16], ds: usize, max: u16, shift: u32 },
+}
+
+/// AV1 block inter prediction without reference scaling (7.11.3.4) of a `w` x `h` block (`w` 4
+/// to 128, a power of two; `h` 1 to 128) of `bit_depth` samples: the horizontal filter `hf`
+/// rounded by InterRound0 = `r0` (<= 7), then the vertical filter `vf` rounded by InterRound1 =
+/// `r1`, written as `out` says. `src` is the reference from (x - 3, y - 3), rows `ss` apart, every
+/// sample the filters read inside the reference (no edge clamping). The vector version reads 16
+/// samples from each strip of 8 columns (one of 4 for 4-wide blocks), h + 7 rows, so it needs
+/// `(h + 6) * ss + w + 8` samples (`+ 12` for 4-wide). Returns false, writing nothing, when no
+/// vector version runs (on the scalar level, for other sizes, or when the loads or stores do not
+/// fit); the caller then runs its scalar version.
+#[allow(clippy::too_many_arguments)]
+pub fn av1_mc(src: &[u16], ss: usize, hf: &[i16; 8], vf: &[i16; 8], w: usize, h: usize, bit_depth: u32, r0: u32, r1: u32, out: Av1McOut) -> bool {
+    av1_mc_at(level(), src, ss, hf, vf, w, h, bit_depth, r0, r1, out)
+}
+
+/// [`av1_mc`] on a given level.
+#[allow(clippy::too_many_arguments)]
+pub fn av1_mc_at(
+    level: Level,
+    src: &[u16],
+    ss: usize,
+    hf: &[i16; 8],
+    vf: &[i16; 8],
+    w: usize,
+    h: usize,
+    bit_depth: u32,
+    r0: u32,
+    r1: u32,
+    out: Av1McOut,
+) -> bool {
+    let wrap = bit_depth == 8 && r0 == 3 && vp9_wraps(hf);
+    match level {
+        #[cfg(target_arch = "aarch64")]
+        Level::Neon => av1_mc_neon::mc(src, ss, hf, vf, w, h, wrap, r0, r1, out),
+        _ => {
+            let _ = (src, ss, vf, w, h, r1, out, wrap);
+            false
+        }
+    }
 }
 
 /// Whether `rows` holds 8 rows of `n` samples `stride` apart: the vector kernels need them all
