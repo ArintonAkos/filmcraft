@@ -50,7 +50,10 @@ impl<'a> SymbolDecoder<'a> {
             _ => self.decode(cdf, n),
         };
         if !self.disable_update {
-            update_cdf(cdf, n, symbol);
+            match cdf.first_chunk_mut::<5>() {
+                Some(c) if n == 4 => update_cdf4(c, symbol),
+                _ => update_cdf(cdf, n, symbol),
+            }
         }
         symbol
     }
@@ -180,6 +183,21 @@ pub(crate) fn update_cdf(cdf: &mut [u16], n: usize, symbol: usize) {
         *e = if i < symbol { c - (c >> rate) } else { c + (((1 << 15) - c) >> rate) } as u16;
     }
     cdf[n] += (count < 32) as u16;
+}
+
+/// [`update_cdf`] of a 4 symbol CDF, its three entries written out (rate 5 + (count > 15) +
+/// (count > 31)).
+#[inline(always)]
+fn update_cdf4(cdf: &mut [u16; 5], symbol: usize) {
+    let count = cdf[4];
+    let rate = 5 + (count > 15) as u32 + (count > 31) as u32;
+    for i in 0..3 {
+        let c = cdf[i] as u32;
+        let down = c - (c >> rate);
+        let up = c + (((1 << 15) - c) >> rate);
+        cdf[i] = if i < symbol { down } else { up } as u16;
+    }
+    cdf[4] = count + (count < 32) as u16;
 }
 
 #[cfg(test)]

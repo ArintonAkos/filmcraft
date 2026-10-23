@@ -7,7 +7,7 @@ use crate::frame::{MiInfo, Mv};
 use crate::header::{FrameHeader, NONE, SequenceHeader};
 use crate::intra::{IntraParams, IntraScratch, is_directional_mode, predict_intra, round2_signed};
 use crate::spec_tables::*;
-use crate::state::{FrameShared, TileState};
+use crate::state::{FrameShared, TileState, fill_span};
 use crate::symbol::SymbolDecoder;
 use crate::transform::inverse_transform_2d;
 
@@ -447,18 +447,18 @@ impl<'a, 'f> TileDecoder<'a, 'f> {
             for y in 0..rows {
                 let i = mi.idx(r + y, c);
                 let span = i..i + cols;
-                mi.y_mode[span.clone()].fill(b.y_mode as u8);
+                fill_span(&mut mi.y_mode[span.clone()], b.y_mode as u8);
                 if set_uv {
-                    mi.uv_mode[span.clone()].fill(b.uv_mode as u8);
+                    fill_span(&mut mi.uv_mode[span.clone()], b.uv_mode as u8);
                 }
-                mi.ref_frame[span.clone()].fill(b.ref_frame);
-                mi.written[span.clone()].fill(true);
+                fill_span(&mut mi.ref_frame[span.clone()], b.ref_frame);
+                fill_span(&mut mi.written[span.clone()], true);
                 if b.is_inter {
                     if !b.use_intrabc {
-                        mi.comp_group_idx[span.clone()].fill(b.comp_group_idx);
-                        mi.compound_idx[span.clone()].fill(b.compound_idx);
+                        fill_span(&mut mi.comp_group_idx[span.clone()], b.comp_group_idx);
+                        fill_span(&mut mi.compound_idx[span.clone()], b.compound_idx);
                     }
-                    mi.interp_filter[span.clone()].fill(b.interp_filter);
+                    fill_span(&mut mi.interp_filter[span.clone()], b.interp_filter);
                     for m in mi.mv[span].iter_mut() {
                         m[0] = mvs[0];
                         if is_compound {
@@ -479,20 +479,20 @@ impl<'a, 'f> TileDecoder<'a, 'f> {
         for y in 0..rows {
             let i = mi.idx(r + y, c);
             let span = i..i + cols;
-            mi.is_inter[span.clone()].fill(b.is_inter);
-            mi.skip_mode[span.clone()].fill(b.skip_mode);
-            mi.skip[span.clone()].fill(b.skip);
-            mi.tx_size[span.clone()].fill(b.tx_size as u8);
-            mi.mi_size[span.clone()].fill(b.mi_size as u8);
-            mi.segment_id[span.clone()].fill(b.segment_id as u8);
+            fill_span(&mut mi.is_inter[span.clone()], b.is_inter);
+            fill_span(&mut mi.skip_mode[span.clone()], b.skip_mode);
+            fill_span(&mut mi.skip[span.clone()], b.skip);
+            fill_span(&mut mi.tx_size[span.clone()], b.tx_size as u8);
+            fill_span(&mut mi.mi_size[span.clone()], b.mi_size as u8);
+            fill_span(&mut mi.segment_id[span.clone()], b.segment_id as u8);
             if !mi.palette_size[0].is_empty() {
-                mi.palette_size[0][span.clone()].fill(b.palette_size_y as u8);
-                mi.palette_size[1][span.clone()].fill(b.palette_size_uv as u8);
-                mi.palette_colors[0][span.clone()].fill(b.palette_colors_y);
-                mi.palette_colors[1][span.clone()].fill(b.palette_colors_u);
+                fill_span(&mut mi.palette_size[0][span.clone()], b.palette_size_y as u8);
+                fill_span(&mut mi.palette_size[1][span.clone()], b.palette_size_uv as u8);
+                fill_span(&mut mi.palette_colors[0][span.clone()], b.palette_colors_y);
+                fill_span(&mut mi.palette_colors[1][span.clone()], b.palette_colors_u);
             }
-            mi.delta_lf[span.clone()].fill(dlf);
-            mi.motion_mode[span].fill(b.motion_mode);
+            fill_span(&mut mi.delta_lf[span.clone()], dlf);
+            fill_span(&mut mi.motion_mode[span], b.motion_mode);
         }
         Ok(())
     }
@@ -1404,16 +1404,11 @@ impl<'a, 'f> TileDecoder<'a, 'f> {
                 self.reconstruct(plane, start_x, start_y, tx_sz);
             }
         }
-        for i in 0..step_y {
-            for j in 0..step_x {
-                let rr = (row >> sub_y) + i;
-                let cc = (col >> sub_x) + j;
-                self.t.set_lf_tx_size(plane, rr, cc, tx_sz as u8);
-                let by = (sub_block_mi_row >> sub_y) + i;
-                let bx = (sub_block_mi_col >> sub_x) + j;
-                if by + 1 < 35 && bx + 1 < 35 {
-                    self.block_decoded[plane][by + 1][bx + 1] = true;
-                }
+        self.t.set_lf_tx_size(plane, row >> sub_y, col >> sub_x, step_y, step_x, tx_sz as u8);
+        let (by, bx) = ((sub_block_mi_row >> sub_y) + 1, (sub_block_mi_col >> sub_x) + 1);
+        for r in self.block_decoded[plane].iter_mut().skip(by).take(step_y) {
+            if let Some(d) = r.get_mut(bx.min(35)..(bx + step_x).min(35)) {
+                fill_span(d, true);
             }
         }
         Ok(())
@@ -1729,37 +1724,50 @@ impl<'a, 'f> TileDecoder<'a, 'f> {
             let mut nz = std::mem::take(&mut self.nonzero);
             nz.resize(eob, 0);
             let mut count = 0usize;
+            // Per coefficient: the CDFs of this block's size and plane type, and the base
+            // context offset of each position, looked up once.
+            let sd = &mut self.sd;
+            let quant = &mut self.quant;
+            let cdf = &mut *self.cdf;
+            let base_eob = &mut cdf.coeff_base_eob[tx_sz_ctx][ptype];
+            let base = &mut cdf.coeff_base[tx_sz_ctx][ptype];
+            let base_range = &mut cdf.coeff_br[tx_sz_ctx.min(TX_32X32)][ptype];
+            let offsets = base_ctx_offsets(tx_sz, tx_class);
             for c in (0..eob).rev() {
                 let pos = scan[c] as usize;
-                let row = pos >> bwl;
-                let col = pos & (width - 1);
-                let li = row * stride + col;
+                // row * stride + col, with stride = width + TX_PAD
+                let li = pos + ((pos >> bwl) * TX_PAD);
                 let mut level = if c == eob - 1 {
                     let ctx = coeff_base_eob_ctx(c, bwl, height);
-                    self.sd.read_symbol(&mut self.cdf.coeff_base_eob[tx_sz_ctx][ptype][ctx]) as i32 + 1
+                    sd.read_symbol(&mut base_eob[ctx]) as i32 + 1
                 } else {
                     let mut mag = 0u32;
                     for o in sig_off {
                         mag += (lev[li + o] as u32).min(3);
                     }
-                    let ctx = coeff_base_ctx(tx_sz, tx_class, row, col, mag);
-                    self.sd.read_symbol(&mut self.cdf.coeff_base[tx_sz_ctx][ptype][ctx]) as i32
+                    let off = offsets.get(pos).copied().unwrap_or(0);
+                    // offset 255: the DC of a 2D transform, context 0 whatever the neighbours
+                    let ctx = if off == 255 { 0 } else { ((mag + 1) >> 1).min(4) as usize + off as usize };
+                    sd.read_symbol(&mut base[ctx]) as i32
                 };
                 if level > NUM_BASE_LEVELS as i32 {
+                    // Levels are at most NUM_BASE_LEVELS + COEFF_BASE_RANGE + 1 = 15 here (the
+                    // Golomb remainders come later): the specification's clamp to 15 is a no-op.
                     let mut mag = 0u32;
                     for o in mag_off {
-                        mag += (lev[li + o] as u32).min((COEFF_BASE_RANGE + NUM_BASE_LEVELS + 1) as u32);
+                        mag += lev[li + o] as u32;
                     }
+                    let (row, col) = (pos >> bwl, pos & (width - 1));
                     let ctx = coeff_br_ctx(tx_class, row, col, pos, mag);
                     for _ in 0..(COEFF_BASE_RANGE / (BR_CDF_SIZE - 1)) {
-                        let br = self.sd.read_symbol(&mut self.cdf.coeff_br[tx_sz_ctx.min(TX_32X32)][ptype][ctx]) as i32;
+                        let br = sd.read_symbol(&mut base_range[ctx]) as i32;
                         level += br;
                         if br < (BR_CDF_SIZE - 1) as i32 {
                             break;
                         }
                     }
                 }
-                self.quant[pos] = level;
+                quant[pos] = level;
                 lev[li] = level as u8;
                 if let Some(e) = nz.get_mut(count) {
                     *e = pos as u16;
@@ -2154,6 +2162,30 @@ fn get_tx_class(t: usize) -> usize {
     }
 }
 
+/// The position part of the coefficient base context (get_coeff_base_ctx) of every position of
+/// a `tx_sz` transform of class `tx_class` (positions of its adjusted size, at most 32x32), 255
+/// for the DC of a 2D transform (context 0). The context is the offset plus
+/// Min((mag + 1) >> 1, 4).
+fn base_ctx_offsets(tx_sz: usize, tx_class: usize) -> &'static [u8] {
+    static TABLES: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+    let t = TABLES.get_or_init(|| {
+        let mut t = vec![0u8; TX_SIZES_ALL * 3 * 1024];
+        for tx in 0..TX_SIZES_ALL {
+            let bwl = TX_WIDTH_LOG2[ADJUSTED_TX_SIZE[tx] as usize] as usize;
+            for class in 0..3 {
+                for pos in 0..1024 {
+                    let (row, col) = (pos >> bwl, pos & ((1 << bwl) - 1));
+                    let i = (tx * 3 + class) * 1024 + pos;
+                    t[i] = if class == TX_CLASS_2D && pos == 0 { 255 } else { coeff_base_ctx(tx, class, row, col, 0) as u8 };
+                }
+            }
+        }
+        t
+    });
+    let i = (tx_sz * 3 + tx_class) * 1024;
+    t.get(i..i + 1024).unwrap_or(&[])
+}
+
 /// Coefficient base context from the neighbourhood magnitude `mag` (get_coeff_base_ctx).
 #[inline(always)]
 fn coeff_base_ctx(tx_sz: usize, tx_class: usize, row: usize, col: usize, mag: u32) -> usize {
@@ -2288,3 +2320,31 @@ fn palette_color_context(map: &[u8], r: usize, c: usize, n: usize) -> ([u8; 8], 
 
 #[allow(dead_code)]
 fn _unused(_: &MiInfo) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The per-position table gives get_coeff_base_ctx's context for every transform size,
+    /// class, position and neighbourhood magnitude.
+    #[test]
+    fn base_context_offsets_match_the_context_derivation() {
+        for tx in 0..TX_SIZES_ALL {
+            let adj = ADJUSTED_TX_SIZE[tx] as usize;
+            let bwl = TX_WIDTH_LOG2[adj] as usize;
+            let n = (TX_WIDTH[adj] as usize) * (TX_HEIGHT[adj] as usize);
+            for class in [TX_CLASS_2D, TX_CLASS_HORIZ, TX_CLASS_VERT] {
+                let offsets = base_ctx_offsets(tx, class);
+                assert_eq!(offsets.len(), 1024);
+                for pos in 0..n {
+                    let (row, col) = (pos >> bwl, pos & ((1 << bwl) - 1));
+                    for mag in 0..=20 {
+                        let off = offsets[pos];
+                        let got = if off == 255 { 0 } else { ((mag + 1) >> 1).min(4) as usize + off as usize };
+                        assert_eq!(got, coeff_base_ctx(tx, class, row, col, mag), "tx {tx} class {class} pos {pos} mag {mag}");
+                    }
+                }
+            }
+        }
+    }
+}
