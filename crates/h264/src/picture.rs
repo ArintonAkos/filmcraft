@@ -209,8 +209,19 @@ impl Frame {
         }
         #[cfg(not(feature = "threads"))]
         {
-            self.rows[r].get().expect("reference row decoded before use")
+            // Decoding one picture at a time publishes every row before the frame is referenced
+            // (a picture that fails has its missing rows filled with gray); should one be missing
+            // all the same, it reads as such a row rather than ending the decode.
+            self.rows[r].get_or_init(|| self.gray_row(r))
         }
+    }
+
+    /// Row `r` of a gray frame without motion: what the decoder publishes for rows a failed
+    /// picture did not decode.
+    #[cfg(not(feature = "threads"))]
+    fn gray_row(&self, r: usize) -> FrameRow {
+        let blank = vec![MbState::default(); self.mb_w * self.rows.len()];
+        Frame::make_row(&Planes::gray(self.width, self.height), r, &blank, &|_, _, _| u32::MAX, true)
     }
 
     /// Wait until the whole frame is available.
@@ -428,5 +439,25 @@ impl RefPic {
     }
     pub fn id(&self) -> u32 {
         self.frame.id
+    }
+}
+
+/// Without threads only (with them, a reader waits for the row).
+#[cfg(all(test, not(feature = "threads")))]
+mod tests {
+    use super::*;
+
+    /// Without threads, a row that was never published reads as a gray row without motion
+    /// instead of panicking (it used to `expect` it).
+    #[test]
+    fn unpublished_row_reads_as_gray_without_threads() {
+        let f = Frame::new(1, 0, 2, 3);
+        let row = f.row(1);
+        assert_eq!(row.y.len(), 16 * 32);
+        assert!(row.y.iter().all(|&v| v == 128));
+        assert!(row.mv[0].iter().all(|&m| m == [0, 0]));
+        let mut out = vec![0u8; 8 * 8];
+        f.luma_window(4, 20, 8, 8, &mut out, 8);
+        assert!(out.iter().all(|&v| v == 128));
     }
 }
