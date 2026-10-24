@@ -164,3 +164,31 @@ pub(crate) fn cdef_filter(buf: &[u16; CDEF_STRIDE * CDEF_STRIDE], w: usize, h: u
         }
     }
 }
+
+/// See [`crate::av1_rows_to_lanes`].
+pub(crate) fn av1_rows_to_lanes(src: &[i32], stride: usize, cols: usize, out: &mut [[i16; 8]]) -> bool {
+    let src_ok = stride >= cols && 7usize.checked_mul(stride).and_then(|n| n.checked_add(cols)).is_some_and(|n| n <= src.len());
+    if !cols.is_multiple_of(8) || out.len() < cols || !src_ok {
+        return false;
+    }
+    for (j, o) in out[..cols].iter_mut().enumerate() {
+        for (l, v) in o.iter_mut().enumerate() {
+            *v = src[l * stride + j] as i16;
+        }
+    }
+    true
+}
+
+/// See [`crate::av1_lanes_to_rows`].
+pub(crate) fn av1_lanes_to_rows(t: &[[i16; 8]], cols: usize, shift: u32, dst: &mut [i32], stride: usize) -> bool {
+    let dst_ok = stride >= cols && 7usize.checked_mul(stride).and_then(|n| n.checked_add(cols)).is_some_and(|n| n <= dst.len());
+    if !cols.is_multiple_of(8) || t.len() < cols || !dst_ok || shift > 16 {
+        return false;
+    }
+    for (j, lanes) in t[..cols].iter().enumerate() {
+        for (l, &v) in lanes.iter().enumerate() {
+            dst[l * stride + j] = (v as i32 + (1 << shift >> 1)) >> shift;
+        }
+    }
+    true
+}

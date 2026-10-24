@@ -870,3 +870,50 @@ fn av1_inter_prediction_declines_blocks_whose_loads_leave_the_source() {
         assert!(dst.iter().all(|&v| v == 7));
     }
 }
+
+#[test]
+fn every_level_transposes_av1_transform_rows_like_the_definition() {
+    let mut seed = 0x77a5_9e01u32;
+    let mut next = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        seed
+    };
+    for &level in levels() {
+        for cols in [8usize, 16, 32, 64] {
+            for shift in [0u32, 1, 2, 3, 16] {
+                let stride = cols + (next() % 9) as usize;
+                let src: Vec<i32> = (0..7 * stride + cols).map(|_| (next() % 65536) as i32 - 32768).collect();
+                let mut lanes = vec![[0i16; 8]; cols];
+                assert!(av1_rows_to_lanes_at(level, &src, stride, cols, &mut lanes));
+                for j in 0..cols {
+                    for l in 0..8 {
+                        assert_eq!(lanes[j][l], src[l * stride + j] as i16, "{level:?} cols {cols} ({j}, {l})");
+                    }
+                }
+                let mut dst = vec![7i32; 7 * stride + cols + 3];
+                assert!(av1_lanes_to_rows_at(level, &lanes, cols, shift, &mut dst, stride));
+                for l in 0..8 {
+                    for j in 0..stride {
+                        let want = if j < cols {
+                            (lanes[j][l] as i32 + (1 << shift >> 1)) >> shift
+                        } else if l < 7 {
+                            7
+                        } else {
+                            continue;
+                        };
+                        assert_eq!(dst[l * stride + j], want, "{level:?} cols {cols} shift {shift} ({j}, {l})");
+                    }
+                }
+                // too short a source or destination: nothing written
+                let mut out = vec![[1i16; 8]; cols];
+                assert!(!av1_rows_to_lanes_at(level, &src[..7 * stride + cols - 1], stride, cols, &mut out));
+                assert!(out.iter().all(|o| *o == [1; 8]));
+                let mut short = vec![9i32; 7 * stride + cols - 1];
+                assert!(!av1_lanes_to_rows_at(level, &lanes, cols, shift, &mut short, stride));
+                assert!(short.iter().all(|&v| v == 9));
+            }
+        }
+    }
+}

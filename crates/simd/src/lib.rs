@@ -27,6 +27,10 @@ mod vp9;
 
 #[cfg(target_arch = "aarch64")]
 #[allow(unsafe_code)]
+mod av1_itx_neon;
+
+#[cfg(target_arch = "aarch64")]
+#[allow(unsafe_code)]
 mod av1_mc_neon;
 
 #[cfg(target_arch = "aarch64")]
@@ -296,6 +300,38 @@ pub fn subpel_h_at(level: Level, src: &[u16], taps: &[i16; 8], out: &mut [i16], 
 /// count as zero.
 pub fn subpel_v(rows: &[i16], stride: usize, taps: &[i16; 8], out: &mut [i32], shift: u32) {
     subpel_v_at(level(), rows, stride, taps, out, shift);
+}
+
+/// The AV1 inverse transform's row pass input, 8 rows at a time: `out[j][l]` = `src[l * stride
+/// + j]` narrowed to 16 bits (wrapping; dequantised 8-bit coefficients fit), for the `cols`
+/// (a multiple of 8) columns. Returns false, writing nothing, when `src` or `out` is too short.
+pub fn av1_rows_to_lanes(src: &[i32], stride: usize, cols: usize, out: &mut [[i16; 8]]) -> bool {
+    av1_rows_to_lanes_at(level(), src, stride, cols, out)
+}
+
+/// [`av1_rows_to_lanes`] on a given level.
+pub fn av1_rows_to_lanes_at(level: Level, src: &[i32], stride: usize, cols: usize, out: &mut [[i16; 8]]) -> bool {
+    match level {
+        #[cfg(target_arch = "aarch64")]
+        Level::Neon => av1_itx_neon::rows_to_lanes(src, stride, cols, out),
+        _ => scalar::av1_rows_to_lanes(src, stride, cols, out),
+    }
+}
+
+/// The AV1 inverse transform's row pass output, 8 rows at a time: `dst[l * stride + j]` =
+/// Round2(`t[j][l]`, `shift`) for the `cols` (a multiple of 8) columns. Returns false, writing
+/// nothing, when `t` or `dst` is too short or `shift` > 16.
+pub fn av1_lanes_to_rows(t: &[[i16; 8]], cols: usize, shift: u32, dst: &mut [i32], stride: usize) -> bool {
+    av1_lanes_to_rows_at(level(), t, cols, shift, dst, stride)
+}
+
+/// [`av1_lanes_to_rows`] on a given level.
+pub fn av1_lanes_to_rows_at(level: Level, t: &[[i16; 8]], cols: usize, shift: u32, dst: &mut [i32], stride: usize) -> bool {
+    match level {
+        #[cfg(target_arch = "aarch64")]
+        Level::Neon => av1_itx_neon::lanes_to_rows(t, cols, shift, dst, stride),
+        _ => scalar::av1_lanes_to_rows(t, cols, shift, dst, stride),
+    }
 }
 
 /// Where [`av1_mc`] writes a block's prediction.
