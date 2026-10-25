@@ -41,6 +41,7 @@ and `filmcraft-cli`.
 | `geom` | L0 | `Vec2`, `Rect`, `Affine`, Motion-transform composition |
 | `color` | L0 | colour spaces, transfer functions, YUV↔RGB matrices, LUTs |
 | `bitstream` | L0 | bit reader/writer, Exp-Golomb, emulation prevention |
+| `simd` | L0 | hand-written SIMD kernels for the codecs' hot loops (NEON on aarch64, SSE2 on x86_64; scalar on wasm and other targets), each bit-identical to its scalar twin behind a safe API; one of the two crates allowed `unsafe`, for vector intrinsics only ([ADR 0002](adr/0002-simd-crate-and-unsafe-policy.md)) |
 | `isobmff` | L0 | MP4/MOV demux and mux |
 | `matroska` | L0 | MKV/WebM demux |
 | `mxf` | L0 | MXF demux and mux (SMPTE ST 377-1): OP1a / OP-Atom, index tables, AVC / VC-3 / ProRes / MPEG-2 identification, PCM / AES3 sound, timecode; writer for OP1a / OP-Atom with VC-3, ProRes, AVC and PCM ([README](../crates/mxf/README.md)) |
