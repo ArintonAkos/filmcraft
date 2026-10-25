@@ -20,8 +20,7 @@ fn cdef_direction_sse2(rows: &[&[u16; 8]; 8], shift: u32) -> (usize, i32) {
     let centre = _mm_set1_epi16(128);
     let ones = _mm_set1_epi16(1);
     let load = |r: &[u16; 8]| -> __m128i {
-        // SAFETY: `r` is 8 u16, the 16 bytes `_mm_loadu_si128` reads (unaligned load).
-        let v = unsafe { _mm_loadu_si128(r.as_ptr().cast()) };
+        let v: __m128i = bytemuck::must_cast(*r);
         _mm_sub_epi16(_mm_srl_epi16(v, down), centre)
     };
     // Add `v` to the line sum (lo, hi) starting at lane `o`.
@@ -167,23 +166,20 @@ fn lanes(on: u8) -> V {
 }
 #[target_feature(enable = "sse2")]
 fn load4(s: &[u16; 4]) -> V {
-    // SAFETY: `s` is 4 u16, the 8 bytes `_mm_loadl_epi64` reads (unaligned load).
-    unsafe { _mm_loadl_epi64(s.as_ptr().cast()) }
+    bytemuck::must_cast([s[0], s[1], s[2], s[3], 0, 0, 0, 0])
 }
 #[target_feature(enable = "sse2")]
 fn store4(v: V, s: &mut [u16; 4]) {
-    // SAFETY: `s` is 4 u16, the 8 bytes `_mm_storel_epi64` writes (unaligned store).
-    unsafe { _mm_storel_epi64(s.as_mut_ptr().cast(), v) }
+    let a: [u16; 8] = bytemuck::must_cast(v);
+    *s = [a[0], a[1], a[2], a[3]];
 }
 #[target_feature(enable = "sse2")]
 fn load8(s: &[u16; 8]) -> V {
-    // SAFETY: `s` is 8 u16, the 16 bytes `_mm_loadu_si128` reads (unaligned load).
-    unsafe { _mm_loadu_si128(s.as_ptr().cast()) }
+    bytemuck::must_cast(*s)
 }
 #[target_feature(enable = "sse2")]
 fn store8(v: V, s: &mut [u16; 8]) {
-    // SAFETY: `s` is 8 u16, the 16 bytes `_mm_storeu_si128` writes (unaligned store).
-    unsafe { _mm_storeu_si128(s.as_mut_ptr().cast(), v) }
+    *s = bytemuck::must_cast(v);
 }
 /// 8 rows of 8 to 8 columns of 8 (and back: it is its own inverse).
 #[target_feature(enable = "sse2")]
@@ -233,8 +229,7 @@ fn subpel_h_sse2(src: &[u16], taps: &[i16; 8], out: &mut [i16], shift: u32) {
         }
         if let Some(o) = out.get_mut(j..).and_then(|o| o.first_chunk_mut::<8>()) {
             let r = _mm_packs_epi32(_mm_sra_epi32(lo, cnt), _mm_sra_epi32(hi, cnt));
-            // SAFETY: `o` is 8 i16, the 16 bytes `_mm_storeu_si128` writes (unaligned store).
-            unsafe { _mm_storeu_si128(o.as_mut_ptr().cast(), r) };
+            *o = bytemuck::must_cast(r);
         }
         j += 8;
     }
@@ -249,8 +244,8 @@ fn subpel_h_sse2(src: &[u16], taps: &[i16; 8], out: &mut [i16], shift: u32) {
         }
         if let Some(o) = out.get_mut(j..).and_then(|o| o.first_chunk_mut::<4>()) {
             let r = _mm_packs_epi32(_mm_sra_epi32(lo, cnt), lo);
-            // SAFETY: `o` is 4 i16, the 8 bytes `_mm_storel_epi64` writes (unaligned store).
-            unsafe { _mm_storel_epi64(o.as_mut_ptr().cast(), r) };
+            let a: [i16; 8] = bytemuck::must_cast(r);
+            *o = [a[0], a[1], a[2], a[3]];
         }
         j += 4;
     }
@@ -291,11 +286,9 @@ fn subpel_v_sse2(rows: &[i16], stride: usize, taps: &[i16; 8], out: &mut [i32], 
         let Some(o) = out.get_mut(j..).and_then(|o| o.first_chunk_mut::<4>()) else {
             return;
         };
-        // SAFETY: `o` is 4 i32, the 16 bytes `_mm_storeu_si128` writes (unaligned store).
-        unsafe { _mm_storeu_si128(o.as_mut_ptr().cast(), _mm_sra_epi32(lo, cnt)) };
+        *o = bytemuck::must_cast(_mm_sra_epi32(lo, cnt));
         if wide && let Some(o) = out.get_mut(j + 4..).and_then(|o| o.first_chunk_mut::<4>()) {
-            // SAFETY: as above, the next 4 i32.
-            unsafe { _mm_storeu_si128(o.as_mut_ptr().cast(), _mm_sra_epi32(hi, cnt)) };
+            *o = bytemuck::must_cast(_mm_sra_epi32(hi, cnt));
         }
         j += if wide { 8 } else { 4 };
     }
@@ -306,14 +299,12 @@ fn subpel_v_sse2(rows: &[i16], stride: usize, taps: &[i16; 8], out: &mut [i32], 
 
 #[target_feature(enable = "sse2")]
 fn load8_i16(s: &[i16; 8]) -> V {
-    // SAFETY: `s` is 8 i16, the 16 bytes `_mm_loadu_si128` reads (unaligned load).
-    unsafe { _mm_loadu_si128(s.as_ptr().cast()) }
+    bytemuck::must_cast(*s)
 }
 
 #[target_feature(enable = "sse2")]
 fn load4_i16(s: &[i16; 4]) -> V {
-    // SAFETY: `s` is 4 i16, the 8 bytes `_mm_loadl_epi64` reads (unaligned load).
-    unsafe { _mm_loadl_epi64(s.as_ptr().cast()) }
+    bytemuck::must_cast([s[0], s[1], s[2], s[3], 0, 0, 0, 0])
 }
 
 /// See [`crate::cdef_filter`]: 8-wide blocks a row per vector, 4-wide ones two rows; `false`

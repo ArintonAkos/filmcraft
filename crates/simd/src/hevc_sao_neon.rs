@@ -53,8 +53,7 @@ fn st(s: &mut [u8], o: usize, v: uint8x16_t) {
 
 #[target_feature(enable = "neon")]
 fn band_v(src: &[u8], dst: &mut [u8], n: usize, table: &[i8; 32]) {
-    // SAFETY: `table` is the 32 bytes the two `vld1q_s8` read.
-    let t = unsafe { int8x16x2_t(vld1q_s8(table.as_ptr()), vld1q_s8(table.as_ptr().add(16))) };
+    let t: int8x16x2_t = bytemuck::must_cast(*table);
     for o in starts(n) {
         let v = ld(src, o);
         st(dst, o, vsqaddq_u8(v, vqtbl2q_s8(t, vshrq_n_u8::<3>(v))));
@@ -71,8 +70,7 @@ fn sign(v: uint8x16_t, a: uint8x16_t) -> int8x16_t {
 fn edge_v(cur: &[u8], a: &[u8], b: &[u8], dst: &mut [u8], n: usize, offs: &[i8; 5]) {
     let mut t = [0i8; 16];
     t[..5].copy_from_slice(offs);
-    // SAFETY: `t` is the 16 bytes `vld1q_s8` reads.
-    let t = unsafe { vld1q_s8(t.as_ptr()) };
+    let t: int8x16_t = bytemuck::must_cast(t);
     let two = vdupq_n_s8(2);
     for o in starts(n) {
         let v = ld(cur, o);

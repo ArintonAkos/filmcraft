@@ -102,9 +102,7 @@ fn store<const N: usize>(d: &mut [u8], o: usize, v: uint16x8_t) {
         // SAFETY: `predict` checked (h - 1) * ds + w <= d.len(); o + 8 <= r * ds + w.
         unsafe { vst1_u8(d.as_mut_ptr().add(o), v) };
     } else {
-        let mut t = [0u8; 8];
-        // SAFETY: `t` is the 8 bytes `vst1_u8` writes.
-        unsafe { vst1_u8(t.as_mut_ptr(), v) };
+        let t: [u8; 8] = bytemuck::must_cast(v);
         if let Some(d) = d.get_mut(o..o + 4) {
             d.copy_from_slice(&t[..4]);
         }

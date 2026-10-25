@@ -53,8 +53,7 @@ fn rows_to_lanes_v(src: &[i32], stride: usize, cols: usize, out: &mut [[i16; 8]]
             vcombine_s16(vmovn_s32(a), vmovn_s32(b))
         });
         for (k, v) in transpose(rows).into_iter().enumerate() {
-            // SAFETY: j0 + k < cols <= out.len(); `out[j0 + k]` is the 8 i16 `vst1q_s16` writes.
-            unsafe { vst1q_s16(out[j0 + k].as_mut_ptr(), v) };
+            out[j0 + k] = bytemuck::must_cast(v);
         }
     }
 }
@@ -63,8 +62,7 @@ fn rows_to_lanes_v(src: &[i32], stride: usize, cols: usize, out: &mut [[i16; 8]]
 fn lanes_to_rows_v(t: &[[i16; 8]], cols: usize, shift: u32, dst: &mut [i32], stride: usize) {
     let sh = vdupq_n_s32(-(shift as i32));
     for j0 in (0..cols).step_by(8) {
-        // SAFETY: j0 + k < cols <= t.len(); `t[j0 + k]` is the 8 i16 `vld1q_s16` reads.
-        let lanes: [int16x8_t; 8] = std::array::from_fn(|k| unsafe { vld1q_s16(t[j0 + k].as_ptr()) });
+        let lanes: [int16x8_t; 8] = std::array::from_fn(|k| bytemuck::must_cast(t[j0 + k]));
         for (l, v) in transpose(lanes).into_iter().enumerate() {
             let o = l * stride + j0;
             debug_assert!(o + 8 <= dst.len());

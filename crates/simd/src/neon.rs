@@ -19,8 +19,7 @@ fn cdef_direction_neon(rows: &[&[u16; 8]; 8], shift: u32) -> (usize, i32) {
     let down = vdupq_n_s16(-(shift as i16));
     let centre = vdupq_n_s16(128);
     let load = |r: &[u16; 8]| -> int16x8_t {
-        // SAFETY: `r` is 8 u16, the 16 bytes `vld1q_u16` reads.
-        let v = unsafe { vld1q_u16(r.as_ptr()) };
+        let v: uint16x8_t = bytemuck::must_cast(*r);
         vsubq_s16(vreinterpretq_s16_u16(vshlq_u16(v, down)), centre)
     };
     // Add `v` to the line sum (lo, hi) starting at lane `o`.
@@ -158,30 +157,25 @@ fn any(m: V) -> bool {
 #[target_feature(enable = "neon")]
 fn lanes(on: u8) -> V {
     const BITS: [i16; 8] = [1, 2, 4, 8, 16, 32, 64, 128];
-    // SAFETY: `BITS` is 8 i16, the 16 bytes `vld1q_s16` reads.
-    let bits = unsafe { vld1q_s16(BITS.as_ptr()) };
+    let bits: int16x8_t = bytemuck::must_cast(BITS);
     vreinterpretq_s16_u16(vtstq_s16(vdupq_n_s16(on as i16), bits))
 }
 #[target_feature(enable = "neon")]
 fn load4(s: &[u16; 4]) -> V {
-    // SAFETY: `s` is 4 u16, the 8 bytes `vld1_u16` reads.
-    let v = unsafe { vld1_u16(s.as_ptr()) };
+    let v: uint16x4_t = bytemuck::must_cast(*s);
     vreinterpretq_s16_u16(vcombine_u16(v, vdup_n_u16(0)))
 }
 #[target_feature(enable = "neon")]
 fn store4(v: V, s: &mut [u16; 4]) {
-    // SAFETY: `s` is 4 u16, the 8 bytes `vst1_u16` writes.
-    unsafe { vst1_u16(s.as_mut_ptr(), vget_low_u16(vreinterpretq_u16_s16(v))) }
+    *s = bytemuck::must_cast(vget_low_u16(vreinterpretq_u16_s16(v)));
 }
 #[target_feature(enable = "neon")]
 fn load8(s: &[u16; 8]) -> V {
-    // SAFETY: `s` is 8 u16, the 16 bytes `vld1q_u16` reads.
-    vreinterpretq_s16_u16(unsafe { vld1q_u16(s.as_ptr()) })
+    vreinterpretq_s16_u16(bytemuck::must_cast(*s))
 }
 #[target_feature(enable = "neon")]
 fn store8(v: V, s: &mut [u16; 8]) {
-    // SAFETY: `s` is 8 u16, the 16 bytes `vst1q_u16` writes.
-    unsafe { vst1q_u16(s.as_mut_ptr(), vreinterpretq_u16_s16(v)) }
+    *s = bytemuck::must_cast(vreinterpretq_u16_s16(v));
 }
 /// 8 rows of 8 to 8 columns of 8 (and back: it is its own inverse).
 #[target_feature(enable = "neon")]
@@ -218,15 +212,13 @@ fn subpel_h_neon(src: &[u16], taps: &[i16; 8], out: &mut [i16], shift: u32) {
             let Some(s) = src.get(j + t..).and_then(|s| s.first_chunk::<8>()) else {
                 return;
             };
-            // SAFETY: `s` is 8 u16, the 16 bytes `vld1q_u16` reads.
-            let v = vreinterpretq_s16_u16(unsafe { vld1q_u16(s.as_ptr()) });
+            let v = vreinterpretq_s16_u16(bytemuck::must_cast(*s));
             lo = vmlal_n_s16(lo, vget_low_s16(v), f);
             hi = vmlal_high_n_s16(hi, v, f);
         }
         let r = vcombine_s16(vmovn_s32(vrshlq_s32(lo, sh)), vmovn_s32(vrshlq_s32(hi, sh)));
         if let Some(o) = out.get_mut(j..).and_then(|o| o.first_chunk_mut::<8>()) {
-            // SAFETY: `o` is 8 i16, the 16 bytes `vst1q_s16` writes.
-            unsafe { vst1q_s16(o.as_mut_ptr(), r) };
+            *o = bytemuck::must_cast(r);
         }
         j += 8;
     }
@@ -236,12 +228,10 @@ fn subpel_h_neon(src: &[u16], taps: &[i16; 8], out: &mut [i16], shift: u32) {
             let Some(s) = src.get(j + t..).and_then(|s| s.first_chunk::<4>()) else {
                 return;
             };
-            // SAFETY: `s` is 4 u16, the 8 bytes `vld1_u16` reads.
-            lo = vmlal_n_s16(lo, vreinterpret_s16_u16(unsafe { vld1_u16(s.as_ptr()) }), f);
+            lo = vmlal_n_s16(lo, vreinterpret_s16_u16(bytemuck::must_cast(*s)), f);
         }
         if let Some(o) = out.get_mut(j..).and_then(|o| o.first_chunk_mut::<4>()) {
-            // SAFETY: `o` is 4 i16, the 8 bytes `vst1_s16` writes.
-            unsafe { vst1_s16(o.as_mut_ptr(), vmovn_s32(vrshlq_s32(lo, sh))) };
+            *o = bytemuck::must_cast(vmovn_s32(vrshlq_s32(lo, sh)));
         }
         j += 4;
     }
@@ -267,17 +257,12 @@ fn subpel_v_neon(rows: &[i16], stride: usize, taps: &[i16; 8], out: &mut [i32], 
             let Some(s) = rows.get(t * stride + j..).and_then(|s| s.first_chunk::<8>()) else {
                 return;
             };
-            // SAFETY: `s` is 8 i16, the 16 bytes `vld1q_s16` reads.
-            let v = unsafe { vld1q_s16(s.as_ptr()) };
+            let v: int16x8_t = bytemuck::must_cast(*s);
             lo = vmlal_n_s16(lo, vget_low_s16(v), f);
             hi = vmlal_high_n_s16(hi, v, f);
         }
         if let Some(o) = out.get_mut(j..).and_then(|o| o.first_chunk_mut::<8>()) {
-            // SAFETY: `o` is 8 i32; the stores write its first and last 4 (16 bytes each).
-            unsafe {
-                vst1q_s32(o.as_mut_ptr(), vrshlq_s32(lo, sh));
-                vst1q_s32(o.as_mut_ptr().add(4), vrshlq_s32(hi, sh));
-            }
+            *o = bytemuck::must_cast([vrshlq_s32(lo, sh), vrshlq_s32(hi, sh)]);
         }
         j += 8;
     }
@@ -287,12 +272,10 @@ fn subpel_v_neon(rows: &[i16], stride: usize, taps: &[i16; 8], out: &mut [i32], 
             let Some(s) = rows.get(t * stride + j..).and_then(|s| s.first_chunk::<4>()) else {
                 return;
             };
-            // SAFETY: `s` is 4 i16, the 8 bytes `vld1_s16` reads.
-            lo = vmlal_n_s16(lo, unsafe { vld1_s16(s.as_ptr()) }, f);
+            lo = vmlal_n_s16(lo, bytemuck::must_cast(*s), f);
         }
         if let Some(o) = out.get_mut(j..).and_then(|o| o.first_chunk_mut::<4>()) {
-            // SAFETY: `o` is 4 i32, the 16 bytes `vst1q_s32` writes.
-            unsafe { vst1q_s32(o.as_mut_ptr(), vrshlq_s32(lo, sh)) };
+            *o = bytemuck::must_cast(vrshlq_s32(lo, sh));
         }
         j += 4;
     }
@@ -324,8 +307,7 @@ fn cdef_rows<const W: usize>(buf: &[u16; CDEF_STRIDE * CDEF_STRIDE], start: usiz
     }
     let a = buf.get(start..)?.first_chunk::<4>()?;
     let b = buf.get(start + CDEF_STRIDE..)?.first_chunk::<4>()?;
-    // SAFETY: `a` and `b` are 4 u16 each, the 8 bytes each `vld1_u16` reads.
-    let (a, b) = unsafe { (vld1_u16(a.as_ptr()), vld1_u16(b.as_ptr())) };
+    let (a, b): (uint16x4_t, uint16x4_t) = (bytemuck::must_cast(*a), bytemuck::must_cast(*b));
     Some(vreinterpretq_s16_u16(vcombine_u16(a, b)))
 }
 

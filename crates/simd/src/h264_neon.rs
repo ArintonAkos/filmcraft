@@ -516,8 +516,7 @@ fn filter(s: &mut [uint8x16_t; 8], e: &crate::H264Edge, chroma: bool, pair: bool
             tc_b[i] = t;
         }
     }
-    // SAFETY: `on_b` and `tc_b` are 16 bytes, the 16 bytes `vld1q_u8` reads.
-    let (bs_on, tc0) = unsafe { (vld1q_u8(on_b.as_ptr()), vld1q_u8(tc_b.as_ptr())) };
+    let (bs_on, tc0): (uint8x16_t, uint8x16_t) = (bytemuck::must_cast(on_b), bytemuck::must_cast(tc_b));
     let (alpha, beta) = (vdupq_n_u8(e.alpha), vdupq_n_u8(e.beta));
     let on = vandq_u8(vandq_u8(bs_on, vcltq_u8(vabdq_u8(p0, q0), alpha)), vandq_u8(vcltq_u8(vabdq_u8(p1, p0), beta), vcltq_u8(vabdq_u8(q1, q0), beta)));
     if vmaxvq_u8(on) == 0 {

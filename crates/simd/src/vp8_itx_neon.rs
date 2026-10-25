@@ -29,8 +29,7 @@ pub(crate) fn idct_add(coefs: &[i16; 16], dst: &mut [u8], pos: usize, stride: us
 
 #[target_feature(enable = "neon")]
 fn block(coefs: &[i16; 16], px: &mut [u8; 16]) {
-    // SAFETY: `coefs` is 16 i16 and `px` 16 bytes, what the loads read.
-    let (c01, c23, p) = unsafe { (vld1q_s16(coefs.as_ptr()), vld1q_s16(coefs.as_ptr().add(8)), vld1q_u8(px.as_ptr())) };
+    let ([c01, c23], p): ([int16x8_t; 2], uint8x16_t) = (bytemuck::must_cast(*coefs), bytemuck::must_cast(*px));
     let ac = vorrq_s16(vsetq_lane_s16::<0>(0, c01), c23);
     let res: [int16x8_t; 2] = if vmaxvq_u16(vreinterpretq_u16_s16(vabsq_s16(ac))) == 0 {
         // DC only: every residue sample is (dc + 4) >> 3
@@ -48,8 +47,7 @@ fn block(coefs: &[i16; 16], px: &mut [u8; 16]) {
     // add to the prediction (rows 0, 1 then 2, 3), saturating to 8 bits
     let lo = vqaddq_s16(vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(p))), res[0]);
     let hi = vqaddq_s16(vreinterpretq_s16_u16(vmovl_high_u8(p)), res[1]);
-    // SAFETY: `px` is the 16 bytes `vst1q_u8` writes.
-    unsafe { vst1q_u8(px.as_mut_ptr(), vcombine_u8(vqmovun_s16(lo), vqmovun_s16(hi))) };
+    *px = bytemuck::must_cast(vcombine_u8(vqmovun_s16(lo), vqmovun_s16(hi)));
 }
 
 /// One pass of 14.4 over four inputs ip(0..4) (vectors of 4 lanes): the outputs 0..4 in order.

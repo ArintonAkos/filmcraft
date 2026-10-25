@@ -19,3 +19,7 @@ too_many_arguments = "allow"
 needless_range_loop = "allow"
 type_complexity = "allow"
 undocumented_unsafe_blocks = "deny"
+
+[dependencies]
+# Casts between whole arrays and vector registers (`must_cast`: sizes checked at compile time).
+bytemuck = { workspace = true, features = ["must_cast", "aarch64_simd"] }

@@ -96,8 +96,7 @@ fn ld4(s: &[u16], o: usize) -> uint16x4_t {
 
 #[target_feature(enable = "neon")]
 fn taps_s16(f: &[i16; 8]) -> int16x8_t {
-    // SAFETY: `f` is 8 samples, the 8 `vld1q_s16` reads.
-    unsafe { vld1q_s16(f.as_ptr()) }
+    bytemuck::must_cast(*f)
 }
 
 /// The 8-tap filter of 8 lanes, `x[t]` the samples under tap t. `WRAP`: sums modulo 2^16 (see

@@ -64,8 +64,7 @@ fn transpose(r: [uint8x8_t; 8]) -> [uint8x8_t; 8] {
 fn seg<const LINE: u8>(v: int16x8_t) -> int16x8_t {
     let (a, b) = (2 * LINE, 2 * LINE + 1);
     let idx = [a, b, a, b, a, b, a, b, a + 8, b + 8, a + 8, b + 8, a + 8, b + 8, a + 8, b + 8];
-    // SAFETY: `idx` is the 16 bytes `vld1q_u8` reads.
-    let t = unsafe { vld1q_u8(idx.as_ptr()) };
+    let t: uint8x16_t = bytemuck::must_cast(idx);
     vreinterpretq_s16_u8(vqtbl1q_u8(vreinterpretq_u8_s16(v), t))
 }
 
