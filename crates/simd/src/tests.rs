@@ -917,3 +917,213 @@ fn every_level_transposes_av1_transform_rows_like_the_definition() {
         }
     }
 }
+
+/// 8.7.3 band offset sample by sample: `table[sample >> 3]` added with Clip1 (8-bit).
+fn spec_sao_band(src: &[u8], table: &[i32; 32]) -> Vec<u8> {
+    src.iter().map(|&v| (v as i32 + table[v as usize >> 3]).clamp(0, 255) as u8).collect()
+}
+
+/// 8.7.3 edge offset sample by sample: `offsets[2 + Sign(cur - a) + Sign(cur - b)]` added with
+/// Clip1 (8-bit).
+fn spec_sao_edge(cur: &[u8], a: &[u8], b: &[u8], offsets: &[i32; 5]) -> Vec<u8> {
+    let sign = |d: i32| d.signum();
+    (0..cur.len())
+        .map(|i| {
+            let (v, p, q) = (cur[i] as i32, a[i] as i32, b[i] as i32);
+            (v + offsets[(2 + sign(v - p) + sign(v - q)) as usize]).clamp(0, 255) as u8
+        })
+        .collect()
+}
+
+/// Random 8-bit samples, often at 0, 255 or equal to their neighbour (edge offset's Sign 0).
+fn sao_samples(n: usize, next: &mut dyn FnMut() -> u32) -> Vec<u8> {
+    (0..n)
+        .map(|_| match next() % 6 {
+            0 => 0,
+            1 => 255,
+            2 => 128,
+            _ => next() as u8,
+        })
+        .collect()
+}
+
+#[test]
+fn every_level_matches_the_spec_hevc_sao() {
+    let mut seed = 0x5a0_ed9eu32;
+    let mut next = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        seed
+    };
+    let mut ran = 0;
+    for &level in levels() {
+        for n in (16..=80).chain([128, 1920]) {
+            // band offset: the four offsets at a random start band, the others 0
+            let mut table = [0i32; 32];
+            let start = next() as usize % 29;
+            for k in 0..4 {
+                table[start + k] = (next() % 256) as i32 - 128;
+            }
+            let src = sao_samples(n, &mut next);
+            let mut dst = vec![7u8; n + 5];
+            let done = hevc_sao_band8_at(level, &src, &mut dst, &table);
+            if level != Level::Neon {
+                assert!(!done && dst.iter().all(|&v| v == 7), "{level:?} band n {n}");
+            } else {
+                assert!(done, "band n {n}");
+                assert_eq!(&dst[..n], &spec_sao_band(&src, &table)[..], "band n {n} table {table:?}");
+                assert!(dst[n..].iter().all(|&v| v == 7), "band n {n}: wrote past the run");
+                ran += 1;
+            }
+            // edge offset: neighbours often equal to the sample
+            let cur = sao_samples(n, &mut next);
+            let near = |next: &mut dyn FnMut() -> u32| -> Vec<u8> { cur.iter().map(|&v| if next().is_multiple_of(3) { v } else { next() as u8 }).collect() };
+            let (a, b) = (near(&mut next), near(&mut next));
+            let offsets: [i32; 5] = std::array::from_fn(|_| (next() % 256) as i32 - 128);
+            let mut dst = vec![7u8; n + 5];
+            let done = hevc_sao_edge8_at(level, &cur, &a, &b, &mut dst, &offsets);
+            if level != Level::Neon {
+                assert!(!done && dst.iter().all(|&v| v == 7), "{level:?} edge n {n}");
+            } else {
+                assert!(done, "edge n {n}");
+                assert_eq!(&dst[..n], &spec_sao_edge(&cur, &a, &b, &offsets)[..], "edge n {n} offsets {offsets:?}");
+                assert!(dst[n..].iter().all(|&v| v == 7), "edge n {n}: wrote past the run");
+                ran += 1;
+            }
+        }
+    }
+    assert!(ran > 0 || !cfg!(target_arch = "aarch64"));
+}
+
+#[test]
+fn hevc_sao_declines_what_it_cannot_take() {
+    for &level in levels() {
+        let src = vec![100u8; 40];
+        let table = [3i32; 32];
+        // runs shorter than 16, a short destination, offsets outside i8
+        for (src, dlen, table) in [(&src[..15], 40, table), (&src[..], 39, table), (&src[..], 40, [200i32; 32])] {
+            let mut dst = vec![7u8; dlen];
+            assert!(!hevc_sao_band8_at(level, src, &mut dst, &table), "{level:?}");
+            assert!(dst.iter().all(|&v| v == 7));
+        }
+        let offsets = [1i32, 2, 0, -2, -1];
+        let mut dst = vec![7u8; 40];
+        assert!(!hevc_sao_edge8_at(level, &src[..15], &src[..15], &src[..15], &mut dst, &offsets), "{level:?}");
+        assert!(!hevc_sao_edge8_at(level, &src, &src[..39], &src, &mut dst, &offsets), "{level:?}");
+        assert!(!hevc_sao_edge8_at(level, &src, &src, &src, &mut dst, &[1, 2, 0, -2, -129]), "{level:?}");
+        assert!(dst.iter().all(|&v| v == 7));
+    }
+}
+
+/// 18.3 sample by sample: the horizontal six-tap pass over the rows the vertical one reads (or the
+/// samples themselves without a horizontal filter), then the vertical pass; each pass is
+/// (sum + 64) >> 7 clipped to 0..=255. `src` is the window from (x - 2, y - 2).
+fn spec_vp8_predict(src: &[u8], ss: usize, fh: Option<&[i16; 6]>, fv: Option<&[i16; 6]>, w: usize, h: usize) -> Vec<u8> {
+    let pass = |sum: i32| ((sum + 64) >> 7).clamp(0, 255);
+    let first = |r: usize, c: usize| -> i32 {
+        match fh {
+            Some(f) => pass((0..6).map(|t| f[t] as i32 * src[r * ss + c + t] as i32).sum()),
+            None => src[r * ss + c + 2] as i32,
+        }
+    };
+    let mut out = vec![0u8; w * h];
+    for r in 0..h {
+        for c in 0..w {
+            out[r * w + c] = match fv {
+                Some(f) => pass((0..6).map(|t| f[t] as i32 * first(r + t, c)).sum()),
+                None => first(r + 2, c),
+            } as u8;
+        }
+    }
+    out
+}
+
+#[test]
+fn every_level_matches_the_spec_vp8_prediction() {
+    // VP8's six-tap filters (sub-pixel positions 1..8 in eighths) and bilinear ones, as six taps.
+    const SIXTAP: [[i16; 6]; 7] = [
+        [0, -6, 123, 12, -1, 0],
+        [2, -11, 108, 36, -8, 1],
+        [0, -9, 93, 50, -6, 0],
+        [3, -16, 77, 77, -16, 3],
+        [0, -6, 50, 93, -9, 0],
+        [1, -8, 36, 108, -11, 2],
+        [0, -1, 12, 123, -6, 0],
+    ];
+    const BILINEAR: [[i16; 6]; 7] = [
+        [0, 0, 112, 16, 0, 0],
+        [0, 0, 96, 32, 0, 0],
+        [0, 0, 80, 48, 0, 0],
+        [0, 0, 64, 64, 0, 0],
+        [0, 0, 48, 80, 0, 0],
+        [0, 0, 32, 96, 0, 0],
+        [0, 0, 16, 112, 0, 0],
+    ];
+    let mut seed = 0x0f8_5e7au32;
+    let mut next = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        seed
+    };
+    let mut ran = 0;
+    for &level in levels() {
+        for set in [&SIXTAP, &BILINEAR] {
+            for w in [4usize, 8, 16] {
+                for h in 1..=16 {
+                    let pick = |next: &mut dyn FnMut() -> u32| -> Option<&[i16; 6]> {
+                        let k = next() as usize % (set.len() + 1);
+                        (k < set.len()).then(|| &set[k])
+                    };
+                    let (fh, fv) = (pick(&mut next), pick(&mut next));
+                    // the vector loads read 16 samples from each strip's first column, h + 5 rows
+                    let ss = w + 8 + (next() % 7) as usize;
+                    let last = if w == 16 { 8 } else { 0 };
+                    let len = (h + 4) * ss + last + 16;
+                    let src: Vec<u8> = (0..len)
+                        .map(|_| match next() % 5 {
+                            0 => 0,
+                            1 => 255,
+                            _ => next() as u8,
+                        })
+                        .collect();
+                    let want = spec_vp8_predict(&src, ss, fh, fv, w, h);
+                    let ds = w + 3;
+                    let mut dst = vec![7u8; ds * h];
+                    let ctx = format!("{level:?} {w}x{h} fh {fh:?} fv {fv:?}");
+                    let done = vp8_predict_at(level, &src, ss, fh, fv, w, h, &mut dst, ds);
+                    if level != Level::Neon {
+                        assert!(!done && dst.iter().all(|&v| v == 7), "{ctx}");
+                        continue;
+                    }
+                    assert!(done, "{ctx}");
+                    for r in 0..h {
+                        assert_eq!(&dst[r * ds..r * ds + w], &want[r * w..r * w + w], "{ctx} row {r}");
+                        assert!(dst[r * ds + w..r * ds + ds].iter().all(|&v| v == 7), "{ctx} row {r}: wrote past the block");
+                    }
+                    ran += 1;
+                }
+            }
+        }
+    }
+    assert!(ran > 0 || !cfg!(target_arch = "aarch64"));
+}
+
+#[test]
+fn vp8_prediction_declines_what_it_cannot_take() {
+    let f: [i16; 6] = [3, -16, 77, 77, -16, 3];
+    for &level in levels() {
+        let (w, h, ss) = (16usize, 8usize, 24usize);
+        let full = vec![100u8; (h + 4) * ss + 8 + 16];
+        // one sample short of the last row's loads, a short destination, an unsupported width,
+        // and taps whose sums leave 16 bits
+        let cases: [(&[u8], usize, usize, [i16; 6]); 4] =
+            [(&full[..full.len() - 1], w, w * h, f), (&full, w, w * h - 1, f), (&full, 32, 32 * h, f), (&full, w, w * h, [0, 0, 200, -72, 0, 0])];
+        for (src, w, dlen, taps) in cases {
+            let mut dst = vec![7u8; dlen];
+            assert!(!vp8_predict_at(level, src, ss.max(w + 8), Some(&taps), Some(&taps), w, h, &mut dst, w), "{level:?} w {w}");
+            assert!(dst.iter().all(|&v| v == 7), "{level:?} w {w}");
+        }
+    }
+}
