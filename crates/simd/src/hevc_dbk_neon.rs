@@ -16,9 +16,9 @@ use crate::HevcLumaEdge;
 /// See [`crate::hevc_deblock_luma8`]: false (nothing written) when the samples do not fit `d`.
 pub(crate) fn luma(d: &mut [u8], o: usize, stride: usize, vertical: bool, e: &HevcLumaEdge) -> bool {
     let fits = if vertical {
-        o.checked_sub(4).and_then(|s| stride.checked_mul(7).and_then(|r| r.checked_add(s + 8))).is_some_and(|end| end <= d.len())
+        o.checked_sub(4).and_then(|s| stride.checked_mul(7)?.checked_add(s)?.checked_add(8)).is_some_and(|end| end <= d.len())
     } else {
-        stride.checked_mul(4).is_some_and(|b| b <= o) && stride.checked_mul(3).and_then(|r| r.checked_add(o + 8)).is_some_and(|end| end <= d.len())
+        stride.checked_mul(4).is_some_and(|b| b <= o) && stride.checked_mul(3).and_then(|r| r.checked_add(o)?.checked_add(8)).is_some_and(|end| end <= d.len())
     };
     if !fits {
         return false;

@@ -69,12 +69,7 @@ fn cdef_direction_sse2(rows: &[&[u16; 8]; 8], shift: u32) -> (usize, i32) {
     let lines = [(l0, h0), (l1, h1), (l2, z), (l3, h3), (l4, h4), (l5, h5), (l6, z), (l7, h7)];
     let cost: [i32; 8] = std::array::from_fn(|d| {
         let (lo, hi) = lines[d];
-        let mut p = [0i16; 16];
-        // SAFETY: `p` is 16 i16; each store writes 16 bytes inside it (unaligned stores).
-        unsafe {
-            _mm_storeu_si128(p.as_mut_ptr().cast(), lo);
-            _mm_storeu_si128(p.as_mut_ptr().add(8).cast(), hi);
-        }
+        let p: [i16; 16] = bytemuck::must_cast([lo, hi]);
         p.iter().zip(&CDEF_COST_WEIGHTS[d]).map(|(&v, &w)| v as i32 * v as i32 * w).sum()
     });
     cdef_pick(&cost)

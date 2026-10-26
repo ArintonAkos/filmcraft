@@ -34,6 +34,13 @@ pub(crate) fn cdef_direction(rows: &[&[u16; 8]; 8], shift: u32) -> (usize, i32) 
 /// `base` indexes q0 and `step` is the distance between samples across the edge.
 #[inline(always)]
 pub(crate) fn deblock_line(d: &mut [u16], base: usize, step: usize, size: LfSize, t: &LfThresh) {
+    // p(reach - 1)..q(reach - 1) must all be in `d`; otherwise the line is left as it is.
+    let reach = size.reach();
+    let fits = reach.checked_mul(step).is_some_and(|b| b <= base)
+        && (reach - 1).checked_mul(step).and_then(|a| a.checked_add(base)).is_some_and(|last| last < d.len());
+    if !fits {
+        return;
+    }
     let at = |d: &[u16], k: isize| -> i32 { d[(base as isize + k * step as isize) as usize] as i32 };
     let (q0, q1, p0, p1) = (at(d, 0), at(d, 1), at(d, -1), at(d, -2));
     let lim = t.limit;

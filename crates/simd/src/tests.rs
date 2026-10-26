@@ -1127,3 +1127,84 @@ fn vp8_prediction_declines_what_it_cannot_take() {
         }
     }
 }
+
+#[test]
+fn vp8_loop_filters_decline_edges_whose_lines_leave_the_buffer() {
+    let l = Vp8Limits { edge: 255, interior: 255, hev_threshold: 0 };
+    let stride = 40;
+    // A step across every edge, so a filter that ran would change samples.
+    let pic = |len: usize| -> Vec<u8> { (0..len).map(|i| if i % 2 == 0 { 60 } else { 90 }).collect() };
+    let mut ran = 0;
+    for &level in levels() {
+        for vertical in [false, true] {
+            for f in [Vp8Filter::Simple, Vp8Filter::Subblock, Vp8Filter::Macroblock] {
+                for lines in [16usize, 8] {
+                    let (step, along) = if vertical { (1, stride) } else { (stride, 1) };
+                    // The smallest start, and the length that just holds q3 of the last line.
+                    let start = 4 * step;
+                    let len = start + (lines - 1) * along + 3 * step + 1;
+                    let call = |d: &mut [u8], e: &mut [u8], start: usize, which: usize| -> bool {
+                        if lines == 16 {
+                            vp8_loop_filter_at(level, d, start, stride, vertical, f, &l)
+                        } else if which == 0 {
+                            vp8_loop_filter_uv_at(level, d, e, start, stride, vertical, f, &l)
+                        } else {
+                            vp8_loop_filter_uv_at(level, e, d, start, stride, vertical, f, &l)
+                        }
+                    };
+                    // `which`: the plane that is short (chroma only; luma has one).
+                    for which in 0..if lines == 16 { 1 } else { 2 } {
+                        let (mut d, mut e) = (pic(len), pic(len));
+                        ran += call(&mut d, &mut e, start, which) as usize;
+                        for (s, n) in [(start - 1, len), (start, len - 1)] {
+                            let (mut d, mut e) = (pic(n), pic(len));
+                            let (d0, e0) = (d.clone(), e.clone());
+                            assert!(!call(&mut d, &mut e, s, which), "{level:?} {f:?} vertical {vertical} lines {lines} start {s} len {n}");
+                            assert!(d == d0 && e == e0, "{level:?} {f:?} vertical {vertical} lines {lines}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(ran > 0 || !cfg!(target_arch = "aarch64"));
+}
+
+#[test]
+fn kernels_decline_offsets_whose_reach_overflows() {
+    let l = Vp8Limits { edge: 255, interior: 255, hev_threshold: 0 };
+    let e = HevcLumaEdge { on: [true; 2], tc: [4; 2], beta: [40; 2], no_p: [false; 2], no_q: [false; 2] };
+    let mut d = vec![0u8; 256];
+    for &level in levels() {
+        for o in [usize::MAX - 3, usize::MAX] {
+            for vertical in [false, true] {
+                assert!(!hevc_deblock_luma8_at(level, &mut d, o, 16, vertical, &e));
+                assert!(!vp8_loop_filter_at(level, &mut d, o, 16, vertical, Vp8Filter::Macroblock, &l));
+            }
+            assert!(!vp8_idct_add_at(level, &[1; 16], &mut d, o, 16));
+        }
+        // A stride whose three steps past q0 overflow.
+        assert!(!vp8_loop_filter_at(level, &mut d, 4, usize::MAX / 2, true, Vp8Filter::Macroblock, &l));
+    }
+    assert!(d.iter().all(|&v| v == 0));
+}
+
+#[test]
+fn scalar_loop_filter_leaves_lines_that_leave_the_buffer() {
+    let t = lf_thresh(63, 0, 8);
+    let step_edge = |len: usize| -> Vec<u16> { (0..len).map(|i| if i < len / 2 { 60 } else { 70 }).collect() };
+    for size in [LfSize::Four, LfSize::Six, LfSize::Eight, LfSize::Sixteen, LfSize::Vp9Four, LfSize::Vp9Eight, LfSize::Vp9Sixteen] {
+        let reach = size.reach();
+        let len = 2 * reach;
+        // Fits exactly: the line is filtered.
+        let mut d = step_edge(len);
+        deblock_line(&mut d, reach, 1, size, &t);
+        assert_ne!(d, step_edge(len), "{size:?}");
+        // One short on either side, and offsets whose reach overflows: left unchanged.
+        for (base, n, step) in [(reach - 1, len - 1, 1), (reach, len - 1, 1), (usize::MAX, len, 1), (reach, len, usize::MAX)] {
+            let mut d = step_edge(n);
+            deblock_line(&mut d, base, step, size, &t);
+            assert_eq!(d, step_edge(n), "{size:?} base {base}");
+        }
+    }
+}

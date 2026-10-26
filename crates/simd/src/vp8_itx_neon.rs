@@ -11,7 +11,7 @@ use core::arch::aarch64::*;
 
 /// See [`crate::vp8_idct_add`].
 pub(crate) fn idct_add(coefs: &[i16; 16], dst: &mut [u8], pos: usize, stride: usize) -> bool {
-    if !stride.checked_mul(3).and_then(|n| n.checked_add(pos + 4)).is_some_and(|n| n <= dst.len()) {
+    if !stride.checked_mul(3).and_then(|n| n.checked_add(pos)?.checked_add(4)).is_some_and(|n| n <= dst.len()) {
         return false;
     }
     // The prediction rows, gathered and written back as one vector (4 bytes per row).

@@ -104,8 +104,9 @@ fn fetch_window(r: &RefPlane, x0: i32, y0: i32, w: usize, h: usize, win: &mut [u
         let src = rows(yy);
         let dst = &mut win[row * ws..row * ws + ws];
         let xs = x0 - 3;
-        if xs >= 0 && xs + ws as i32 - 1 <= r.last_x {
-            copy_samples(dst, &src[xs as usize..xs as usize + ws], ws);
+        let interior = if xs >= 0 && xs + ws as i32 - 1 <= r.last_x { src.get(xs as usize..xs as usize + ws) } else { None };
+        if let Some(s) = interior {
+            copy_samples(dst, s, ws);
         } else {
             // Columns left of the picture, inside it, and right of it.
             let lo = (-xs).clamp(0, ws as i32) as usize;

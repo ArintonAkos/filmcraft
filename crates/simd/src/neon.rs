@@ -6,6 +6,9 @@ use core::arch::aarch64::*;
 
 use crate::{CDEF_COST_WEIGHTS, CDEF_STRIDE, CdefTap, cdef_pick};
 
+/// [`CDEF_COST_WEIGHTS`] as vectors, cast once when the crate is compiled.
+static CDEF_WEIGHT_VECTORS: [[int32x4_t; 4]; 8] = bytemuck::must_cast(CDEF_COST_WEIGHTS);
+
 /// 16-bit lanes; each line sum is two vectors (lanes 0..8 and 8..16), and a row is added at its
 /// offset with `ext`, a fixed shift of lanes across two registers.
 pub(crate) fn cdef_direction(rows: &[&[u16; 8]; 8], shift: u32) -> (usize, i32) {
@@ -63,9 +66,7 @@ fn cdef_direction_neon(rows: &[&[u16; 8]; 8], shift: u32) -> (usize, i32) {
     let lines = [(l0, h0), (l1, h1), (l2, z), (l3, h3), (l4, h4), (l5, h5), (l6, z), (l7, h7)];
     let cost: [i32; 8] = std::array::from_fn(|d| {
         let (lo, hi) = lines[d];
-        let w = &CDEF_COST_WEIGHTS[d];
-        // SAFETY: each pointer starts a run of 4 i32 inside the 16 of `w`.
-        let (w0, w1, w2, w3) = unsafe { (vld1q_s32(w.as_ptr()), vld1q_s32(w.as_ptr().add(4)), vld1q_s32(w.as_ptr().add(8)), vld1q_s32(w.as_ptr().add(12))) };
+        let [w0, w1, w2, w3] = CDEF_WEIGHT_VECTORS[d];
         // Squares widened to 32 bits, times the lane weights, summed.
         let mut s = vmulq_s32(vmull_s16(vget_low_s16(lo), vget_low_s16(lo)), w0);
         s = vmlaq_s32(s, vmull_high_s16(lo, lo), w1);

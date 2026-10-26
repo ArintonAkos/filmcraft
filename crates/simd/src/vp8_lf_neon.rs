@@ -18,7 +18,7 @@ use crate::{Vp8Filter, Vp8Limits};
 fn fits(len: usize, start: usize, stride: usize, vertical: bool, lines: usize) -> bool {
     let (step, along) = if vertical { (1, stride) } else { (stride, 1) };
     4usize.checked_mul(step).is_some_and(|b| b <= start)
-        && (lines - 1).checked_mul(along).and_then(|a| a.checked_add(start)).and_then(|e| e.checked_add(3 * step)).is_some_and(|e| e < len)
+        && (lines - 1).checked_mul(along).and_then(|a| a.checked_add(start)).and_then(|e| e.checked_add(3usize.checked_mul(step)?)).is_some_and(|e| e < len)
 }
 
 /// The filter as the kernels' const parameter.

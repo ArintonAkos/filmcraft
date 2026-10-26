@@ -46,7 +46,6 @@ impl LfSize {
     }
 
     /// Samples the filter reads on each side of the edge.
-    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     pub(crate) const fn reach(self) -> usize {
         match self {
             LfSize::Four => 2,

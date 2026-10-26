@@ -73,8 +73,10 @@ hand-written SIMD kernels on the instruction sets every core of a target has. No
 3. **Whole-array copies are safe code.** A load or store whose memory is a whole fixed-size array
    (a row the caller sized with `first_chunk`, a local table or a temporary) uses
    `bytemuck::must_cast`, so its size is checked at compile time. This removed 37 of the crate's
-   118 `unsafe` blocks with no cycle cost (9-run measurements on every codec, all within ±0.3%).
-   What remains is 32 kernel entries and 49 offset accesses.
+   119 `unsafe` blocks with no cycle cost (9-run measurements on every codec, all within ±0.3%),
+   and review found two more. A constant table is cast once, into a `static`: casting the CDEF
+   weights on every call measured 2% slower on AV1. What remains is 39 kernel entries and 41
+   offset accesses.
 4. **Safety comments.** Every `unsafe` block has a `// SAFETY:` comment naming the invariant that
    makes it sound: either the baseline feature, or the entry-point check that covers the access.
 5. **The public API is safe.**
@@ -109,7 +111,7 @@ hand-written SIMD kernels on the instruction sets every core of a target has. No
 ## Consequences
 
 - **The decoders keep their vector speed**, and the crate's `unsafe` surface is small and countable:
-  81 blocks of two kinds, each with its invariant written next to it.
+  80 blocks of two kinds, each with its invariant written next to it.
 - **A review burden.** Changes to the per-architecture modules of `crates/simd` need the scrutiny
   of `unsafe` code. A new kind of `unsafe` there (anything beyond the two above), or `unsafe`
   anywhere else, needs a new decision, not an extension of this one.
