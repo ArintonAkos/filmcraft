@@ -275,6 +275,49 @@ fn a_wobbly_click_on_an_edge_selects_the_edit_point() {
     assert!(!st.selection.contains(&ClipId(city)), "the clip is not selected");
 }
 
+/// Click a real rolling edge, then the Trim Monitor's +1 button: linked sound follows exactly once.
+fn linked_trim_monitor() -> Driver {
+    let mut d = Driver::demo();
+    let rate = d.app().session.sequence_rate();
+    let video = ClipId(d.v1_clip(CITY));
+    let q = d.app().session.active_sequence().unwrap();
+    let picture = q.find_item(video).unwrap().1;
+    let audio = q.audio_tracks[0].items.iter().find(|i| i.link.is_some() && i.link == picture.link).unwrap().id;
+    let cut = picture.end();
+    d.exec("tool.rolling", json!({}));
+    d.frames(4);
+    let (_, x, y) = d.edges(video.0);
+    d.drag(pos2(x - 2.0, y), pos2(x - 2.0, y), 1);
+    let points = &d.app().session.state.edit_points;
+    assert_eq!(points.len(), 2, "both linked edges selected: {points:?}");
+    assert!(points.iter().any(|e| e.clip == audio));
+    let before = d.app().session.project.clone();
+    d.ok("ui.click", json!({"id": "trimMonitor.forward"}));
+    d.frames(4);
+    for clip in [video, audio] {
+        assert_eq!(d.span(clip.0).1, (cut + rate.frame_duration()).0);
+    }
+    let after = d.app().session.project.clone();
+    d.exec("edit.undo", json!({}));
+    assert_eq!(*d.app().session.project, *before);
+    d.exec("edit.redo", json!({}));
+    assert_eq!(*d.app().session.project, *after);
+    d
+}
+
+/// #3085: the timeline gesture and Trim Monitor button keep picture and sound synchronized.
+#[test]
+fn trim_monitor_button_rolls_linked_audio_once() {
+    linked_trim_monitor();
+}
+
+/// Visual check of the linked edit brackets and Trim Monitor after one frame of rolling.
+#[test]
+#[ignore = "renders a screenshot; requires a GPU"]
+fn screenshot_linked_trim_monitor() {
+    linked_trim_monitor().screenshot("linked-trim-monitor");
+}
+
 /// A moved clip stays under the point it was grabbed by. It used to lag behind the pointer by the
 /// distance egui waits before it calls a press a drag.
 #[test]
@@ -656,4 +699,34 @@ fn linked_video_drag_adds_video_and_audio_tracks() {
 #[test]
 fn linked_audio_drag_adds_audio_and_video_tracks() {
     move_existing_clip_to_a_new_track(true, true);
+}
+
+/// #3300: with Alt held, dragging the edge of one side of a linked clip trims only that side; the
+/// linked audio keeps its range. Without Alt the partner still follows.
+#[test]
+fn alt_dragging_an_edge_trims_only_that_side_of_a_link() {
+    for alt in [true, false] {
+        let mut d = Driver::demo();
+        let seq = d.app().session.active_sequence().expect("sequence");
+        let (video, sound) = seq.video_tracks[0]
+            .items
+            .iter()
+            .find_map(|v| {
+                let a = seq.audio_tracks.iter().flat_map(|t| &t.items).find(|a| v.link.is_some() && a.link == v.link)?;
+                Some((v.id.0, a.id.0))
+            })
+            .expect("a linked clip on V1");
+        let (v0, a0) = (d.span(video), d.span(sound));
+        let (_, x1, y) = d.edges(video);
+        d.ok("ui.drag", json!({"from": {"x": x1 - 3.0, "y": y}, "to": {"x": x1 - 63.0, "y": y}, "steps": 20, "modifiers": {"alt": alt}}));
+        d.frames(2);
+        let v1 = d.span(video);
+        assert_eq!(v1.0, v0.0, "alt={alt}: the In point stays");
+        assert!(v1.1 < v0.1, "alt={alt}: the video's Out edge was trimmed: {v0:?} -> {v1:?}");
+        if alt {
+            assert_eq!(d.span(sound), a0, "Alt-trim leaves the linked audio alone");
+        } else {
+            assert_eq!(d.span(sound).1, a0.1 - (v0.1 - v1.1), "the linked audio follows a plain trim");
+        }
+    }
 }
