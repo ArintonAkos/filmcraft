@@ -71,29 +71,44 @@ struct PackedRow {
 }
 
 impl PackedRow {
-    /// The blocks of `r` in `blocks` (bit b: block b).
-    fn push(&mut self, r: &MbResidual, blocks: u32) {
-        let mut present = 0u32;
-        for (b, (c, _)) in r.coeffs.iter().zip(r.nonzero).enumerate().filter(|&(b, (_, nz))| nz && blocks >> b & 1 == 1) {
-            present |= 1 << b;
-            self.blocks.push(*c);
-        }
-        self.mbs.push((present, r.has_coeffs));
+    fn with_capacity(mbs: usize) -> PackedRow {
+        PackedRow { mbs: Vec::with_capacity(mbs), blocks: Vec::with_capacity(mbs * 4) }
     }
 
-    /// The coefficients of macroblock `i` into `r` (zero), whose blocks start at `*next`.
-    fn unpack(&self, i: usize, next: &mut usize, r: &mut MbResidual) {
-        let Some(&(present, has_coeffs)) = self.mbs.get(i) else { return };
-        for (b, (c, nz)) in r.coeffs.iter_mut().zip(r.nonzero.iter_mut()).enumerate() {
-            if present >> b & 1 == 1
-                && let Some(block) = self.blocks.get(*next)
-            {
+    /// The coefficients of `r` into the rows of the planes (`rows[p]` the blocks of
+    /// `PLANE_BLOCKS[p]`), leaving `r` zero.
+    fn take(rows: &mut [PackedRow; 2], r: &mut MbResidual) {
+        let mut present = [0u32; 2];
+        for (b, (c, nz)) in r.coeffs.iter_mut().zip(r.nonzero.iter_mut()).enumerate().filter(|(_, (_, nz))| **nz) {
+            let p = usize::from(PLANE_BLOCKS[0] >> b & 1 == 0);
+            present[p] |= 1 << b;
+            if let Some(row) = rows.get_mut(p) {
+                row.blocks.push(std::mem::take(c));
+            }
+            *nz = false;
+        }
+        for (row, present) in rows.iter_mut().zip(present) {
+            row.mbs.push((present, r.has_coeffs));
+        }
+        r.has_coeffs = false;
+    }
+
+    /// The coefficients of macroblock `i` into `r` (zero), whose blocks start at `*next`; the
+    /// blocks they went to (bit b: block b), for [`MbResidual::clear_blocks`].
+    fn unpack(&self, i: usize, next: &mut usize, r: &mut MbResidual) -> u32 {
+        let Some(&(present, has_coeffs)) = self.mbs.get(i) else { return 0 };
+        let mut left = present;
+        while left != 0 {
+            let b = left.trailing_zeros() as usize;
+            left &= left - 1;
+            if let (Some(block), Some(c), Some(nz)) = (self.blocks.get(*next), r.coeffs.get_mut(b), r.nonzero.get_mut(b)) {
                 *c = *block;
                 *nz = true;
-                *next += 1;
             }
+            *next += 1;
         }
         r.has_coeffs = has_coeffs;
+        present
     }
 }
 
@@ -351,13 +366,10 @@ fn read_tokens(work: &Work) {
             return;
         };
         let mut left_nz = [0u8; 9];
-        let mut rows = PLANE_BLOCKS.map(|_| PackedRow { mbs: Vec::with_capacity(recs.len()), blocks: Vec::new() });
+        let mut rows = PLANE_BLOCKS.map(|_| PackedRow::with_capacity(recs.len()));
         for (rec, an) in recs.iter().zip(above_nz.iter_mut()) {
             read_mb_tokens(td, &job.f, &job.coeff, rec, (an, &mut left_nz), &mut res);
-            for (row, blocks) in rows.iter_mut().zip(PLANE_BLOCKS) {
-                row.push(&res, blocks);
-            }
-            res.clear();
+            PackedRow::take(&mut rows, &mut res);
         }
         for (r, row) in work.rows.iter().zip(rows) {
             r.put(mb_y, row);
@@ -413,14 +425,14 @@ fn reconstruct_rows<const LUMA: bool>(work: &Work, refs: Refs, to_filter: &Sende
         let mut lf = Vec::with_capacity(mb_w);
         let mut next = 0;
         for (mb_x, rec) in recs.iter().enumerate() {
-            row.unpack(mb_x, &mut next, res);
+            let blocks = row.unpack(mb_x, &mut next, res);
             lf.push((filter_level(&job.f, rec.segment, &rec.modes.info), !rec.has_y2() || res.has_coeffs));
             if LUMA {
                 reconstruct_mb::<true, false>(&mut buf, (mb_x, mb_y), top, mb_w, &rec.modes, res, &recon)?;
             } else {
                 reconstruct_mb::<false, true>(&mut buf, (mb_x, mb_y), top, mb_w, &rec.modes, res, &recon)?;
             }
-            res.clear();
+            res.clear_blocks(blocks);
         }
         let n = above.0.len();
         copy_lines(&mut above.0, 0, &buf.y, (first + 15) * w, n);

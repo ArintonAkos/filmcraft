@@ -761,6 +761,22 @@ impl MbResidual {
         self.nonzero = [false; 25];
         self.has_coeffs = false;
     }
+
+    /// [`MbResidual::clear`] when the blocks with coefficients are known: `blocks` (bit b: block
+    /// b).
+    #[cfg(all(feature = "threads", not(target_arch = "wasm32")))]
+    fn clear_blocks(&mut self, blocks: u32) {
+        let mut left = blocks;
+        while left != 0 {
+            let b = left.trailing_zeros() as usize;
+            left &= left - 1;
+            if let (Some(c), Some(nz)) = (self.coeffs.get_mut(b), self.nonzero.get_mut(b)) {
+                *c = [0; 16];
+                *nz = false;
+            }
+        }
+        self.has_coeffs = false;
+    }
 }
 
 /// What inter prediction of a frame needs: the reference frames and the sub-pixel filter setup.

@@ -110,6 +110,78 @@ fn frames_in_flight() {
     }
 }
 
+/// Frame threads under random use: streams of different sizes (with hidden frames and several
+/// token partitions) one after the other in random order, decode calls interleaved with
+/// flushes, flush-and-reset and (without a flush first) plain resets and drops. With a flush
+/// before each reset the pictures are those of one thread; without, decoding goes on and
+/// nothing hangs (each round runs under a deadline).
+#[test]
+fn frame_threads_under_random_use() {
+    let names = ["odd_size", "tiny", "partitions8", "hd_1080p", "altref_2pass", "realtime_segments"];
+    let mut streams = Vec::new();
+    for name in names {
+        let Some((ivf, _)) = common::ensure(common::fixture(name)) else { return };
+        streams.push(std::fs::read(&ivf).unwrap());
+    }
+    let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+    let mut rnd = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    for round in 0..24 {
+        // a run of whole streams, each starting at its key frame
+        let order: Vec<usize> = (0..6).map(|_| (rnd() % streams.len() as u64) as usize).collect();
+        let frames: Vec<Vec<u8>> = order.iter().flat_map(|&s| common::ivf_frames(&streams[s]).into_iter().map(<[u8]>::to_vec)).collect();
+        // per frame: 0 decode, 1 decode then flush, 2 decode then flush and reset, 3 decode then reset
+        let ops: Vec<u64> = frames
+            .iter()
+            .map(|_| match rnd() % 16 {
+                0 => 1,
+                1 => 2,
+                2 => 3,
+                _ => 0,
+            })
+            .collect();
+        let threads = 2 + (rnd() % 7) as usize;
+        let exact = round % 2 == 0;
+        let run = move |threads: usize, frames: Vec<Vec<u8>>, ops: Vec<u64>| {
+            let mut dec = filmcraft_vp8::Decoder::with_threads(threads);
+            let mut out = Vec::new();
+            for (i, (f, &op)) in frames.iter().zip(&ops).enumerate() {
+                out.extend(dec.decode(f, i as i64).unwrap_or_default().iter().map(|p| (p.pts, common::i420(p))));
+                match op {
+                    1 => out.extend(dec.flush().iter().map(|p| (p.pts, common::i420(p)))),
+                    2 => {
+                        out.extend(dec.flush().iter().map(|p| (p.pts, common::i420(p))));
+                        dec.reset();
+                    }
+                    3 if !exact => dec.reset(),
+                    _ => {}
+                }
+            }
+            if exact {
+                out.extend(dec.flush().iter().map(|p| (p.pts, common::i420(p))));
+            }
+            // without the last flush, the frames still in flight go with the decoder
+            drop(dec);
+            out
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (f, o) = (frames.clone(), ops.clone());
+        std::thread::spawn(move || {
+            let _ = tx.send(run(threads, f, o));
+        });
+        let got = rx.recv_timeout(std::time::Duration::from_secs(60)).unwrap_or_else(|_| panic!("round {round}: {threads} threads hang"));
+        if exact {
+            assert!(got == run(1, frames, ops), "round {round}: {threads} threads, streams {order:?}");
+        } else {
+            assert!(got.windows(2).all(|w| w[0].0 < w[1].0), "round {round}: pictures in order");
+        }
+    }
+}
+
 /// Hidden (altref) frames produce no picture, and leaving out the frames the decoder calls
 /// disposable changes none of the other pictures.
 #[test]
