@@ -26,21 +26,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let frame = &data[pos..(pos + size).min(data.len())];
             pos += size;
             match dec.decode(frame, pts) {
-                Ok(Some(p)) => {
-                    if std::env::var_os("VP8DEC_SIZES").is_some() {
-                        println!("{} {}", p.width, p.height);
-                    }
-                    out.write_all(&p.y)?;
-                    out.write_all(&p.u)?;
-                    out.write_all(&p.v)?;
-                    n += 1;
-                }
-                Ok(None) => {}
+                Ok(pictures) => n += write(&mut out, &pictures)?,
                 Err(e) => eprintln!("frame at pts {pts}: {e}"),
             }
         }
     }
+    n += write(&mut out, &dec.flush())?;
     let secs = t.elapsed().as_secs_f64();
     eprintln!("{n} pictures in {secs:.3}s ({:.1} fps); {:?}", n as f64 / secs, dec.stats());
     Ok(())
+}
+
+/// The pictures as I420; how many.
+fn write(out: &mut impl Write, pictures: &[filmcraft_vp8::Picture]) -> std::io::Result<usize> {
+    for p in pictures {
+        if std::env::var_os("VP8DEC_SIZES").is_some() {
+            println!("{} {}", p.width, p.height);
+        }
+        out.write_all(&p.y)?;
+        out.write_all(&p.u)?;
+        out.write_all(&p.v)?;
+    }
+    Ok(pictures.len())
 }

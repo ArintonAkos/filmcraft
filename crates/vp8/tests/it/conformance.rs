@@ -69,13 +69,44 @@ fn same_pictures_at_every_thread_count() {
     for (name, frames) in cases {
         let decode = |threads: usize| {
             let mut dec = filmcraft_vp8::Decoder::with_threads(threads);
-            frames.iter().enumerate().filter_map(|(i, f)| dec.decode(f, i as i64).unwrap()).map(|p| (p.width, common::i420(&p))).collect::<Vec<_>>()
+            let mut pictures: Vec<_> = frames.iter().enumerate().flat_map(|(i, f)| dec.decode(f, i as i64).unwrap()).collect();
+            pictures.extend(dec.flush());
+            pictures.iter().map(|p| (p.width, p.pts, common::i420(p))).collect::<Vec<_>>()
         };
         let one = decode(1);
         assert!(!one.is_empty(), "{name}: pictures");
         for threads in [2, 3, 4, 5, 8] {
             assert!(decode(threads) == one, "{name}: {threads} threads");
         }
+    }
+}
+
+/// With frames in flight on the worker threads: a reset drops them (decoding resumes at the next
+/// key frame, with the same pictures as a new decoder), flush returns every one still in flight,
+/// and dropping the decoder returns.
+#[test]
+fn frames_in_flight() {
+    let Some((ivf, _)) = common::ensure(common::fixture("hd_1080p")) else { return };
+    let data = std::fs::read(&ivf).unwrap();
+    let frames = common::ivf_frames(&data);
+    let all = common::decode_all(&frames);
+    for threads in [2, 4, 8] {
+        let mut dec = filmcraft_vp8::Decoder::with_threads(threads);
+        assert_eq!(dec.threads(), if cfg!(feature = "threads") { threads } else { 1 });
+        let mut first: Vec<_> = frames.iter().enumerate().flat_map(|(i, f)| dec.decode(f, i as i64).unwrap()).collect();
+        dec.reset();
+        assert!(dec.flush().is_empty(), "{threads} threads: a reset drops the frames in flight");
+        assert!(dec.decode(frames[1], 1).is_err(), "{threads} threads: an inter frame after a reset");
+        let mut again: Vec<_> = frames.iter().enumerate().flat_map(|(i, f)| dec.decode(f, i as i64).unwrap()).collect();
+        again.extend(dec.flush());
+        assert!(again.iter().map(common::i420).eq(all.iter().map(common::i420)), "{threads} threads: the pictures after a reset");
+        assert!(first.len() <= all.len());
+        first.clear();
+        // frames in flight when the decoder goes
+        for (i, f) in frames.iter().enumerate() {
+            let _ = dec.decode(f, i as i64);
+        }
+        drop(dec);
     }
 }
 
@@ -94,10 +125,9 @@ fn hidden_and_disposable_frames() {
         let mut disposable = Vec::new();
         for (i, f) in frames.iter().enumerate() {
             disposable.push(dec.is_disposable(f));
-            if let Some(p) = dec.decode(f, i as i64).unwrap() {
-                all.push((p.pts, common::i420(&p)));
-            }
+            all.extend(dec.decode(f, i as i64).unwrap().iter().map(|p| (p.pts, common::i420(p))));
         }
+        all.extend(dec.flush().iter().map(|p| (p.pts, common::i420(p))));
         let stats = dec.stats();
         assert_eq!(stats.frames as usize, frames.len());
         assert_eq!(all.len() + stats.hidden_frames as usize, frames.len(), "{name}: one picture per shown frame");
@@ -112,10 +142,14 @@ fn hidden_and_disposable_frames() {
             if disposable[i] {
                 continue;
             }
-            if let Some(p) = dec.decode(f, i as i64).unwrap() {
+            for p in dec.decode(f, i as i64).unwrap() {
                 let reference = all.iter().find(|(pts, _)| *pts == p.pts).expect("picture of a shown frame");
                 assert!(common::i420(&p) == reference.1, "{name}: picture {} changed after leaving out disposable frames", p.pts);
             }
+        }
+        for p in dec.flush() {
+            let reference = all.iter().find(|(pts, _)| *pts == p.pts).expect("picture of a shown frame");
+            assert!(common::i420(&p) == reference.1, "{name}: picture {} changed after leaving out disposable frames", p.pts);
         }
     }
 }

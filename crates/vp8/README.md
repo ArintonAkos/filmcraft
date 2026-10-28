@@ -39,17 +39,18 @@ of `tests/it/conformance.rs`.
 ```rust
 use filmcraft_vp8::Decoder;
 
-let mut dec = Decoder::new();
+let mut dec = Decoder::new(); // all cores; Decoder::with_threads(1): on the calling thread
 for (pts, frame) in frames {      // one IVF frame / WebM block / MP4 sample each
     let skippable = dec.is_disposable(frame); // could this frame be left out (catching up)?
-    if let Some(pic) = dec.decode(frame, pts)? {
+    for pic in dec.decode(frame, pts)? {
+        // the pictures finished so far, in order (with threads, of earlier frames too):
         // pic.width / pic.height, pic.chroma_width / chroma_height,
         // pic.y / pic.u / pic.v: tight 8-bit 4:2:0 planes, pic.pts, pic.key,
-        // pic.color_space (0: BT.601 YUV)
+        // pic.color_space (0: BT.601 YUV); none for a hidden (altref) frame
     }
-    // None: a hidden (altref) frame
 }
-dec.reset(); // forget the reference frames (seek): decoding resumes at the next key frame
+let rest = dec.flush(); // end of stream: the pictures still in flight
+dec.reset(); // forget the reference frames and the frames in flight (seek): decoding resumes at the next key frame
 let stats = dec.stats(); // frames, key frames, hidden frames
 
 // Random access points

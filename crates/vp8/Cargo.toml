@@ -11,12 +11,11 @@ workspace = true
 
 [features]
 default = ["threads"]
-threads = ["dep:rayon"]
+threads = []
 
 [dependencies]
 filmcraft-simd = { workspace = true }
 thiserror = { workspace = true }
-rayon = { workspace = true, optional = true }
 
 [dev-dependencies]
 filmcraft-testkit = { workspace = true }

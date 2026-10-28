@@ -635,12 +635,12 @@ impl Vp8Decoder {
 
 impl VideoDecoder for Vp8Decoder {
     fn decode(&mut self, sample: &[u8], pts: i64) -> Result<Vec<DecodedFrame>> {
-        let pic = self.dec.decode(sample, pts).map_err(|e| CodecError::Decode(e.to_string()))?;
-        Ok(pic.into_iter().map(Self::convert).collect())
+        let pics = self.dec.decode(sample, pts).map_err(|e| CodecError::Decode(e.to_string()))?;
+        Ok(pics.into_iter().map(Self::convert).collect())
     }
     fn flush(&mut self) -> Vec<DecodedFrame> {
-        // no reordering: every picture comes out with its frame
-        Vec::new()
+        // no reordering, but with frame threads the last pictures are still in flight
+        self.dec.flush().into_iter().map(Self::convert).collect()
     }
     fn reset(&mut self) {
         self.dec.reset();

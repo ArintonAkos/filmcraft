@@ -21,7 +21,7 @@ use crate::tables::{
 use crate::transform;
 
 #[cfg(all(feature = "threads", not(target_arch = "wasm32")))]
-mod threads;
+mod frames;
 
 /// Largest frame dimension in macroblocks (14-bit sizes).
 const MAX_MBS: usize = 16384 / 16 + 1;
@@ -117,11 +117,11 @@ pub struct Decoder {
     /// `ref_frame_sign_bias`, indexed by reference frame (0 intra, 1 last, 2 golden, 3 altref).
     sign_bias: [bool; 4],
     stats: DecodeStats,
+    /// A key frame was decoded since the start or the last reset (inter frames need one).
+    key_seen: bool,
+    /// The frames on worker threads, with more than one ([`frames`]); `refs` is then theirs.
     #[cfg(all(feature = "threads", not(target_arch = "wasm32")))]
-    threads: usize,
-    /// The macroblock rows of each frame run on it ([`threads`]).
-    #[cfg(all(feature = "threads", not(target_arch = "wasm32")))]
-    pool: Option<std::sync::Arc<rayon::ThreadPool>>,
+    frames: Option<frames::Pipeline>,
 }
 
 fn default_threads() -> usize {
@@ -147,15 +147,13 @@ impl Decoder {
         Self::with_threads(default_threads())
     }
 
-    /// A decoder using up to `threads` threads for the macroblock rows of each frame (1: all on
-    /// the calling thread). The output is the same for every thread count.
+    /// A decoder using `threads` threads (1: everything on the calling thread, each picture
+    /// returned by the [`Decoder::decode`] call of its frame). With more, the frames go through
+    /// worker threads and a picture may come out of a later call or [`Decoder::flush`]. The
+    /// pictures are the same for every thread count.
     pub fn with_threads(threads: usize) -> Decoder {
         #[cfg(all(feature = "threads", not(target_arch = "wasm32")))]
-        let pool = if threads > 1 {
-            rayon::ThreadPoolBuilder::new().num_threads(threads).thread_name(|i| format!("vp8-{i}")).build().ok().map(std::sync::Arc::new)
-        } else {
-            None
-        };
+        let frames = (threads > 1).then(|| frames::Pipeline::new(threads)).flatten();
         #[cfg(not(all(feature = "threads", not(target_arch = "wasm32"))))]
         let _ = threads;
         Decoder {
@@ -170,25 +168,39 @@ impl Decoder {
             refs: [None, None, None],
             sign_bias: [false; 4],
             stats: DecodeStats::default(),
+            key_seen: false,
             #[cfg(all(feature = "threads", not(target_arch = "wasm32")))]
-            threads: threads.max(1),
-            #[cfg(all(feature = "threads", not(target_arch = "wasm32")))]
-            pool,
+            frames,
         }
     }
 
     /// Threads in use (1: everything runs on the calling thread).
     pub fn threads(&self) -> usize {
         #[cfg(all(feature = "threads", not(target_arch = "wasm32")))]
-        if self.pool.is_some() {
-            return self.threads;
+        if let Some(frames) = &self.frames {
+            return frames.threads();
         }
         1
     }
 
-    /// Forget the reference frames (after a seek): decoding resumes at the next key frame.
+    /// Forget the reference frames and the pictures in flight (after a seek): decoding resumes
+    /// at the next key frame.
     pub fn reset(&mut self) {
         self.refs = [None, None, None];
+        self.key_seen = false;
+        #[cfg(all(feature = "threads", not(target_arch = "wasm32")))]
+        if let Some(frames) = self.frames.take() {
+            self.frames = frames::Pipeline::new(frames.threads());
+        }
+    }
+
+    /// End of stream: every picture still in flight, in order.
+    pub fn flush(&mut self) -> Vec<Picture> {
+        #[cfg(all(feature = "threads", not(target_arch = "wasm32")))]
+        if let Some(frames) = &mut self.frames {
+            return frames.drain(true);
+        }
+        Vec::new()
     }
 
     pub fn stats(&self) -> DecodeStats {
@@ -201,7 +213,7 @@ impl Decoder {
     /// probability updates to itself). Only the frame header is read.
     pub fn is_disposable(&self, frame: &[u8]) -> bool {
         let Ok(tag) = FrameTag::parse(frame) else { return false };
-        if tag.key_frame || self.refs[0].is_none() {
+        if tag.key_frame || !self.key_seen {
             return false;
         }
         let Some(first) = frame.get(tag.header_len..tag.header_len.saturating_add(tag.first_part_size)) else { return false };
@@ -253,32 +265,6 @@ impl Decoder {
         })
     }
 
-    /// Reference updates (9.7, 9.8): the copies first (altref, then golden from the possibly
-    /// updated altref), then the refreshes with the new frame.
-    fn update_references(&mut self, hdr: &FrameHeader, frame: &Arc<Frame>) {
-        let [last, golden, altref] = self.refs.clone();
-        let mut new_golden = golden;
-        let mut new_altref = altref;
-        match hdr.copy_to_altref {
-            1 => new_altref = last.clone(),
-            2 => new_altref = new_golden.clone(),
-            _ => {}
-        }
-        match hdr.copy_to_golden {
-            1 => new_golden = last.clone(),
-            2 => new_golden = new_altref.clone(),
-            _ => {}
-        }
-        if hdr.refresh_golden {
-            new_golden = Some(frame.clone());
-        }
-        if hdr.refresh_altref {
-            new_altref = Some(frame.clone());
-        }
-        let new_last = if hdr.refresh_last { Some(frame.clone()) } else { last };
-        self.refs = [new_last, new_golden, new_altref];
-    }
-
     /// Prediction record of the macroblock at (`mb_x`, `mb_y`) (first partition): its segment
     /// (updating `seg_map`), skip flag and modes, kept in `mc` for the macroblocks after it.
     #[inline(always)]
@@ -289,7 +275,7 @@ impl Decoder {
         let modes = if f.key_frame {
             read_key_frame_modes(bd, &mc.above_bmodes[mb_x], &mc.left_bmodes)
         } else {
-            self.read_inter_frame_modes(bd, f.hdr, &mc.infos, pos)
+            self.read_inter_frame_modes(bd, &f.hdr, &mc.infos, pos)
         };
         mc.above_bmodes[mb_x] = [modes.bmodes[12], modes.bmodes[13], modes.bmodes[14], modes.bmodes[15]];
         mc.left_bmodes = [modes.bmodes[3], modes.bmodes[7], modes.bmodes[11], modes.bmodes[15]];
@@ -299,9 +285,21 @@ impl Decoder {
         MbRec { modes, segment, skip }
     }
 
+    /// The prediction records of every macroblock of a frame (the first partition), by row.
+    #[cfg(all(feature = "threads", not(target_arch = "wasm32")))]
+    fn read_headers(&self, bd: &mut BoolDecoder, f: &FrameParams, seg_map: &mut [u8]) -> Vec<Vec<MbRec>> {
+        let mut mc = ModeCtx::new(self.mb_w, self.mb_h);
+        (0..self.mb_h)
+            .map(|mb_y| {
+                mc.left_bmodes = [B_DC_PRED; 4];
+                (0..self.mb_w).map(|mb_x| self.read_mb_header(bd, f, seg_map, &mut mc, (mb_x, mb_y))).collect()
+            })
+            .collect()
+    }
+
     /// The macroblocks of a frame on the calling thread: each row's prediction records, tokens
     /// and reconstruction, then the loop filter of the row above.
-    fn decode_rows(&self, bd: &mut BoolDecoder, parts: &mut [BoolDecoder], f: &FrameParams, seg_map: &mut [u8]) -> Result<Frame> {
+    fn decode_rows(&self, bd: &mut BoolDecoder, parts: &mut [BoolDecoder], f: &FrameParams, recon: &InterRecon, seg_map: &mut [u8]) -> Result<Frame> {
         let (mb_w, mb_h) = (self.mb_w, self.mb_h);
         let mut frame = Frame::new(mb_w * 16, mb_h * 16);
         let mut mc = ModeCtx::new(mb_w, mb_h);
@@ -320,18 +318,18 @@ impl Decoder {
                 let rec = self.read_mb_header(bd, f, seg_map, &mut mc, (mb_x, mb_y));
                 read_mb_tokens(td, f, &self.ctx.coeff, &rec, (&mut above_nz[mb_x], &mut left_nz), &mut residual);
                 if let Some(l) = lf[0].get_mut(mb_x) {
-                    *l = (self.filter_level(f.hdr, rec.segment, &rec.modes.info), !rec.has_y2() || residual.has_coeffs);
+                    *l = (filter_level(f, rec.segment, &rec.modes.info), !rec.has_y2() || residual.has_coeffs);
                 }
-                reconstruct_mb(&mut frame, (mb_x, mb_y), 0, mb_w, &rec.modes, &residual, &f.recon)?;
+                reconstruct_mb::<true, true>(&mut frame, (mb_x, mb_y), 0, mb_w, &rec.modes, &residual, recon)?;
                 residual.clear();
             }
             if filter && mb_y > 0 {
-                loop_filter_row(&mut frame, mb_y - 1, &lf[1], f.hdr, f.key_frame);
+                loop_filter_row::<true, true>(&mut frame, mb_y - 1, &lf[1], &f.hdr, f.key_frame);
             }
             lf.swap(0, 1);
         }
         if filter && mb_h > 0 {
-            loop_filter_row(&mut frame, mb_h - 1, &lf[1], f.hdr, f.key_frame);
+            loop_filter_row::<true, true>(&mut frame, mb_h - 1, &lf[1], &f.hdr, f.key_frame);
         }
         Ok(frame)
     }
@@ -355,14 +353,15 @@ impl Decoder {
         modes
     }
 
-    /// Decode one compressed frame. Returns the picture when the frame is meant to be shown
-    /// (`show_frame`), `None` for a hidden frame (an altref).
-    pub fn decode(&mut self, data: &[u8], pts: i64) -> Result<Option<Picture>> {
+    /// Decode one compressed frame. Returns the pictures finished so far, in order: with one
+    /// thread, this frame's when it is meant to be shown (`show_frame`; none for a hidden
+    /// altref); with more, a picture may come out of a later call or [`Decoder::flush`].
+    pub fn decode(&mut self, data: &[u8], pts: i64) -> Result<Vec<Picture>> {
         let tag = FrameTag::parse(data)?;
         ensure!(tag.first_part_size > 0, "empty first partition");
         if tag.key_frame {
             self.begin_key_frame(&tag)?;
-        } else if self.refs[0].is_none() {
+        } else if !self.key_seen {
             return Err(Error::MissingReference("inter frame before the first key frame".into()));
         }
         ensure!(self.mb_w > 0 && self.mb_w <= MAX_MBS && self.mb_h <= MAX_MBS, "no frame size");
@@ -376,92 +375,64 @@ impl Decoder {
             self.sign_bias[2] = hdr.sign_bias_golden;
             self.sign_bias[3] = hdr.sign_bias_altref;
         }
-
-        let mut parts = split_token_partitions(data, first_end, hdr.partitions);
+        let parts = token_partitions(data, first_end, hdr.partitions);
         let f = FrameParams {
-            hdr: &hdr,
-            key_frame: tag.key_frame,
             dequant: self.segment_dequant(&hdr),
-            recon: InterRecon {
-                refs: self.refs.clone(),
-                filters: if tag.version == 0 || tag.version > 3 { &SIXTAP_FILTERS } else { &BILINEAR_FILTERS },
-                full_pixel: tag.version == 3,
-            },
+            hdr,
+            key_frame: tag.key_frame,
+            seg: self.seg,
+            lf: self.lf,
+            filters: if tag.version == 0 || tag.version > 3 { &SIXTAP_FILTERS } else { &BILINEAR_FILTERS },
+            full_pixel: tag.version == 3,
         };
         let mut seg_map = std::mem::take(&mut self.seg_map);
-        #[cfg(all(feature = "threads", not(target_arch = "wasm32")))]
-        let frame = match &self.pool {
-            Some(pool) => threads::decode_rows(self, pool, self.threads, &mut bd, parts, &f, &mut seg_map),
-            None => self.decode_rows(&mut bd, &mut parts, &f, &mut seg_map),
-        };
-        #[cfg(not(all(feature = "threads", not(target_arch = "wasm32"))))]
-        let frame = self.decode_rows(&mut bd, &mut parts, &f, &mut seg_map);
-        self.seg_map = seg_map;
-        let frame = frame?;
 
+        #[cfg(all(feature = "threads", not(target_arch = "wasm32")))]
+        if let Some(mut frames) = self.frames.take() {
+            // The first partition here (the next frame's segment map and probabilities depend on
+            // it), the rest on the worker threads.
+            let recs = self.read_headers(&mut bd, &f, &mut seg_map);
+            self.seg_map = seg_map;
+            let coeff = Box::new(self.ctx.coeff);
+            if let Some(s) = saved {
+                self.ctx = s;
+            }
+            self.count(&tag);
+            let job = frames::Job {
+                f,
+                coeff,
+                data: data.into(),
+                parts,
+                recs,
+                size: (self.width, self.height),
+                mb: (self.mb_w, self.mb_h),
+                pts,
+                show: tag.show_frame,
+            };
+            let out = frames.submit(job);
+            self.frames = Some(frames);
+            return out;
+        }
+
+        let mut parts: Vec<BoolDecoder> = parts.iter().map(|r| BoolDecoder::new(data.get(r.clone()).unwrap_or(&[]))).collect();
+        let recon = InterRecon { refs: self.refs.clone(), filters: f.filters, full_pixel: f.full_pixel };
+        let frame = self.decode_rows(&mut bd, &mut parts, &f, &recon, &mut seg_map);
+        self.seg_map = seg_map;
+        let frame = Arc::new(frame?);
         if let Some(s) = saved {
             self.ctx = s;
         }
+        self.refs = updated_refs(&self.refs, &f.hdr, &frame);
+        self.count(&tag);
+        Ok(if tag.show_frame { vec![picture(&frame, (self.width, self.height), pts, tag.key_frame, f.hdr.color_space)] } else { Vec::new() })
+    }
 
-        let frame = Arc::new(frame);
-        self.update_references(&hdr, &frame);
-
+    /// A frame decoded (or on its way through the worker threads).
+    fn count(&mut self, tag: &FrameTag) {
+        self.key_seen = true;
         self.stats.frames += 1;
         self.stats.key_frames += u64::from(tag.key_frame);
-        if !tag.show_frame {
-            self.stats.hidden_frames += 1;
-            return Ok(None);
-        }
-        Ok(Some(self.picture(&frame, pts, tag.key_frame, hdr.color_space)))
-    }
-
-    /// The visible part of a reconstructed frame.
-    fn picture(&self, f: &Frame, pts: i64, key: bool, color_space: u8) -> Picture {
-        let (w, h) = (self.width, self.height);
-        let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
-        let crop = |plane: &[u8], stride: usize, w: usize, h: usize| {
-            let mut out = Vec::with_capacity(w * h);
-            for r in 0..h {
-                out.extend_from_slice(plane.get(r * stride..r * stride + w).unwrap_or(&[]));
-            }
-            out
-        };
-        Picture {
-            width: w as u32,
-            height: h as u32,
-            chroma_width: cw as u32,
-            chroma_height: ch as u32,
-            y: crop(&f.y, f.w, w, h),
-            u: crop(&f.u, f.w / 2, cw, ch),
-            v: crop(&f.v, f.w / 2, cw, ch),
-            pts,
-            key,
-            color_space,
-        }
-    }
-
-    /// Loop filter level of a macroblock (15.1 with the adjustments of 9.3 and 9.4).
-    fn filter_level(&self, hdr: &FrameHeader, segment: usize, info: &MbInfo) -> u8 {
-        let mut level = i32::from(hdr.filter_level);
-        if self.seg.enabled {
-            let v = i32::from(self.seg.lf_level[segment]);
-            level = if self.seg.absolute { v } else { level + v }.clamp(0, 63);
-        }
-        if self.lf.enabled {
-            level += i32::from(self.lf.ref_deltas[usize::from(info.ref_frame)]);
-            let mode_delta = match (info.ref_frame, info.mode) {
-                (0, B_PRED) => Some(0),
-                (0, _) => None,
-                (_, MV_ZERO) => Some(1),
-                (_, MV_SPLIT) => Some(3),
-                _ => Some(2),
-            };
-            if let Some(m) = mode_delta {
-                level += i32::from(self.lf.mode_deltas[m]);
-            }
-            level = level.clamp(0, 63);
-        }
-        level as u8
+        self.stats.hidden_frames += u64::from(!tag.show_frame);
     }
 
     /// Inter prediction record (16.2-16.4, 17) of the macroblock at `idx` in `infos`.
@@ -652,13 +623,97 @@ impl ModeCtx {
     }
 }
 
-/// What decoding the macroblocks of a frame reads: its header, the dequantization factors of
-/// each segment and the inter prediction setup.
-struct FrameParams<'a> {
-    hdr: &'a FrameHeader,
+/// What decoding the macroblocks of a frame reads besides its data and the reference frames:
+/// its header, the dequantization factors of each segment, the segmentation and loop filter
+/// delta settings (for the loop filter levels) and the inter prediction filters.
+struct FrameParams {
+    hdr: FrameHeader,
     key_frame: bool,
     dequant: [Dequant; 4],
-    recon: InterRecon,
+    seg: Segmentation,
+    lf: LfDeltas,
+    filters: &'static [i32; 48],
+    full_pixel: bool,
+}
+
+/// The coefficient probabilities (13.4): by block type, band, context and token tree node.
+type CoeffProbs = [[[[u8; 11]; 3]; 8]; 4];
+
+/// The last, golden and altref frames.
+type Refs = [Option<Arc<Frame>>; 3];
+
+/// Loop filter level of a macroblock (15.1 with the adjustments of 9.3 and 9.4).
+fn filter_level(f: &FrameParams, segment: usize, info: &MbInfo) -> u8 {
+    let mut level = i32::from(f.hdr.filter_level);
+    if f.seg.enabled {
+        let v = i32::from(f.seg.lf_level[segment]);
+        level = if f.seg.absolute { v } else { level + v }.clamp(0, 63);
+    }
+    if f.lf.enabled {
+        level += i32::from(f.lf.ref_deltas[usize::from(info.ref_frame)]);
+        let mode_delta = match (info.ref_frame, info.mode) {
+            (0, B_PRED) => Some(0),
+            (0, _) => None,
+            (_, MV_ZERO) => Some(1),
+            (_, MV_SPLIT) => Some(3),
+            _ => Some(2),
+        };
+        if let Some(m) = mode_delta {
+            level += i32::from(f.lf.mode_deltas[m]);
+        }
+        level = level.clamp(0, 63);
+    }
+    level as u8
+}
+
+/// Reference updates (9.7, 9.8) of `refs` by a frame with header `hdr`: the copies first
+/// (altref, then golden from the possibly updated altref), then the refreshes with the frame.
+fn updated_refs(refs: &Refs, hdr: &FrameHeader, frame: &Arc<Frame>) -> Refs {
+    let [last, golden, altref] = refs.clone();
+    let mut new_golden = golden;
+    let mut new_altref = altref;
+    match hdr.copy_to_altref {
+        1 => new_altref = last.clone(),
+        2 => new_altref = new_golden.clone(),
+        _ => {}
+    }
+    match hdr.copy_to_golden {
+        1 => new_golden = last.clone(),
+        2 => new_golden = new_altref.clone(),
+        _ => {}
+    }
+    if hdr.refresh_golden {
+        new_golden = Some(frame.clone());
+    }
+    if hdr.refresh_altref {
+        new_altref = Some(frame.clone());
+    }
+    let new_last = if hdr.refresh_last { Some(frame.clone()) } else { last };
+    [new_last, new_golden, new_altref]
+}
+
+/// The visible `size` part of a reconstructed frame.
+fn picture(f: &Frame, (w, h): (usize, usize), pts: i64, key: bool, color_space: u8) -> Picture {
+    let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+    let crop = |plane: &[u8], stride: usize, w: usize, h: usize| {
+        let mut out = Vec::with_capacity(w * h);
+        for r in 0..h {
+            out.extend_from_slice(plane.get(r * stride..r * stride + w).unwrap_or(&[]));
+        }
+        out
+    };
+    Picture {
+        width: w as u32,
+        height: h as u32,
+        chroma_width: cw as u32,
+        chroma_height: ch as u32,
+        y: crop(&f.y, f.w, w, h),
+        u: crop(&f.u, f.w / 2, cw, ch),
+        v: crop(&f.v, f.w / 2, cw, ch),
+        pts,
+        key,
+        color_space,
+    }
 }
 
 /// Reads the segment id (when the map is updated) into `seg_map` and returns the segment of
@@ -677,14 +732,7 @@ fn read_segment(seg: &Segmentation, seg_map: &mut [u8], bd: &mut BoolDecoder, se
 /// Tokens of one macroblock (13) into `res` (cleared), or the context update of a macroblock
 /// without coefficients; `nz` are the non-zero contexts above and left.
 #[inline(always)]
-fn read_mb_tokens(
-    td: &mut BoolDecoder,
-    f: &FrameParams,
-    coeff: &[[[[u8; 11]; 3]; 8]; 4],
-    rec: &MbRec,
-    (an, ln): (&mut [u8; 9], &mut [u8; 9]),
-    res: &mut MbResidual,
-) {
+fn read_mb_tokens(td: &mut BoolDecoder, f: &FrameParams, coeff: &CoeffProbs, rec: &MbRec, (an, ln): (&mut [u8; 9], &mut [u8; 9]), res: &mut MbResidual) {
     if rec.skip {
         skip_residual(rec.has_y2(), an, ln);
     } else {
@@ -717,15 +765,15 @@ impl MbResidual {
 
 /// What inter prediction of a frame needs: the reference frames and the sub-pixel filter setup.
 struct InterRecon {
-    refs: [Option<Arc<Frame>>; 3],
+    refs: Refs,
     filters: &'static [i32; 48],
     full_pixel: bool,
 }
 
-/// Token partitions (9.5): sizes of all but the last, then the data.
-fn split_token_partitions(data: &[u8], sizes_start: usize, n: usize) -> Vec<BoolDecoder<'_>> {
+/// Where in `data` the token partitions (9.5) are: sizes of all but the last, then the data.
+fn token_partitions(data: &[u8], sizes_start: usize, n: usize) -> Vec<std::ops::Range<usize>> {
     let mut pos = sizes_start.saturating_add(3 * (n - 1)).min(data.len());
-    let mut parts: Vec<BoolDecoder> = Vec::with_capacity(n);
+    let mut parts = Vec::with_capacity(n);
     for i in 0..n {
         let size = if i + 1 < n {
             let s = sizes_start + 3 * i;
@@ -737,7 +785,7 @@ fn split_token_partitions(data: &[u8], sizes_start: usize, n: usize) -> Vec<Bool
             data.len() - pos
         };
         let end = pos.saturating_add(size).min(data.len());
-        parts.push(BoolDecoder::new(&data[pos..end]));
+        parts.push(pos..end);
         pos = end;
     }
     parts
@@ -829,12 +877,13 @@ fn read_residual(
     }
 }
 
-/// Prediction plus residue of the macroblock at (`mb_x`, `mb_y`) into `frame`, which holds the
+/// Prediction plus residue of the macroblock at (`mb_x`, `mb_y`) into `frame` (of its luma plane
+/// with `LUMA`, of its chroma planes with `CHROMA`: they are independent), which holds the
 /// frame's luma rows from `top` on (a multiple of 16; chroma from `top / 2`): 0 for the whole
 /// frame, or the row of macroblocks above for a buffer of two rows whose upper one has only its
 /// last line, the line intra prediction reads.
 #[inline(always)]
-fn reconstruct_mb(
+fn reconstruct_mb<const LUMA: bool, const CHROMA: bool>(
     frame: &mut Frame,
     (mb_x, mb_y): (usize, usize),
     top: usize,
@@ -850,7 +899,7 @@ fn reconstruct_mb(
     let ys = frame.w;
     let cs = frame.w / 2;
     if info.ref_frame == 0 {
-        if info.mode == B_PRED {
+        if LUMA && info.mode == B_PRED {
             for b in 0..16 {
                 predict::predict_subblock(&mut frame.y, ys, px, py, b, modes.bmodes[b], mb_x + 1 == mb_w);
                 if res.nonzero[b] {
@@ -858,18 +907,25 @@ fn reconstruct_mb(
                     transform::idct_add(&mut frame.y, ys, pos, &res.coeffs[b]);
                 }
             }
-        } else {
+        } else if LUMA {
             predict::predict_block(&mut frame.y, ys, px, py, 16, info.mode);
             add_luma_residue(&mut frame.y, ys, px, py, &res.coeffs, &res.nonzero);
         }
-        predict::predict_block(&mut frame.u, cs, px / 2, py / 2, 8, modes.uv_mode);
-        predict::predict_block(&mut frame.v, cs, px / 2, py / 2, 8, modes.uv_mode);
+        if CHROMA {
+            predict::predict_block(&mut frame.u, cs, px / 2, py / 2, 8, modes.uv_mode);
+            predict::predict_block(&mut frame.v, cs, px / 2, py / 2, 8, modes.uv_mode);
+        }
     } else {
         let Some(r) = recon.refs.get(usize::from(info.ref_frame) - 1).and_then(Option::as_deref) else {
             return Err(Error::MissingReference(format!("reference frame {}", info.ref_frame)));
         };
-        predict_inter_mb(r, frame, (mb_x, mb_y), top, info, recon.filters, recon.full_pixel);
-        add_luma_residue(&mut frame.y, ys, px, py, &res.coeffs, &res.nonzero);
+        predict_inter_mb::<LUMA, CHROMA>(r, frame, (mb_x, mb_y), top, info, recon.filters, recon.full_pixel);
+        if LUMA {
+            add_luma_residue(&mut frame.y, ys, px, py, &res.coeffs, &res.nonzero);
+        }
+    }
+    if !CHROMA {
+        return Ok(());
     }
     for b in 16..24 {
         if res.nonzero[b] {
@@ -1007,7 +1063,15 @@ fn add_luma_residue(plane: &mut [u8], stride: usize, px: usize, py: usize, coeff
 }
 
 /// Inter prediction of a macroblock (18) into `frame` (which holds the frame's rows from `top` on).
-fn predict_inter_mb(r: &Frame, frame: &mut Frame, (mb_x, mb_y): (usize, usize), top: usize, info: &MbInfo, filters: &[i32; 48], full_pixel: bool) {
+fn predict_inter_mb<const LUMA: bool, const CHROMA: bool>(
+    r: &Frame,
+    frame: &mut Frame,
+    (mb_x, mb_y): (usize, usize),
+    top: usize,
+    info: &MbInfo,
+    filters: &[i32; 48],
+    full_pixel: bool,
+) {
     let (px, py) = (mb_x * 16, mb_y * 16);
     let ys = frame.w;
     let cs = frame.w / 2;
@@ -1017,13 +1081,18 @@ fn predict_inter_mb(r: &Frame, frame: &mut Frame, (mb_x, mb_y): (usize, usize), 
     let fp = |v: i32| if full_pixel { v & !7 } else { v };
     if info.mode != MV_SPLIT {
         let m = info.mv;
-        predict::predict_inter(
-            &ry,
-            DstPlane { data: &mut frame.y, stride: ys, top },
-            BlockRect { x: px, y: py, w: 16, h: 16 },
-            (m.col * 2, m.row * 2),
-            filters,
-        );
+        if LUMA {
+            predict::predict_inter(
+                &ry,
+                DstPlane { data: &mut frame.y, stride: ys, top },
+                BlockRect { x: px, y: py, w: 16, h: 16 },
+                (m.col * 2, m.row * 2),
+                filters,
+            );
+        }
+        if !CHROMA {
+            return;
+        }
         // chroma: the luma vector in quarter pixels is the chroma vector in eighth pixels
         let (cx, cy) = (fp(m.col), fp(m.row));
         predict::predict_inter(
@@ -1042,10 +1111,13 @@ fn predict_inter_mb(r: &Frame, frame: &mut Frame, (mb_x, mb_y): (usize, usize), 
         );
         return;
     }
-    for b in 0..16 {
+    for b in (0..16).filter(|_| LUMA) {
         let m = info.bmv[b];
         let rect = BlockRect { x: px + 4 * (b & 3), y: py + 4 * (b >> 2), w: 4, h: 4 };
         predict::predict_inter(&ry, DstPlane { data: &mut frame.y, stride: ys, top }, rect, (m.col * 2, m.row * 2), filters);
+    }
+    if !CHROMA {
+        return;
     }
     for i in 0..2 {
         for j in 0..2 {
@@ -1066,55 +1138,112 @@ fn predict_inter_mb(r: &Frame, frame: &mut Frame, (mb_x, mb_y): (usize, usize), 
 /// Loop filter (15.1) of macroblock row `mb_y`, whose macroblocks have the levels and inner
 /// edge flags `lf_row`; the rows are filtered in order, so the frame's macroblocks are in raster
 /// order. The filter changes the 3 rows of samples above the row and the row itself, which no
-/// intra prediction of a later row reads.
-fn loop_filter_row(frame: &mut Frame, mb_y: usize, lf_row: &[(u8, bool)], hdr: &FrameHeader, key_frame: bool) {
+/// intra prediction of a later row reads. `LUMA` / `CHROMA`: the planes filtered (each edge
+/// filter reads and changes the samples of one plane, so they may be filtered apart). Together,
+/// the planes of a macroblock are filtered in turn: luma alone, each horizontal edge loads what
+/// the vertical ones just stored and waits for it.
+fn loop_filter_row<const LUMA: bool, const CHROMA: bool>(frame: &mut Frame, mb_y: usize, lf_row: &[(u8, bool)], hdr: &FrameHeader, key_frame: bool) {
+    for (mb_x, &lf) in lf_row.iter().enumerate() {
+        loop_filter_mb::<LUMA, CHROMA>(frame, (mb_x, mb_y), lf, hdr, key_frame);
+    }
+}
+
+/// [`loop_filter_row`] of rows `mb_y` and `mb_y + 1` (levels and inner edge flags `lf`)
+/// together: each macroblock of the lower row after the one above and to the right of it in the
+/// upper row (whose left edge reaches into it), the two rows taking turns. Their macroblocks
+/// filtered in a row are two columns apart, changing samples far apart, so each pixel goes
+/// through the same filters in the same order as in raster order; but one plane's horizontal
+/// edges no longer wait for the samples its vertical edges just stored.
+#[cfg(all(feature = "threads", not(target_arch = "wasm32")))]
+fn loop_filter_rows<const LUMA: bool, const CHROMA: bool>(frame: &mut Frame, mb_y: usize, lf: [&[(u8, bool)]; 2], hdr: &FrameHeader, key_frame: bool) {
+    let [upper, lower] = lf;
+    let mut ahead = upper.iter().enumerate();
+    for (mb_x, &l) in lower.iter().enumerate() {
+        for (ux, &u) in ahead.by_ref().take(if mb_x == 0 { 2 } else { 1 }) {
+            loop_filter_mb::<LUMA, CHROMA>(frame, (ux, mb_y), u, hdr, key_frame);
+        }
+        loop_filter_mb::<LUMA, CHROMA>(frame, (mb_x, mb_y + 1), l, hdr, key_frame);
+    }
+    for (ux, &u) in ahead {
+        loop_filter_mb::<LUMA, CHROMA>(frame, (ux, mb_y), u, hdr, key_frame);
+    }
+}
+
+/// [`loop_filter_row`] of the macroblock at (`mb_x`, `mb_y`), with its loop filter level and
+/// inner edge flag `(level, inner)`.
+#[inline(always)]
+fn loop_filter_mb<const LUMA: bool, const CHROMA: bool>(
+    frame: &mut Frame,
+    (mb_x, mb_y): (usize, usize),
+    (level, inner): (u8, bool),
+    hdr: &FrameHeader,
+    key_frame: bool,
+) {
     let ys = frame.w;
     let cs = frame.w / 2;
     let simple = hdr.filter_type == 1;
-    for (mb_x, &(level, inner)) in lf_row.iter().enumerate() {
-        if level == 0 {
-            continue;
-        }
-        let prm = Params::new(level, hdr.sharpness, key_frame);
-        let y0 = mb_y * 16 * ys + mb_x * 16;
-        let c0 = mb_y * 8 * cs + mb_x * 8;
-        if simple {
-            if mb_x > 0 {
-                loopfilter::filter_edge::<16>(&mut frame.y, ys, y0, true, Kind::Simple, &prm);
-            }
-            if inner {
-                for x in [4, 8, 12] {
-                    loopfilter::filter_edge::<16>(&mut frame.y, ys, y0 + x, true, Kind::SimpleInner, &prm);
-                }
-            }
-            if mb_y > 0 {
-                loopfilter::filter_edge::<16>(&mut frame.y, ys, y0, false, Kind::Simple, &prm);
-            }
-            if inner {
-                for y in [4, 8, 12] {
-                    loopfilter::filter_edge::<16>(&mut frame.y, ys, y0 + y * ys, false, Kind::SimpleInner, &prm);
-                }
-            }
-            continue;
+    if level == 0 {
+        return;
+    }
+    let prm = Params::new(level, hdr.sharpness, key_frame);
+    let y0 = mb_y * 16 * ys + mb_x * 16;
+    let c0 = mb_y * 8 * cs + mb_x * 8;
+    if simple {
+        if !LUMA {
+            // the simple filter leaves the chroma planes alone (15.2)
+            return;
         }
         if mb_x > 0 {
-            loopfilter::filter_edge::<16>(&mut frame.y, ys, y0, true, Kind::NormalMb, &prm);
-            loopfilter::filter_edge_uv(&mut frame.u, &mut frame.v, cs, c0, true, Kind::NormalMb, &prm);
+            loopfilter::filter_edge::<16>(&mut frame.y, ys, y0, true, Kind::Simple, &prm);
         }
         if inner {
             for x in [4, 8, 12] {
-                loopfilter::filter_edge::<16>(&mut frame.y, ys, y0 + x, true, Kind::NormalSub, &prm);
+                loopfilter::filter_edge::<16>(&mut frame.y, ys, y0 + x, true, Kind::SimpleInner, &prm);
             }
-            loopfilter::filter_edge_uv(&mut frame.u, &mut frame.v, cs, c0 + 4, true, Kind::NormalSub, &prm);
         }
         if mb_y > 0 {
-            loopfilter::filter_edge::<16>(&mut frame.y, ys, y0, false, Kind::NormalMb, &prm);
-            loopfilter::filter_edge_uv(&mut frame.u, &mut frame.v, cs, c0, false, Kind::NormalMb, &prm);
+            loopfilter::filter_edge::<16>(&mut frame.y, ys, y0, false, Kind::Simple, &prm);
         }
         if inner {
             for y in [4, 8, 12] {
+                loopfilter::filter_edge::<16>(&mut frame.y, ys, y0 + y * ys, false, Kind::SimpleInner, &prm);
+            }
+        }
+        return;
+    }
+    if mb_x > 0 {
+        if LUMA {
+            loopfilter::filter_edge::<16>(&mut frame.y, ys, y0, true, Kind::NormalMb, &prm);
+        }
+        if CHROMA {
+            loopfilter::filter_edge_uv(&mut frame.u, &mut frame.v, cs, c0, true, Kind::NormalMb, &prm);
+        }
+    }
+    if inner {
+        if LUMA {
+            for x in [4, 8, 12] {
+                loopfilter::filter_edge::<16>(&mut frame.y, ys, y0 + x, true, Kind::NormalSub, &prm);
+            }
+        }
+        if CHROMA {
+            loopfilter::filter_edge_uv(&mut frame.u, &mut frame.v, cs, c0 + 4, true, Kind::NormalSub, &prm);
+        }
+    }
+    if mb_y > 0 {
+        if LUMA {
+            loopfilter::filter_edge::<16>(&mut frame.y, ys, y0, false, Kind::NormalMb, &prm);
+        }
+        if CHROMA {
+            loopfilter::filter_edge_uv(&mut frame.u, &mut frame.v, cs, c0, false, Kind::NormalMb, &prm);
+        }
+    }
+    if inner {
+        if LUMA {
+            for y in [4, 8, 12] {
                 loopfilter::filter_edge::<16>(&mut frame.y, ys, y0 + y * ys, false, Kind::NormalSub, &prm);
             }
+        }
+        if CHROMA {
             loopfilter::filter_edge_uv(&mut frame.u, &mut frame.v, cs, c0 + 4 * cs, false, Kind::NormalSub, &prm);
         }
     }
