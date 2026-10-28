@@ -254,7 +254,7 @@ impl Frame {
     }
 
     /// Copy a w x h luma window at (x0, y0) with edge replication into `out` (stride `os`).
-    pub fn luma_window<S: Sample>(&self, x0: i32, y0: i32, w: usize, h: usize, out: &mut [i16], os: usize) {
+    pub fn luma_window<S: Sample>(&self, (x0, y0): (i32, i32), (w, h): (usize, usize), out: &mut [i16], os: usize) {
         let (width, height) = (self.width as i32, self.height as i32);
         let sh = self.log2_ctb;
         let mask = (1i32 << sh) - 1;
@@ -267,7 +267,7 @@ impl Frame {
     }
 
     /// Copy a w x h window of chroma component `c` (0 = Cb, 1 = Cr) with edge replication.
-    pub fn chroma_window<S: Sample>(&self, c: usize, x0: i32, y0: i32, w: usize, h: usize, out: &mut [i16], os: usize) {
+    pub fn chroma_window<S: Sample>(&self, c: usize, (x0, y0): (i32, i32), (w, h): (usize, usize), out: &mut [i16], os: usize) {
         let (cw, ch) = (self.cwidth as i32, self.cheight as i32);
         let sh = self.log2_ctb - 1;
         let mask = (1i32 << sh) - 1;
@@ -322,10 +322,9 @@ impl Frame {
 
     /// Copy the w x h block at (x0, y0) of plane `c` (0 = luma, 1 = Cb, 2 = Cr) into `dst`
     /// (stride `ds`), samples outside the picture replicated from its edges (8-228, 8-229).
-    #[allow(clippy::too_many_arguments)]
-    pub fn copy_block<S: Sample>(&self, c: usize, x0: i32, y0: i32, w: usize, h: usize, dst: &mut [S], ds: usize) {
+    pub fn copy_block<S: Sample>(&self, c: usize, (x0, y0): (i32, i32), (w, h): (usize, usize), dst: &mut [S], ds: usize) {
         // Inside the picture horizontally: the lines in place, each CTB row looked up once.
-        let done = if c == 0 { self.copy_in_place::<S, 64>(c, x0, y0, w, h, dst, ds) } else { self.copy_in_place::<S, 32>(c, x0, y0, w, h, dst, ds) };
+        let done = if c == 0 { self.copy_in_place::<S, 64>(c, (x0, y0), (w, h), dst, ds) } else { self.copy_in_place::<S, 32>(c, (x0, y0), (w, h), dst, ds) };
         if done {
             return;
         }
@@ -356,8 +355,7 @@ impl Frame {
 
     /// [`Frame::copy_block`] from the lines in place ([`Frame::window_rows`]) for blocks of up to
     /// `R` lines; false when the block is not inside the picture horizontally.
-    #[allow(clippy::too_many_arguments)]
-    fn copy_in_place<S: Sample, const R: usize>(&self, c: usize, x0: i32, y0: i32, w: usize, h: usize, dst: &mut [S], ds: usize) -> bool {
+    fn copy_in_place<S: Sample, const R: usize>(&self, c: usize, (x0, y0): (i32, i32), (w, h): (usize, usize), dst: &mut [S], ds: usize) -> bool {
         let mut rows: [&[S]; R] = [&[]; R];
         let Some(rows) = rows.get_mut(..h) else { return false };
         if !self.window_rows(c, x0, y0, w, rows) {
@@ -687,10 +685,10 @@ mod tests {
         assert!(f.row::<u16>(0).is_none());
         assert_eq!(f.row::<u8>(1).map(|r| r.y[0]), Some(128));
         let mut win = [7i16; 64];
-        f.luma_window::<u16>(-3, -3, 8, 8, &mut win, 8);
+        f.luma_window::<u16>((-3, -3), (8, 8), &mut win, 8);
         assert!(win.iter().all(|&v| v == 7));
         let mut dst = [5u16; 16];
-        f.copy_block::<u16>(0, 0, 0, 4, 4, &mut dst, 4);
+        f.copy_block::<u16>(0, (0, 0), (4, 4), &mut dst, 4);
         assert!(dst.iter().all(|&v| v == 5));
         let g = Frame::gray(1, 0, &Frame::new(0, 0, 16, 8, 4, 10, 10));
         assert!(g.is_complete());

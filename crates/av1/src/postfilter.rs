@@ -2,7 +2,9 @@
 //! super-resolution upscaling (7.16) and loop restoration (7.17).
 
 use crate::frame::RowBand;
-use crate::spec_tables::*;
+use crate::spec_tables::{
+    GLOBAL_GLOBALMV, GLOBALMV, INTRA_FRAME, MAX_LOOP_FILTER, NEARESTMV, NUM_4X4_BLOCKS_HIGH, NUM_4X4_BLOCKS_WIDE, SEG_LVL_ALT_LF_Y_V, TX_HEIGHT, TX_WIDTH,
+};
 use crate::state::FrameState;
 use crate::stats::{DecodeStats, Stage, Timer};
 use filmcraft_simd::{LfSize, LfThresh};

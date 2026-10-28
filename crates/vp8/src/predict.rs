@@ -257,21 +257,27 @@ impl RefPlane<'_> {
     }
 }
 
-/// Predict the `w`x`h` block at `(bx, by)` of a plane from `reference` displaced by the motion
-/// vector `(mvx, mvy)` in eighth pixels, using `filters` (8 x 6 taps: the six-tap or bilinear
-/// set, 18.3), writing into `dst` (same layout as the block's plane).
-pub fn predict_inter(
-    reference: &RefPlane,
-    dst: &mut [u8],
-    dst_stride: usize,
-    bx: usize,
-    by: usize,
-    w: usize,
-    h: usize,
-    mvx: i32,
-    mvy: i32,
-    filters: &[i32; 48],
-) {
+/// Destination plane of an inter prediction (same layout as the block's plane).
+pub struct DstPlane<'a> {
+    pub data: &'a mut [u8],
+    pub stride: usize,
+}
+
+/// A `w`x`h` block at `(x, y)` of a plane.
+#[derive(Clone, Copy)]
+pub struct BlockRect {
+    pub x: usize,
+    pub y: usize,
+    pub w: usize,
+    pub h: usize,
+}
+
+/// Predict the block `rect` of a plane from `reference` displaced by the motion vector
+/// `(mvx, mvy)` in eighth pixels, using `filters` (8 x 6 taps: the six-tap or bilinear set,
+/// 18.3), writing into `dst`.
+pub fn predict_inter(reference: &RefPlane, dst: DstPlane, rect: BlockRect, (mvx, mvy): (i32, i32), filters: &[i32; 48]) {
+    let DstPlane { data: dst, stride: dst_stride } = dst;
+    let BlockRect { x: bx, y: by, w, h } = rect;
     let x0 = bx as isize + (mvx >> 3) as isize;
     let y0 = by as isize + (mvy >> 3) as isize;
     let (fx, fy) = ((mvx & 7) as usize, (mvy & 7) as usize);
@@ -435,7 +441,7 @@ mod tests {
             let (mvx, mvy) = ((next() % 160) as i32 - 80, (next() % 160) as i32 - 80);
             let mut got = vec![9u8; dw * dh];
             let mut want = got.clone();
-            predict_inter(&reference, &mut got, dw, bx, by, w, w, mvx, mvy, filters);
+            predict_inter(&reference, DstPlane { data: &mut got, stride: dw }, BlockRect { x: bx, y: by, w, h: w }, (mvx, mvy), filters);
             predict_inter_window(&reference, &mut want, dw, bx, by, w, w, mvx, mvy, filters);
             let (x0, y0) = (bx as i32 + (mvx >> 3), by as i32 + (mvy >> 3));
             inside += usize::from(x0 >= 2 && y0 >= 2 && x0 + w as i32 + 3 <= rw as i32 && y0 + w as i32 + 3 <= rh as i32);

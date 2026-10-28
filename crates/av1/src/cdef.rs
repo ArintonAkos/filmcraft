@@ -9,7 +9,7 @@
 use crate::frame::{FrameBuf, RowBand};
 use crate::par::Pool;
 use crate::postfilter::bands;
-use crate::spec_tables::*;
+use crate::spec_tables::{CDEF_DIRECTIONS, CDEF_PRI_TAPS, CDEF_SEC_TAPS, CDEF_UV_DIR};
 use crate::state::FrameState;
 use filmcraft_simd::CdefTap;
 
@@ -206,7 +206,7 @@ fn cdef_block(
         // Luma filters along its direction only with a primary strength (before the variance
         // adjustment).
         let fdir = if plane == 0 && pri0 == 0 { 0 } else { dir };
-        let out = filter(fs, &src, plane, r, c, pri, sec, damping, fdir);
+        let out = filter(fs, &src, plane, (r, c), Strength { pri, sec, damping, dir: fdir });
         if let Some(o) = out
             && let Some(old) = pending[plane].replace(o)
         {
@@ -250,8 +250,17 @@ fn constrain(diff: i32, threshold: i32, adj: u32) -> i32 {
     if diff < 0 { -mag } else { mag }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn filter(fs: &FrameState, src: &Src, plane: usize, r: usize, c: usize, pri: i32, sec: i32, damping: i32, dir: usize) -> Option<Pending> {
+/// Primary/secondary strengths, damping and direction for one plane of one 8x8 block.
+#[derive(Clone, Copy)]
+struct Strength {
+    pri: i32,
+    sec: i32,
+    damping: i32,
+    dir: usize,
+}
+
+fn filter(fs: &FrameState, src: &Src, plane: usize, (r, c): (usize, usize), st: Strength) -> Option<Pending> {
+    let Strength { pri, sec, damping, dir } = st;
     if pri == 0 && sec == 0 {
         // Every tap contributes 0 and the clamp to [min, max] keeps x: CdefFrame = CurrFrame.
         return None;

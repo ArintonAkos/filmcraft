@@ -1,4 +1,50 @@
-use super::*;
+use super::{
+    AC_QLOOKUP, ADJUSTED_TX_SIZE, ADST_FLIPADST, BR_CDF_SIZE, COEFF_BASE_CTX_OFFSET, COEFF_BASE_POS_CTX_OFFSET, COEFF_BASE_RANGE, DC_QLOOKUP, DCT_DCT,
+    DCT_FLIPADST, DEFAULT_SCAN_4X4, DEFAULT_SCAN_4X8, DEFAULT_SCAN_4X16, DEFAULT_SCAN_8X4, DEFAULT_SCAN_8X8, DEFAULT_SCAN_8X16, DEFAULT_SCAN_8X32,
+    DEFAULT_SCAN_16X4, DEFAULT_SCAN_16X8, DEFAULT_SCAN_16X16, DEFAULT_SCAN_16X32, DEFAULT_SCAN_32X8, DEFAULT_SCAN_32X16, DEFAULT_SCAN_32X32,
+    FILTER_INTRA_MODE_TO_INTRA_DIR, FLIPADST_ADST, FLIPADST_DCT, FLIPADST_FLIPADST, H_ADST, H_DCT, H_FLIPADST, IDTX, MAG_REF_OFFSET_WITH_TX_CLASS,
+    MCOL_SCAN_4X4, MCOL_SCAN_4X8, MCOL_SCAN_4X16, MCOL_SCAN_8X4, MCOL_SCAN_8X8, MCOL_SCAN_8X16, MCOL_SCAN_16X4, MCOL_SCAN_16X8, MCOL_SCAN_16X16, MODE_TO_TXFM,
+    MROW_SCAN_4X4, MROW_SCAN_4X8, MROW_SCAN_4X16, MROW_SCAN_8X4, MROW_SCAN_8X8, MROW_SCAN_8X16, MROW_SCAN_16X4, MROW_SCAN_16X8, MROW_SCAN_16X16,
+    NUM_BASE_LEVELS, QM_OFFSET, QUANTIZER_MATRIX, SIG_REF_DIFF_OFFSET, SIG_REF_DIFF_OFFSET_NUM, SymbolDecoder, TX_4X4, TX_4X8, TX_4X16, TX_8X4, TX_8X8,
+    TX_8X16, TX_8X32, TX_16X4, TX_16X8, TX_16X16, TX_16X32, TX_16X64, TX_32X8, TX_32X16, TX_32X32, TX_32X64, TX_64X16, TX_64X32, TX_64X64, TX_CLASS_2D,
+    TX_CLASS_HORIZ, TX_CLASS_VERT, TX_HEIGHT, TX_HEIGHT_LOG2, TX_SET_DCTONLY, TX_SET_INTER_1, TX_SET_INTER_2, TX_SET_INTER_3, TX_SET_INTRA_1, TX_SET_INTRA_2,
+    TX_SIZE_SQR, TX_SIZE_SQR_UP, TX_SIZES_ALL, TX_TYPE_IN_SET_INTER, TX_TYPE_IN_SET_INTRA, TX_TYPE_INTER_INV_SET1, TX_TYPE_INTER_INV_SET2,
+    TX_TYPE_INTER_INV_SET3, TX_TYPE_INTRA_INV_SET1, TX_TYPE_INTRA_INV_SET2, TX_WIDTH, TX_WIDTH_LOG2, TileDecoder, V_ADST, V_DCT, V_FLIPADST, block_height,
+    block_width, inverse_transform_2d,
+};
+
+/// Reads the coeff_br increments that raise a base level past NUM_BASE_LEVELS, with the CDF of
+/// the coefficient's context.
+#[inline(always)]
+fn read_range_level(sd: &mut SymbolDecoder, cdf: &mut [u16]) -> i32 {
+    let mut total = 0;
+    for _ in 0..(COEFF_BASE_RANGE / (BR_CDF_SIZE - 1)) {
+        let br = sd.read_symbol(cdf) as i32;
+        total += br;
+        if br < (BR_CDF_SIZE - 1) as i32 {
+            break;
+        }
+    }
+    total
+}
+
+/// Position and size (in 4x4 units) of the transform block being coded.
+#[derive(Clone, Copy)]
+struct TxbPos {
+    x4: usize,
+    y4: usize,
+    w4: usize,
+    h4: usize,
+}
+
+/// Transform size, class and CDF selectors shared by the coefficient reading steps.
+#[derive(Clone, Copy)]
+struct TxbClass {
+    tx_sz: usize,
+    tx_class: usize,
+    tx_sz_ctx: usize,
+    ptype: usize,
+}
 
 impl<'a, 'f> TileDecoder<'a, 'f> {
     // ---- coefficients -----------------------------------------------------------------------
@@ -142,181 +188,202 @@ impl<'a, 'f> TileDecoder<'a, 'f> {
 
     /// coeffs( ): returns eob.
     pub(super) fn coeffs(&mut self, plane: usize, start_x: usize, start_y: usize, tx_sz: usize) -> usize {
-        let x4 = start_x >> 2;
-        let y4 = start_y >> 2;
-        let w4 = TX_WIDTH[tx_sz] as usize >> 2;
-        let h4 = TX_HEIGHT[tx_sz] as usize >> 2;
+        let pos = TxbPos { x4: start_x >> 2, y4: start_y >> 2, w4: TX_WIDTH[tx_sz] as usize >> 2, h4: TX_HEIGHT[tx_sz] as usize >> 2 };
         let tx_sz_ctx = (TX_SIZE_SQR[tx_sz] as usize + TX_SIZE_SQR_UP[tx_sz] as usize + 1) >> 1;
-        let ptype = (plane > 0) as usize;
         // Every position below eob is written before it is read: `quant` needs no clearing.
         self.nonzero.clear();
         let mut eob = 0usize;
         let mut cul_level = 0u32;
         let mut dc_category = 0u8;
-        let ctx = self.all_zero_ctx(plane, tx_sz, x4, y4, w4, h4);
+        let ctx = self.all_zero_ctx(plane, tx_sz, pos.x4, pos.y4, pos.w4, pos.h4);
         let all_zero = self.sd.read_symbol(&mut self.cdf.txb_skip[tx_sz_ctx][ctx]) == 1;
         if all_zero {
             if plane == 0 {
-                self.set_tx_types(x4, y4, tx_sz, DCT_DCT);
+                self.set_tx_types(pos.x4, pos.y4, tx_sz, DCT_DCT);
             }
         } else {
             if plane == 0 {
-                self.transform_type(x4, y4, tx_sz);
+                self.transform_type(pos.x4, pos.y4, tx_sz);
             }
-            self.plane_tx_type = self.compute_tx_type(plane, tx_sz, x4, y4);
+            self.plane_tx_type = self.compute_tx_type(plane, tx_sz, pos.x4, pos.y4);
             let scan = self.get_scan(tx_sz);
-            let eob_multisize = (TX_WIDTH_LOG2[tx_sz] as usize).min(5) + (TX_HEIGHT_LOG2[tx_sz] as usize).min(5) - 4;
-            let tx_class = get_tx_class(self.plane_tx_type);
-            let ectx = (tx_class != TX_CLASS_2D) as usize;
-            let eob_pt = 1 + match eob_multisize {
-                0 => self.sd.read_symbol(&mut self.cdf.eob_pt_16[ptype][ectx]),
-                1 => self.sd.read_symbol(&mut self.cdf.eob_pt_32[ptype][ectx]),
-                2 => self.sd.read_symbol(&mut self.cdf.eob_pt_64[ptype][ectx]),
-                3 => self.sd.read_symbol(&mut self.cdf.eob_pt_128[ptype][ectx]),
-                4 => self.sd.read_symbol(&mut self.cdf.eob_pt_256[ptype][ectx]),
-                5 => self.sd.read_symbol(&mut self.cdf.eob_pt_512[ptype]),
-                _ => self.sd.read_symbol(&mut self.cdf.eob_pt_1024[ptype]),
-            };
-            eob = if eob_pt < 2 { eob_pt } else { (1 << (eob_pt - 2)) + 1 };
-            let eob_shift = eob_pt as i32 - 3;
-            if eob_shift >= 0 {
-                let extra = self.sd.read_symbol(&mut self.cdf.eob_extra[tx_sz_ctx][ptype][eob_pt - 3]);
-                if extra == 1 {
-                    eob += 1 << eob_shift;
-                }
-                for i in 1..(eob_pt as i32 - 2).max(0) {
-                    let sh = (eob_pt as i32 - 2).max(0) - 1 - i;
-                    if self.sd.read_literal(1) == 1 {
-                        eob += 1 << sh;
-                    }
-                }
-            }
-            let adj = ADJUSTED_TX_SIZE[tx_sz] as usize;
-            let bwl = TX_WIDTH_LOG2[adj] as usize;
-            let height = TX_HEIGHT[adj] as usize;
-            let width = 1usize << bwl;
-            // Levels with TX_PAD zero columns / rows past the right / bottom edge, so the
-            // neighbourhood sums need no bounds checks (out-of-range neighbours count as 0).
-            let stride = width + TX_PAD;
-            let mut lev = std::mem::take(&mut self.levels);
-            lev[..(height + TX_PAD) * stride].fill(0);
-            let sig = &SIG_REF_DIFF_OFFSET[tx_class];
-            let sig_off: [usize; SIG_REF_DIFF_OFFSET_NUM] = std::array::from_fn(|i| sig[i][0] as usize * stride + sig[i][1] as usize);
-            let magr = &MAG_REF_OFFSET_WITH_TX_CLASS[tx_class];
-            let mag_off: [usize; 3] = std::array::from_fn(|i| magr[i][0] as usize * stride + magr[i][1] as usize);
-            // The nonzero list grows without a branch on the level (as random as the symbols).
-            let mut nz = std::mem::take(&mut self.nonzero);
-            nz.resize(eob, 0);
-            let mut count = 0usize;
-            // Per coefficient: the CDFs of this block's size and plane type, and the base
-            // context offset of each position, looked up once.
-            let sd = &mut self.sd;
-            let quant = &mut self.quant;
-            let cdf = &mut *self.cdf;
-            let base_eob = &mut cdf.coeff_base_eob[tx_sz_ctx][ptype];
-            let base = &mut cdf.coeff_base[tx_sz_ctx][ptype];
-            let base_range = &mut cdf.coeff_br[tx_sz_ctx.min(TX_32X32)][ptype];
-            let offsets = base_ctx_offsets(tx_sz, tx_class);
-            for c in (0..eob).rev() {
-                let pos = scan[c] as usize;
-                // row * stride + col, with stride = width + TX_PAD
-                let li = pos + ((pos >> bwl) * TX_PAD);
-                let mut level = if c == eob - 1 {
-                    let ctx = coeff_base_eob_ctx(c, bwl, height);
-                    sd.read_symbol(&mut base_eob[ctx]) as i32 + 1
-                } else {
-                    let mut mag = 0u32;
-                    for o in sig_off {
-                        mag += (lev[li + o] as u32).min(3);
-                    }
-                    let off = offsets.get(pos).copied().unwrap_or(0);
-                    // offset 255: the DC of a 2D transform, context 0 whatever the neighbours
-                    let ctx = if off == 255 { 0 } else { ((mag + 1) >> 1).min(4) as usize + off as usize };
-                    sd.read_symbol(&mut base[ctx]) as i32
-                };
-                if level > NUM_BASE_LEVELS as i32 {
-                    // Levels are at most NUM_BASE_LEVELS + COEFF_BASE_RANGE + 1 = 15 here (the
-                    // Golomb remainders come later): the specification's clamp to 15 is a no-op.
-                    let mut mag = 0u32;
-                    for o in mag_off {
-                        mag += lev[li + o] as u32;
-                    }
-                    let (row, col) = (pos >> bwl, pos & (width - 1));
-                    let ctx = coeff_br_ctx(tx_class, row, col, pos, mag);
-                    for _ in 0..(COEFF_BASE_RANGE / (BR_CDF_SIZE - 1)) {
-                        let br = sd.read_symbol(&mut base_range[ctx]) as i32;
-                        level += br;
-                        if br < (BR_CDF_SIZE - 1) as i32 {
-                            break;
-                        }
-                    }
-                }
-                quant[pos] = level;
-                lev[li] = level as u8;
-                if let Some(e) = nz.get_mut(count) {
-                    *e = pos as u16;
-                }
-                count += (level != 0) as usize;
-            }
-            nz.truncate(count);
-            self.nonzero = nz;
-            self.levels = lev;
-            // Signs and Golomb remainders of the nonzero coefficients, in scan order (the
-            // reverse of the level pass's); zero ones have neither. The scans start at 0.
-            let nonzero = std::mem::take(&mut self.nonzero);
-            for &pos in nonzero.iter().rev() {
-                let pos = pos as usize;
-                let sign = if pos == 0 {
-                    let ctx = self.dc_sign_ctx(plane, x4, y4, w4, h4);
-                    self.sd.read_symbol(&mut self.cdf.dc_sign[ptype][ctx]) as i32
-                } else {
-                    self.sd.read_bool() as i32
-                };
-                let Some(q) = self.quant.get_mut(pos) else {
-                    continue;
-                };
-                let mut v = *q;
-                if v > (NUM_BASE_LEVELS + COEFF_BASE_RANGE) as i32 {
-                    let mut length = 0;
-                    loop {
-                        length += 1;
-                        if self.sd.read_bool() == 1 {
-                            break;
-                        }
-                        if length > 32 {
-                            break;
-                        }
-                    }
-                    let mut x: u32 = 1;
-                    for _ in (0..length - 1).rev() {
-                        x = (x << 1) | self.sd.read_bool();
-                    }
-                    v = (x as i64 + COEFF_BASE_RANGE as i64 + NUM_BASE_LEVELS as i64).min(i32::MAX as i64) as i32;
-                }
-                if pos == 0 && v > 0 {
-                    dc_category = 2 - sign as u8;
-                }
-                v &= 0xFFFFF;
-                cul_level += v as u32;
-                // The sign applied without a branch: signs are close to random.
-                *q = (v ^ -sign) + sign;
-            }
-            self.nonzero = nonzero;
-            cul_level = cul_level.min(63);
+            let tc = TxbClass { tx_sz, tx_class: get_tx_class(self.plane_tx_type), tx_sz_ctx, ptype: (plane > 0) as usize };
+            eob = self.read_eob(&tc);
+            self.read_levels(&tc, scan, eob);
+            (cul_level, dc_category) = self.read_signs_and_remainders(plane, pos);
         }
-        for i in 0..w4 {
-            if x4 + i < self.t.above_level[plane].len() {
-                self.t.above_level[plane][x4 + i] = cul_level as u8;
-                self.t.above_dc[plane][x4 + i] = dc_category;
+        self.store_level_context(plane, pos, cul_level, dc_category);
+        eob
+    }
+
+    /// Reads eob_pt, eob_extra and the extra eob bits, returning the end-of-block position.
+    fn read_eob(&mut self, tc: &TxbClass) -> usize {
+        let TxbClass { tx_sz, tx_class, tx_sz_ctx, ptype } = *tc;
+        let eob_multisize = (TX_WIDTH_LOG2[tx_sz] as usize).min(5) + (TX_HEIGHT_LOG2[tx_sz] as usize).min(5) - 4;
+        let ectx = (tx_class != TX_CLASS_2D) as usize;
+        let eob_pt = 1 + match eob_multisize {
+            0 => self.sd.read_symbol(&mut self.cdf.eob_pt_16[ptype][ectx]),
+            1 => self.sd.read_symbol(&mut self.cdf.eob_pt_32[ptype][ectx]),
+            2 => self.sd.read_symbol(&mut self.cdf.eob_pt_64[ptype][ectx]),
+            3 => self.sd.read_symbol(&mut self.cdf.eob_pt_128[ptype][ectx]),
+            4 => self.sd.read_symbol(&mut self.cdf.eob_pt_256[ptype][ectx]),
+            5 => self.sd.read_symbol(&mut self.cdf.eob_pt_512[ptype]),
+            _ => self.sd.read_symbol(&mut self.cdf.eob_pt_1024[ptype]),
+        };
+        let mut eob = if eob_pt < 2 { eob_pt } else { (1 << (eob_pt - 2)) + 1 };
+        let eob_shift = eob_pt as i32 - 3;
+        if eob_shift >= 0 {
+            let extra = self.sd.read_symbol(&mut self.cdf.eob_extra[tx_sz_ctx][ptype][eob_pt - 3]);
+            if extra == 1 {
+                eob += 1 << eob_shift;
             }
-        }
-        for i in 0..h4 {
-            if y4 + i < self.t.left_level[plane].len() {
-                self.t.left_level[plane][y4 + i] = cul_level as u8;
-                self.t.left_dc[plane][y4 + i] = dc_category;
+            for i in 1..(eob_pt as i32 - 2).max(0) {
+                let sh = (eob_pt as i32 - 2).max(0) - 1 - i;
+                if self.sd.read_literal(1) == 1 {
+                    eob += 1 << sh;
+                }
             }
         }
         eob
+    }
+
+    /// Reads the base and range levels of every coefficient in reverse scan order into `self.quant`,
+    /// and the positions of the nonzero ones into `self.nonzero`.
+    fn read_levels(&mut self, tc: &TxbClass, scan: &[u16], eob: usize) {
+        let TxbClass { tx_sz, tx_class, tx_sz_ctx, ptype } = *tc;
+        let adj = ADJUSTED_TX_SIZE[tx_sz] as usize;
+        let bwl = TX_WIDTH_LOG2[adj] as usize;
+        let height = TX_HEIGHT[adj] as usize;
+        let width = 1usize << bwl;
+        // Levels with TX_PAD zero columns / rows past the right / bottom edge, so the
+        // neighbourhood sums need no bounds checks (out-of-range neighbours count as 0).
+        let stride = width + TX_PAD;
+        let mut lev = std::mem::take(&mut self.levels);
+        lev[..(height + TX_PAD) * stride].fill(0);
+        let sig = &SIG_REF_DIFF_OFFSET[tx_class];
+        let sig_off: [usize; SIG_REF_DIFF_OFFSET_NUM] = std::array::from_fn(|i| sig[i][0] as usize * stride + sig[i][1] as usize);
+        let magr = &MAG_REF_OFFSET_WITH_TX_CLASS[tx_class];
+        let mag_off: [usize; 3] = std::array::from_fn(|i| magr[i][0] as usize * stride + magr[i][1] as usize);
+        // The nonzero list grows without a branch on the level (as random as the symbols).
+        let mut nz = std::mem::take(&mut self.nonzero);
+        nz.resize(eob, 0);
+        let mut count = 0usize;
+        // Per coefficient: the CDFs of this block's size and plane type, and the base
+        // context offset of each position, looked up once.
+        let sd = &mut self.sd;
+        let quant = &mut self.quant;
+        let cdf = &mut *self.cdf;
+        let base_eob = &mut cdf.coeff_base_eob[tx_sz_ctx][ptype];
+        let base = &mut cdf.coeff_base[tx_sz_ctx][ptype];
+        let base_range = &mut cdf.coeff_br[tx_sz_ctx.min(TX_32X32)][ptype];
+        let offsets = base_ctx_offsets(tx_sz, tx_class);
+        for c in (0..eob).rev() {
+            let pos = scan[c] as usize;
+            // row * stride + col, with stride = width + TX_PAD
+            let li = pos + ((pos >> bwl) * TX_PAD);
+            let mut level = if c == eob - 1 {
+                let ctx = coeff_base_eob_ctx(c, bwl, height);
+                sd.read_symbol(&mut base_eob[ctx]) as i32 + 1
+            } else {
+                let mut mag = 0u32;
+                for o in sig_off {
+                    mag += (lev[li + o] as u32).min(3);
+                }
+                let off = offsets.get(pos).copied().unwrap_or(0);
+                // offset 255: the DC of a 2D transform, context 0 whatever the neighbours
+                let ctx = if off == 255 { 0 } else { ((mag + 1) >> 1).min(4) as usize + off as usize };
+                sd.read_symbol(&mut base[ctx]) as i32
+            };
+            if level > NUM_BASE_LEVELS as i32 {
+                // Levels are at most NUM_BASE_LEVELS + COEFF_BASE_RANGE + 1 = 15 here (the
+                // Golomb remainders come later): the specification's clamp to 15 is a no-op.
+                let mut mag = 0u32;
+                for o in mag_off {
+                    mag += lev[li + o] as u32;
+                }
+                let (row, col) = (pos >> bwl, pos & (width - 1));
+                let ctx = coeff_br_ctx(tx_class, row, col, pos, mag);
+                level += read_range_level(sd, &mut base_range[ctx]);
+            }
+            quant[pos] = level;
+            lev[li] = level as u8;
+            if let Some(e) = nz.get_mut(count) {
+                *e = pos as u16;
+            }
+            count += (level != 0) as usize;
+        }
+        nz.truncate(count);
+        self.nonzero = nz;
+        self.levels = lev;
+    }
+
+    /// Reads the Exp-Golomb coded remainder of a coefficient above NUM_BASE_LEVELS + COEFF_BASE_RANGE.
+    fn read_golomb_level(&mut self) -> i32 {
+        let mut length = 0;
+        loop {
+            length += 1;
+            if self.sd.read_bool() == 1 {
+                break;
+            }
+            if length > 32 {
+                break;
+            }
+        }
+        let mut x: u32 = 1;
+        for _ in (0..length - 1).rev() {
+            x = (x << 1) | self.sd.read_bool();
+        }
+        (x as i64 + COEFF_BASE_RANGE as i64 + NUM_BASE_LEVELS as i64).min(i32::MAX as i64) as i32
+    }
+
+    /// Reads signs and Golomb remainders of the nonzero coefficients in scan order (the reverse of
+    /// the level pass's; zero ones have neither), finishing `self.quant`; returns (culLevel,
+    /// dcCategory). The scans start at 0.
+    fn read_signs_and_remainders(&mut self, plane: usize, p: TxbPos) -> (u32, u8) {
+        let ptype = (plane > 0) as usize;
+        let mut cul_level = 0u32;
+        let mut dc_category = 0u8;
+        let nonzero = std::mem::take(&mut self.nonzero);
+        for &pos in nonzero.iter().rev() {
+            let pos = pos as usize;
+            let sign = if pos == 0 {
+                let ctx = self.dc_sign_ctx(plane, p.x4, p.y4, p.w4, p.h4);
+                self.sd.read_symbol(&mut self.cdf.dc_sign[ptype][ctx]) as i32
+            } else {
+                self.sd.read_bool() as i32
+            };
+            let mut v = self.quant.get(pos).copied().unwrap_or(0);
+            if v > (NUM_BASE_LEVELS + COEFF_BASE_RANGE) as i32 {
+                v = self.read_golomb_level();
+            }
+            if pos == 0 && v > 0 {
+                dc_category = 2 - sign as u8;
+            }
+            v &= 0xFFFFF;
+            cul_level += v as u32;
+            if let Some(q) = self.quant.get_mut(pos) {
+                // The sign applied without a branch: signs are close to random.
+                *q = (v ^ -sign) + sign;
+            }
+        }
+        self.nonzero = nonzero;
+        (cul_level.min(63), dc_category)
+    }
+
+    /// Records the level and DC category of the coded block in the above / left context arrays.
+    fn store_level_context(&mut self, plane: usize, p: TxbPos, cul_level: u32, dc_category: u8) {
+        for i in 0..p.w4 {
+            if p.x4 + i < self.t.above_level[plane].len() {
+                self.t.above_level[plane][p.x4 + i] = cul_level as u8;
+                self.t.above_dc[plane][p.x4 + i] = dc_category;
+            }
+        }
+        for i in 0..p.h4 {
+            if p.y4 + i < self.t.left_level[plane].len() {
+                self.t.left_level[plane][p.y4 + i] = cul_level as u8;
+                self.t.left_dc[plane][p.y4 + i] = dc_category;
+            }
+        }
     }
 
     fn all_zero_ctx(&self, plane: usize, tx_sz: usize, x4: usize, y4: usize, w4: usize, h4: usize) -> usize {

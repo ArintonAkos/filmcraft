@@ -3,7 +3,10 @@
 use crate::frame::{FrameBuf, Plane, RowBand};
 use crate::par::Pool;
 use crate::postfilter::bands;
-use crate::spec_tables::*;
+use crate::spec_tables::{
+    FILTER_BITS, RESTORE_NONE, RESTORE_SGRPROJ, RESTORE_WIENER, SGR_PARAMS, SGRPROJ_MTABLE_BITS, SGRPROJ_PRJ_BITS, SGRPROJ_RECIP_BITS, SGRPROJ_RST_BITS,
+    SGRPROJ_SGR_BITS, SUPERRES_EXTRA_BITS, SUPERRES_FILTER_OFFSET, SUPERRES_FILTER_TAPS, SUPERRES_SCALE_BITS, SUPERRES_SCALE_MASK, UPSCALE_FILTER,
+};
 use crate::state::FrameState;
 
 /// Upscale a frame horizontally from FrameWidth to UpscaledWidth (7.16).
@@ -161,6 +164,7 @@ struct LrScratch {
 }
 
 /// A rectangle to restore: its position, unit and filter.
+#[derive(Clone, Copy)]
 struct Rect {
     x: usize,
     y: usize,
@@ -260,9 +264,9 @@ pub(crate) fn loop_restoration(fs: &FrameState, frame: &mut FrameBuf, edges: &[S
 fn restore(fs: &FrameState, plane: usize, r: &Rect, s: &mut LrScratch, out: &mut RowBand, bd: u32) {
     if r.sgr {
         let (set, xqd) = (fs.lr.lr_sgr_set[plane][r.unit] as usize, fs.lr.lr_sgr_xqd[plane][r.unit]);
-        self_guided(set, xqd, s, out, r.x, r.y, r.w, r.h, bd);
+        self_guided(set, xqd, s, out, r, bd);
     } else {
-        wiener(&fs.lr.lr_wiener[plane][r.unit], s, out, r.x, r.y, r.w, r.h, bd);
+        wiener(&fs.lr.lr_wiener[plane][r.unit], s, out, r, bd);
     }
 }
 
@@ -280,8 +284,8 @@ fn wiener_taps(c: &[i8; 3]) -> [i32; 7] {
 
 /// Wiener filter process (7.17.4) of the rectangle (x, y, w, h) whose source samples are in
 /// `s.src`: the horizontal pass over its rows and 3 more above and below, then the vertical.
-#[allow(clippy::too_many_arguments)]
-fn wiener(coef: &[[i8; 3]; 2], s: &mut LrScratch, out: &mut RowBand, x: usize, y: usize, w: usize, h: usize, bd: u32) {
+fn wiener(coef: &[[i8; 3]; 2], s: &mut LrScratch, out: &mut RowBand, r: &Rect, bd: u32) {
+    let Rect { x, y, w, h, .. } = *r;
     let round0: u32 = if bd == 12 { 5 } else { 3 };
     let round1: u32 = if bd == 12 { 9 } else { 11 };
     let vfilter = wiener_taps(&coef[0]);
@@ -310,8 +314,8 @@ fn wiener(coef: &[[i8; 3]; 2], s: &mut LrScratch, out: &mut RowBand, x: usize, y
 
 /// Self guided filter process (7.17.3) of the rectangle (x, y, w, h) whose source samples are
 /// in `s.src`.
-#[allow(clippy::too_many_arguments)]
-fn self_guided(set: usize, xqd: [i8; 2], s: &mut LrScratch, out: &mut RowBand, x: usize, y: usize, w: usize, h: usize, bd: u32) {
+fn self_guided(set: usize, xqd: [i8; 2], s: &mut LrScratch, out: &mut RowBand, r: &Rect, bd: u32) {
+    let Rect { x, y, w, h, .. } = *r;
     for pass in 0..2 {
         box_filter(s, w, h, set, pass, bd);
     }
@@ -357,7 +361,6 @@ const SGR_A2: [i32; 256] = {
 /// `s.src`: `s.flt[pass]`, w per row. A and B are needed one position around the rectangle; the box sums over each
 /// position's (2r + 1)^2 neighbourhood are taken down the columns, then along the rows. The
 /// first pass reads A and B only on every other row (from the row above the rectangle on).
-#[allow(clippy::too_many_arguments)]
 fn box_filter(s: &mut LrScratch, w: usize, h: usize, set: usize, pass: usize, bd: u32) {
     let r = SGR_PARAMS[set][pass * 2] as usize;
     if r == 0 {
@@ -439,7 +442,7 @@ mod tests {
     }
 
     /// 7.17.4 for one block, as the spec writes it.
-    fn spec_wiener(coef: &[[i8; 3]; 2], ctx: &LrCtx, out: &mut Plane, x: i32, y: i32, w: i32, h: i32, bd: u32) {
+    fn spec_wiener(coef: &[[i8; 3]; 2], ctx: &LrCtx, out: &mut Plane, (x, y, w, h): (i32, i32, i32, i32), bd: u32) {
         let round0: u32 = if bd == 12 { 5 } else { 3 };
         let round1: u32 = if bd == 12 { 9 } else { 11 };
         let (vfilter, hfilter) = (wiener_taps(&coef[0]), wiener_taps(&coef[1]));
@@ -462,7 +465,7 @@ mod tests {
     }
 
     /// 7.17.3 for one block, as the spec writes it.
-    fn spec_self_guided(set: usize, xqd: [i8; 2], ctx: &LrCtx, out: &mut Plane, x: i32, y: i32, w: i32, h: i32, bd: u32) {
+    fn spec_self_guided(set: usize, xqd: [i8; 2], ctx: &LrCtx, out: &mut Plane, (x, y, w, h): (i32, i32, i32, i32), bd: u32) {
         let mut flt = [[[0i32; 4]; 4]; 2];
         for (pass, f) in flt.iter_mut().enumerate() {
             let r = SGR_PARAMS[set][pass * 2] as i32;
@@ -594,9 +597,9 @@ mod tests {
                 for bx in (x..x + w).step_by(blk) {
                     let (bw, bh) = (blk.min(x + w - bx) as i32, blk.min(y + h - by) as i32);
                     if sgr {
-                        spec_self_guided(set, xqd, &ctx, &mut want, bx as i32, by as i32, bw, bh, bd);
+                        spec_self_guided(set, xqd, &ctx, &mut want, (bx as i32, by as i32, bw, bh), bd);
                     } else {
-                        spec_wiener(&coef, &ctx, &mut want, bx as i32, by as i32, bw, bh, bd);
+                        spec_wiener(&coef, &ctx, &mut want, (bx as i32, by as i32, bw, bh), bd);
                     }
                 }
             }
@@ -604,10 +607,11 @@ mod tests {
             let mut band = RowBand { data: &mut got.data, stride: pw, y0: 0 };
             let mut s = LrScratch::default();
             ctx.fetch(x as i32, y as i32, w, h, &mut s.src);
+            let rect = Rect { x, y, w, h, unit: 0, sgr };
             if sgr {
-                self_guided(set, xqd, &mut s, &mut band, x, y, w, h, bd);
+                self_guided(set, xqd, &mut s, &mut band, &rect, bd);
             } else {
-                wiener(&coef, &mut s, &mut band, x, y, w, h, bd);
+                wiener(&coef, &mut s, &mut band, &rect, bd);
             }
             assert!(got.data == want.data, "case {case}: sgr {sgr} set {set} bd {bd} rect ({x}, {y}, {w}, {h}) blocks {blk}");
         }

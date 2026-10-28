@@ -5,11 +5,11 @@ use crate::deblock;
 use crate::error::{Result, ensure, invalid};
 use crate::inter::Weight;
 use crate::intra::{self, Avail};
-use crate::mbtypes::*;
+use crate::mbtypes::{CBP_ME, MbTypeInfo, Part, SubMbInfo, SubPart, b_mb_type, b_sub_mb_type, intra_mb_type, p_mb_type, p_sub_mb_type};
 use crate::params::{Pps, Sps};
-use crate::picture::*;
+use crate::picture::{Frame, FrameRef, MbKind, MbState, Planes, RefPic};
 use crate::slice::{SliceHeader, SliceType};
-use crate::tables::*;
+use crate::tables::{BLK4_XY, QPC_TABLE, RASTER_TO_BLK4, ZIGZAG4, ZIGZAG8};
 use crate::transform::{self, LevelScale};
 use filmcraft_bitstream::BitReader;
 use filmcraft_simd::H264Out;
@@ -251,7 +251,16 @@ pub struct SliceDecoder<'a> {
 /// windows copied out with the picture's edge samples repeated.
 #[allow(clippy::too_many_arguments)]
 #[inline]
-fn predict_block(f: &Frame, mv: [i16; 2], px: usize, py: usize, bw: usize, bh: usize, y: (&mut [u8], usize), c: [&mut [u8]; 2], cs: usize, out: [H264Out; 3]) {
+fn predict_block(
+    f: &Frame,
+    mv: [i16; 2],
+    (px, py): (usize, usize),
+    (bw, bh): (usize, usize),
+    y: (&mut [u8], usize),
+    c: [&mut [u8]; 2],
+    cs: usize,
+    out: [H264Out; 3],
+) {
     const LW: usize = 24;
     let mut win = [0u8; LW * 21];
     let ix = px as i32 + (mv[0] as i32 >> 2);
@@ -262,7 +271,7 @@ fn predict_block(f: &Frame, mv: [i16; 2], px: usize, py: usize, bw: usize, bh: u
     match planes.and_then(|p| inside(ix - 2, iy - 2, bw + 5, bh + 5, p.width, p.height).map(|o| (p, o))) {
         Some((p, o)) => filmcraft_simd::h264_luma(&p.y[o..], p.width, lfx, lfy, bw, bh, y.0, y.1, out[0]),
         None => {
-            f.luma_window(ix - 2, iy - 2, bw + 5, bh + 5, &mut win, LW);
+            f.luma_window((ix - 2, iy - 2), bw + 5, bh + 5, &mut win, LW);
             filmcraft_simd::h264_luma(&win, LW, lfx, lfy, bw, bh, y.0, y.1, out[0]);
         }
     }
@@ -278,8 +287,8 @@ fn predict_block(f: &Frame, mv: [i16; 2], px: usize, py: usize, bw: usize, bh: u
             Some((p, o)) => filmcraft_simd::h264_chroma_pair([&p.cb[o..], &p.cr[o..]], p.cwidth, fx, fy, cw, ch, c, cs, out[1]),
             None => {
                 let (mut wb, mut wr) = ([0u8; 16 * 9], [0u8; 16 * 9]);
-                f.chroma_window(0, cx, cy, cw + 1, ch + 1, &mut wb, 16);
-                f.chroma_window(1, cx, cy, cw + 1, ch + 1, &mut wr, 16);
+                f.chroma_window(0, (cx, cy), cw + 1, ch + 1, &mut wb, 16);
+                f.chroma_window(1, (cx, cy), cw + 1, ch + 1, &mut wr, 16);
                 filmcraft_simd::h264_chroma_pair([&wb, &wr], 16, fx, fy, cw, ch, c, cs, out[1]);
             }
         }
@@ -290,7 +299,7 @@ fn predict_block(f: &Frame, mv: [i16; 2], px: usize, py: usize, bw: usize, bh: u
             Some((p, o)) => filmcraft_simd::h264_chroma(&[&p.cb, &p.cr][comp][o..], p.cwidth, fx, fy, cw, ch, dst, cs, out),
             None => {
                 let mut w = [0u8; 16 * 9];
-                f.chroma_window(comp, cx, cy, cw + 1, ch + 1, &mut w, 16);
+                f.chroma_window(comp, (cx, cy), cw + 1, ch + 1, &mut w, 16);
                 filmcraft_simd::h264_chroma(&w, 16, fx, fy, cw, ch, dst, cs, out);
             }
         }
@@ -518,8 +527,7 @@ impl<'a> SliceDecoder<'a> {
     }
 
     /// Luma motion vector prediction (8.4.1.3). `shape`: 1 = 16x8, 2 = 8x16, 0 = other.
-    #[allow(clippy::too_many_arguments)]
-    fn mvp(&self, list: usize, x: usize, y: usize, w: usize, ref_idx: i8, shape: u8, part: usize) -> [i16; 2] {
+    fn mvp(&self, list: usize, (x, y): (usize, usize), w: usize, ref_idx: i8, shape: u8, part: usize) -> [i16; 2] {
         let (a, b, c) = self.nb_abc(list, x, y, w);
         if shape == 1 {
             if part == 0 && b.ref_idx == ref_idx {
@@ -689,7 +697,7 @@ impl<'a> SliceDecoder<'a> {
         let mv = if self.nb[0].is_none() || self.nb[1].is_none() || (a.ref_idx == 0 && a.mv == [0, 0]) || (b.ref_idx == 0 && b.mv == [0, 0]) {
             [0, 0]
         } else {
-            self.mvp(0, 0, 0, 4, 0, 0, 0)
+            self.mvp(0, (0, 0), 4, 0, 0, 0)
         };
         self.set_motion(0, 0, 4, 4, [0, -1], [mv, [0, 0]]);
     }
@@ -715,7 +723,7 @@ impl<'a> SliceDecoder<'a> {
                     if info.pred[p] & (1 << l) != 0 {
                         let r = self.cur.ref_idx[l][p];
                         ensure!((r as usize) < n[l], "ref_idx {r} out of range (list {l}, size {})", n[l]);
-                        let mvp = self.mvp(l, x, y, w, r, shape, p);
+                        let mvp = self.mvp(l, (x, y), w, r, shape, p);
                         let d = self.cur.mvd[l][p * 4];
                         refs[l] = r;
                         mvs[l] = [mvp[0].wrapping_add(d[0]), mvp[1].wrapping_add(d[1])];
@@ -746,7 +754,7 @@ impl<'a> SliceDecoder<'a> {
                 let mut mvs = [[0i16; 2]; 2];
                 for l in 0..2 {
                     if refs[l] >= 0 {
-                        let mvp = self.mvp(l, x, y, w, refs[l], 0, 0);
+                        let mvp = self.mvp(l, (x, y), w, refs[l], 0, 0);
                         let d = self.cur.mvd[l][p * 4 + j];
                         mvs[l] = [mvp[0].wrapping_add(d[0]), mvp[1].wrapping_add(d[1])];
                     }
@@ -829,7 +837,7 @@ impl<'a> SliceDecoder<'a> {
             });
             let planes = &mut self.pic.planes;
             let y = (&mut planes.y[py * ys + px..], ys);
-            predict_block(&rp.frame, mvs[l], px, py, bw, bh, y, [&mut planes.cb[cy * cs + cx..], &mut planes.cr[cy * cs + cx..]], cs, out);
+            predict_block(&rp.frame, mvs[l], (px, py), (bw, bh), y, [&mut planes.cb[cy * cs + cx..], &mut planes.cr[cy * cs + cx..]], cs, out);
             first = false;
         }
     }
@@ -1547,7 +1555,7 @@ mod tests {
         let predict = |f: &Frame, mv: [i16; 2], px: usize, py: usize, bw: usize, bh: usize| {
             let (mut y, mut cb, mut cr) = (vec![0u8; w * mb_h * 16], vec![0u8; cw * mb_h * 8], vec![0u8; cw * mb_h * 8]);
             let c = py / 2 * cw + px / 2;
-            predict_block(f, mv, px, py, bw, bh, (&mut y[py * w + px..], w), [&mut cb[c..], &mut cr[c..]], cw, [H264Out::Put; 3]);
+            predict_block(f, mv, (px, py), (bw, bh), (&mut y[py * w + px..], w), [&mut cb[c..], &mut cr[c..]], cw, [H264Out::Put; 3]);
             (y, cb, cr)
         };
         for (bw, bh) in [(16, 16), (16, 8), (8, 16), (8, 8), (8, 4), (4, 8), (4, 4)] {

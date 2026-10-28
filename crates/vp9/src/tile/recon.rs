@@ -5,12 +5,77 @@ use super::{Blk, TileDecoder};
 use crate::boolcoder::BoolDecoder;
 use crate::error::Error;
 use crate::frame::Mv;
-use crate::inter::{self, RefPlane, Vp9Out};
+use crate::inter::{self, McBlock, RefPlane, Vp9Out};
 use crate::intra::{self, IntraEdge};
-use crate::tables::*;
+use crate::tables::{
+    BLOCK_8X8, CAT_PROBS, DCT_DCT, ENERGY_CLASS, EXTRA_BITS, INTERP_EXTEND, INTRA_FRAME, MAX_TXSIZE, MODE2TXFM, NUM_4X4_HIGH, NUM_4X4_WIDE, NUM_8X8_HIGH,
+    NUM_8X8_WIDE, SS_SIZE_LOOKUP, ScanPos, TX_4X4, TX_32X32, pareto_full, scan, scan_positions,
+};
 use crate::transform;
 
+/// Sample rectangle of a block region within its plane.
+#[derive(Clone, Copy)]
+struct Region {
+    x: usize,
+    y: usize,
+    w: usize,
+    h: usize,
+}
+
 /// round_mv_comp_q2 / q4 (8.5.2.1).
+/// Location and transform parameters of one transform block within a plane.
+#[derive(Clone, Copy)]
+struct TxBlock {
+    plane: usize,
+    start_x: usize,
+    start_y: usize,
+    tx_sz: u8,
+    tx_type: u8,
+}
+
+/// Walks the pareto part of the token tree, returning a token in `2..=10`.
+#[inline(always)]
+fn read_large_token(bd: &mut BoolDecoder, pp: &[u8; 8]) -> usize {
+    if !bd.read_bool(pp[0]) {
+        if !bd.read_bool(pp[1]) {
+            2
+        } else if !bd.read_bool(pp[2]) {
+            3
+        } else {
+            4
+        }
+    } else if !bd.read_bool(pp[3]) {
+        if !bd.read_bool(pp[4]) { 5 } else { 6 }
+    } else if !bd.read_bool(pp[5]) {
+        if !bd.read_bool(pp[6]) { 7 } else { 8 }
+    } else if !bd.read_bool(pp[7]) {
+        9
+    } else {
+        10
+    }
+}
+
+/// read_coef (6.4.26): the unsigned coefficient magnitude of a token of at least 2.
+#[inline(always)]
+fn read_coef(bd: &mut BoolDecoder, token: usize, bit_depth: u8) -> i64 {
+    let (cat, num_extra, base) = EXTRA_BITS[token];
+    let mut v = base as i64;
+    if token == 10 {
+        for e in 0..(bit_depth as u32 - 8) {
+            if bd.read_bool(255) {
+                v += 1 << (5 + bit_depth as u32 - e);
+            }
+        }
+    }
+    let cp = CAT_PROBS[cat as usize];
+    for e in 0..num_extra as usize {
+        if bd.read_bool(cp[e]) {
+            v += 1 << (num_extra as usize - 1 - e);
+        }
+    }
+    v
+}
+
 fn round_q2(v: i32) -> i32 {
     (if v < 0 { v - 1 } else { v + 1 }) / 2
 }
@@ -36,11 +101,11 @@ impl<'a> TileDecoder<'a> {
                 if b.size < BLOCK_8X8 {
                     for y in 0..n4h {
                         for x in 0..n4w {
-                            self.predict_inter(b, plane, base_x + 4 * x, base_y + 4 * y, 4, 4, y * n4w + x);
+                            self.predict_inter(b, plane, Region { x: base_x + 4 * x, y: base_y + 4 * y, w: 4, h: 4 }, y * n4w + x);
                         }
                     }
                 } else {
-                    self.predict_inter(b, plane, base_x, base_y, n4w * 4, n4h * 4, 0);
+                    self.predict_inter(b, plane, Region { x: base_x, y: base_y, w: n4w * 4, h: n4h * 4 }, 0);
                 }
             }
             let max_x = (self.mi_cols * 8) >> sx;
@@ -74,7 +139,7 @@ impl<'a> TileDecoder<'a> {
                             intra::predict(&mut self.strip.planes[plane], stride, x_off, start_x, start_y, mode, &edge);
                         }
                         if !b.skip {
-                            let (eob, rows) = self.tokens(bd, b, plane, start_x, start_y, tx_sz, tx_type);
+                            let (eob, rows) = self.tokens(bd, b, &TxBlock { plane, start_x, start_y, tx_sz, tx_type });
                             nonzero = eob > 0;
                             b.eob_total += nonzero as u32;
                             if eob > 0 {
@@ -82,12 +147,7 @@ impl<'a> TileDecoder<'a> {
                                 let o = start_y * stride + start_x - x_off;
                                 transform::inverse_transform_add(
                                     &self.coefs[..],
-                                    tx_sz,
-                                    tx_type,
-                                    self.h.lossless,
-                                    eob,
-                                    rows,
-                                    self.bit_depth,
+                                    &transform::InverseTx { tx_size: tx_sz, tx_type, lossless: self.h.lossless, eob, rows, bit_depth: self.bit_depth },
                                     &mut self.strip.planes[plane][o..],
                                     stride,
                                 );
@@ -123,14 +183,8 @@ impl<'a> TileDecoder<'a> {
         }
     }
 
-    /// tokens (6.4.24): reads and dequantizes the coefficients into `self.coefs`. Returns the end
-    /// of block position and the number of leading coefficient rows that may be non-zero.
-    #[allow(clippy::too_many_arguments)]
-    fn tokens(&mut self, bd: &mut BoolDecoder, b: &Blk, plane: usize, start_x: usize, start_y: usize, tx_sz: u8, tx_type: u8) -> (usize, usize) {
-        let tab = scan_positions(tx_sz, tx_type);
-        let ptype = (plane > 0) as usize;
-        let rtype = b.is_inter as usize;
-        let (tx, probs) = (tx_sz as usize, &self.fc.coef[tx_sz as usize][ptype][rtype]);
+    /// Above/left non-zero context of a transform block (the initial token context).
+    fn initial_token_ctx(&self, plane: usize, start_x: usize, start_y: usize, tx_sz: u8) -> usize {
         let (sx, sy) = if plane > 0 { (self.ss_x, self.ss_y) } else { (0, 0) };
         let max_x4 = (2 * self.mi_cols) >> sx;
         let max_y4 = (2 * self.mi_rows) >> sy;
@@ -146,7 +200,18 @@ impl<'a> TileDecoder<'a> {
                 left |= self.left_nonzero[plane][y4 + i];
             }
         }
-        let ctx0 = (above + left) as usize;
+        (above + left) as usize
+    }
+
+    /// tokens (6.4.24): reads and dequantizes the coefficients into `self.coefs`. Returns the end
+    /// of block position and the number of leading coefficient rows that may be non-zero.
+    fn tokens(&mut self, bd: &mut BoolDecoder, b: &Blk, t: &TxBlock) -> (usize, usize) {
+        let TxBlock { plane, start_x, start_y, tx_sz, tx_type } = *t;
+        let tab = scan_positions(tx_sz, tx_type);
+        let ptype = (plane > 0) as usize;
+        let rtype = b.is_inter as usize;
+        let (tx, probs) = (tx_sz as usize, &self.fc.coef[tx_sz as usize][ptype][rtype]);
+        let ctx0 = self.initial_token_ctx(plane, start_x, start_y, tx_sz);
         let q = self.s.seg_q[b.seg_id as usize][ptype];
         let dq_shift = (tx_sz == TX_32X32) as u32;
         let pareto = pareto_full();
@@ -202,40 +267,8 @@ impl<'a> TileDecoder<'a> {
                     token_counts[band][ctx][2] += 1;
                 }
                 let pp = &pareto[p[2].max(1) as usize - 1];
-                token = if !d.read_bool(pp[0]) {
-                    if !d.read_bool(pp[1]) {
-                        2
-                    } else if !d.read_bool(pp[2]) {
-                        3
-                    } else {
-                        4
-                    }
-                } else if !d.read_bool(pp[3]) {
-                    if !d.read_bool(pp[4]) { 5 } else { 6 }
-                } else if !d.read_bool(pp[5]) {
-                    if !d.read_bool(pp[6]) { 7 } else { 8 }
-                } else if !d.read_bool(pp[7]) {
-                    9
-                } else {
-                    10
-                };
-                // read_coef (6.4.26)
-                let (cat, num_extra, base) = EXTRA_BITS[token];
-                let mut v = base as i64;
-                if token == 10 {
-                    for e in 0..(bit_depth as u32 - 8) {
-                        if d.read_bool(255) {
-                            v += 1 << (5 + bit_depth as u32 - e);
-                        }
-                    }
-                }
-                let cp = CAT_PROBS[cat as usize];
-                for e in 0..num_extra as usize {
-                    if d.read_bool(cp[e]) {
-                        v += 1 << (num_extra as usize - 1 - e);
-                    }
-                }
-                coef = v;
+                token = read_large_token(d, pp);
+                coef = read_coef(d, token, bit_depth);
             }
             tc[pos] = ENERGY_CLASS[token];
             let sign = d.read_half();
@@ -251,8 +284,8 @@ impl<'a> TileDecoder<'a> {
 
     /// Inter prediction process (8.5.2) for one block region, written straight into the picture
     /// (the second prediction of a compound block averaged into the first).
-    #[allow(clippy::too_many_arguments)]
-    fn predict_inter(&mut self, b: &Blk, plane: usize, x: usize, y: usize, w: usize, h: usize, block_idx: usize) {
+    fn predict_inter(&mut self, b: &Blk, plane: usize, region: Region, block_idx: usize) {
+        let Region { x, y, w, h } = region;
         let is_compound = b.ref_frame[1] > INTRA_FRAME;
         let (sx, sy) = if plane > 0 { (self.ss_x, self.ss_y) } else { (0, 0) };
         let (stride, x_off) = (self.strip.strides[plane], self.strip.x_off[plane]);
@@ -303,7 +336,8 @@ impl<'a> TileDecoder<'a> {
             if rf.x_step == 16 && rf.y_step == 16 && x_scale == 1 << 14 && y_scale == 1 << 14 && matches!(w, 4 | 8 | 16 | 32 | 64) {
                 let (start_x, start_y) = (((x as i32) << 4) + cmv_col, ((y as i32) << 4) + cmv_row);
                 let dst = self.strip.planes[plane].get_mut(o..).unwrap_or_default();
-                inter::predict_unscaled(&rp, start_x, start_y, w, h, b.interp_filter, self.bit_depth, dst, stride, out, &mut self.mc_win);
+                let blk = McBlock { x: start_x, y: start_y, step_x: 16, step_y: 16, w, h, filter: b.interp_filter, bit_depth: self.bit_depth };
+                inter::predict_unscaled(&rp, &blk, dst, stride, out, &mut self.mc_win);
                 continue;
             }
             let (start_x, start_y, step_x, step_y) = if rf.x_step == 16 && rf.y_step == 16 && x_scale == 1 << 14 && y_scale == 1 << 14 {
@@ -320,7 +354,8 @@ impl<'a> TileDecoder<'a> {
                 let dy = ((cmv_row as i64 * y_scale) >> 14) + frac_y;
                 (((base_x << 4) + dx) as i32, ((base_y << 4) + dy) as i32, rf.x_step, rf.y_step)
             };
-            inter::predict_scaled(&rp, start_x, start_y, step_x, step_y, w, h, b.interp_filter, self.bit_depth, &mut self.pred, &mut self.mc_tmp);
+            let blk = McBlock { x: start_x, y: start_y, step_x, step_y, w, h, filter: b.interp_filter, bit_depth: self.bit_depth };
+            inter::predict_scaled(&rp, &blk, &mut self.pred, &mut self.mc_tmp);
             write_pred(&mut self.strip.planes[plane], o, stride, &self.pred, w, h, out);
         }
     }

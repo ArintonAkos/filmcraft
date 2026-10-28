@@ -36,12 +36,26 @@ impl<'a> RefPlane<'a> {
     }
 }
 
-/// Predict a `w` x `h` block (`w` 4, 8, 16, 32 or 64) whose top-left sample is at (`x`, `y`) in
-/// 1/16 sample units of an unscaled reference, written into `dst` (rows `ds` apart) as `out`
-/// says. `win` must hold at least `(w + 7) * (h + 7) + 1` entries (edge-clamped source window,
-/// plus the one sample the vector loads read past it).
-#[allow(clippy::too_many_arguments)]
-pub fn predict_unscaled(r: &RefPlane, x: i32, y: i32, w: usize, h: usize, filter: u8, bit_depth: u8, dst: &mut [u16], ds: usize, out: Vp9Out, win: &mut [u16]) {
+/// Geometry and filtering parameters of one motion-compensated block.
+#[derive(Clone, Copy, Debug)]
+pub struct McBlock {
+    /// Top-left sample position in 1/16 sample units of the reference.
+    pub x: i32,
+    pub y: i32,
+    /// Step per output sample in 1/16 units (16 = unscaled).
+    pub step_x: i32,
+    pub step_y: i32,
+    pub w: usize,
+    pub h: usize,
+    pub filter: u8,
+    pub bit_depth: u8,
+}
+
+/// Predict the block `blk` (`w` 4, 8, 16, 32 or 64) of an unscaled reference, written into `dst`
+/// (rows `ds` apart) as `out` says. `win` must hold at least `(w + 7) * (h + 7) + 1` entries
+/// (edge-clamped source window, plus the one sample the vector loads read past it).
+pub fn predict_unscaled(r: &RefPlane, blk: &McBlock, dst: &mut [u16], ds: usize, out: Vp9Out, win: &mut [u16]) {
+    let McBlock { x, y, w, h, filter, bit_depth, .. } = *blk;
     let (x0, y0) = (x >> 4, y >> 4);
     let (fx, fy) = ((x & 15) as usize, (y & 15) as usize);
     let inside = x0 - 3 >= 0 && y0 - 3 >= 0 && x0 + w as i32 + 4 <= r.last_x && y0 + h as i32 + 4 <= r.last_y;
@@ -122,11 +136,10 @@ fn fetch_window(r: &RefPlane, x0: i32, y0: i32, w: usize, h: usize, win: &mut [u
     ws
 }
 
-/// General process of 8.5.2.4 (any step): the `w` x `h` block at (`x`, `y`) in 1/16 sample units,
-/// stepping `step_x` / `step_y`, into `out` (stride `w`). `tmp` must hold at least
-/// `(h * step_y / 16 + 8) * w` entries.
-#[allow(clippy::too_many_arguments)]
-pub fn predict_scaled(r: &RefPlane, x: i32, y: i32, step_x: i32, step_y: i32, w: usize, h: usize, filter: u8, bit_depth: u8, out: &mut [u16], tmp: &mut [u16]) {
+/// General process of 8.5.2.4 (any step): the block `blk` into `out` (stride `w`). `tmp` must
+/// hold at least `(h * step_y / 16 + 8) * w` entries.
+pub fn predict_scaled(r: &RefPlane, blk: &McBlock, out: &mut [u16], tmp: &mut [u16]) {
+    let McBlock { x, y, step_x, step_y, w, h, filter, bit_depth } = *blk;
     let max = (1i32 << bit_depth) - 1;
     let ih = ((((h as i32 - 1) * step_y + 15) >> 4) + 8) as usize;
     let rows = r.rows();
@@ -192,8 +205,9 @@ mod tests {
                 for &(bw, bh) in &[(4usize, 4usize), (8, 8), (16, 8)] {
                     let mut a = vec![0u16; bw * bh];
                     let mut b = vec![0u16; bw * bh];
-                    predict_unscaled(&r, x, y, bw, bh, filter, 8, &mut a, bw, Vp9Out::Put, &mut [0u16; 71 * 71 + 1]);
-                    predict_scaled(&r, x, y, 16, 16, bw, bh, filter, 8, &mut b, &mut tmp);
+                    let blk = McBlock { x, y, step_x: 16, step_y: 16, w: bw, h: bh, filter, bit_depth: 8 };
+                    predict_unscaled(&r, &blk, &mut a, bw, Vp9Out::Put, &mut [0u16; 71 * 71 + 1]);
+                    predict_scaled(&r, &blk, &mut b, &mut tmp);
                     assert_eq!(a, b, "filter {filter} pos ({x},{y}) {bw}x{bh}");
                 }
             }
@@ -242,7 +256,14 @@ mod tests {
             let mut out = [vec![0u16; bw * bh], vec![0u16; bw * bh]];
             for (f, o) in [&bands, &whole].into_iter().zip(&mut out) {
                 let r = RefPlane { frame: f, plane: p, last_x: pw - 1, last_y: ph - 1 };
-                predict_unscaled(&r, x, y, bw, bh, filter, 10, o, bw, Vp9Out::Put, &mut [0u16; 71 * 71 + 1]);
+                predict_unscaled(
+                    &r,
+                    &McBlock { x, y, step_x: 16, step_y: 16, w: bw, h: bh, filter, bit_depth: 10 },
+                    o,
+                    bw,
+                    Vp9Out::Put,
+                    &mut [0u16; 71 * 71 + 1],
+                );
             }
             assert_eq!(out[0], out[1], "plane {p} ({x}, {y}) {bw}x{bh} filter {filter}");
         }
