@@ -49,6 +49,36 @@ fixture_tests!(
     hd_1080p,
 );
 
+/// Every thread count decodes to the same pictures: with more than one, the rows of each frame
+/// go through a pipeline of threads (and with several token partitions, a wavefront). The last
+/// stream changes size at each of its key frames.
+#[test]
+fn same_pictures_at_every_thread_count() {
+    let names = ["default", "odd_size", "tiny", "intra_only", "partitions8", "altref_2pass", "version1_bilinear_simple", "realtime_segments", "hd_1080p"];
+    let mut streams = Vec::new();
+    for name in names {
+        let Some((ivf, _)) = common::ensure(common::fixture(name)) else { return };
+        streams.push((name, std::fs::read(&ivf).unwrap()));
+    }
+    let mut cases: Vec<(&str, Vec<&[u8]>)> = streams.iter().map(|(name, data)| (*name, common::ivf_frames(data))).collect();
+    let resized = ["odd_size", "hd_1080p", "tiny", "partitions8"]
+        .iter()
+        .flat_map(|n| cases.iter().find(|(name, _)| name == n).map(|c| c.1.clone()).unwrap_or_default())
+        .collect();
+    cases.push(("odd_size, hd_1080p, tiny, partitions8", resized));
+    for (name, frames) in cases {
+        let decode = |threads: usize| {
+            let mut dec = filmcraft_vp8::Decoder::with_threads(threads);
+            frames.iter().enumerate().filter_map(|(i, f)| dec.decode(f, i as i64).unwrap()).map(|p| (p.width, common::i420(&p))).collect::<Vec<_>>()
+        };
+        let one = decode(1);
+        assert!(!one.is_empty(), "{name}: pictures");
+        for threads in [2, 3, 4, 5, 8] {
+            assert!(decode(threads) == one, "{name}: {threads} threads");
+        }
+    }
+}
+
 /// Hidden (altref) frames produce no picture, and leaving out the frames the decoder calls
 /// disposable changes none of the other pictures.
 #[test]

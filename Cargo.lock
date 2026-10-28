@@ -2540,6 +2540,7 @@ version = "0.13.0"
 dependencies = [
  "filmcraft-simd",
  "filmcraft-testkit",
+ "rayon",
  "thiserror 2.0.21",
 ]
 

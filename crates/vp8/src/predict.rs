@@ -257,10 +257,12 @@ impl RefPlane<'_> {
     }
 }
 
-/// Destination plane of an inter prediction (same layout as the block's plane).
+/// Destination plane of an inter prediction (same layout as the block's plane): `data` holds its
+/// rows from `top` on (0: the whole plane).
 pub struct DstPlane<'a> {
     pub data: &'a mut [u8],
     pub stride: usize,
+    pub top: usize,
 }
 
 /// A `w`x`h` block at `(x, y)` of a plane.
@@ -276,7 +278,7 @@ pub struct BlockRect {
 /// `(mvx, mvy)` in eighth pixels, using `filters` (8 x 6 taps: the six-tap or bilinear set,
 /// 18.3), writing into `dst`.
 pub fn predict_inter(reference: &RefPlane, dst: DstPlane, rect: BlockRect, (mvx, mvy): (i32, i32), filters: &[i32; 48]) {
-    let DstPlane { data: dst, stride: dst_stride } = dst;
+    let DstPlane { data: dst, stride: dst_stride, top } = dst;
     let BlockRect { x: bx, y: by, w, h } = rect;
     let x0 = bx as isize + (mvx >> 3) as isize;
     let y0 = by as isize + (mvy >> 3) as isize;
@@ -286,7 +288,7 @@ pub fn predict_inter(reference: &RefPlane, dst: DstPlane, rect: BlockRect, (mvx,
     // by the vector kernel straight into the picture.
     if full_inside
         && let Some(win) = reference.data.get((y0 as usize - 2) * reference.stride + x0 as usize - 2..)
-        && let Some(out) = dst.get_mut(by * dst_stride + bx..)
+        && let Some(out) = dst.get_mut(by.saturating_sub(top) * dst_stride + bx..)
     {
         if fx == 0 && fy == 0 {
             copy_rows(win, reference.stride, out, dst_stride, w, h);
@@ -299,15 +301,16 @@ pub fn predict_inter(reference: &RefPlane, dst: DstPlane, rect: BlockRect, (mvx,
             return;
         }
     }
-    predict_inter_window(reference, DstPlane { data: dst, stride: dst_stride }, rect, (mvx, mvy), filters);
+    predict_inter_window(reference, DstPlane { data: dst, stride: dst_stride, top }, rect, (mvx, mvy), filters);
 }
 
 /// [`predict_inter`] from a copy of the source window (edges replicated where it leaves the
 /// reference), by the scalar filters.
 #[inline(never)]
 fn predict_inter_window(reference: &RefPlane, dst: DstPlane, rect: BlockRect, (mvx, mvy): (i32, i32), filters: &[i32; 48]) {
-    let DstPlane { data: dst, stride: dst_stride } = dst;
+    let DstPlane { data: dst, stride: dst_stride, top } = dst;
     let BlockRect { x: bx, y: by, w, h } = rect;
+    let dy = by.saturating_sub(top);
     let x0 = bx as isize + (mvx >> 3) as isize;
     let y0 = by as isize + (mvy >> 3) as isize;
     let (fx, fy) = ((mvx & 7) as usize, (mvy & 7) as usize);
@@ -330,7 +333,7 @@ fn predict_inter_window(reference: &RefPlane, dst: DstPlane, rect: BlockRect, (m
     }
     if fx == 0 && fy == 0 {
         for r in 0..h {
-            let start = (by + r) * dst_stride + bx;
+            let start = (dy + r) * dst_stride + bx;
             if let Some(row) = dst.get_mut(start..start + w) {
                 row.copy_from_slice(&src[r + 2][2..2 + w]);
             }
@@ -362,7 +365,7 @@ fn predict_inter_window(reference: &RefPlane, dst: DstPlane, rect: BlockRect, (m
         }
     }
     for r in 0..h {
-        let start = (by + r) * dst_stride + bx;
+        let start = (dy + r) * dst_stride + bx;
         let Some(row) = dst.get_mut(start..start + w) else { continue };
         if fy == 0 {
             for (c, d) in row.iter_mut().enumerate() {
@@ -432,8 +435,8 @@ mod tests {
             let (mvx, mvy) = ((next() % 160) as i32 - 80, (next() % 160) as i32 - 80);
             let mut got = vec![9u8; dw * dh];
             let mut want = got.clone();
-            predict_inter(&reference, DstPlane { data: &mut got, stride: dw }, BlockRect { x: bx, y: by, w, h: w }, (mvx, mvy), filters);
-            predict_inter_window(&reference, DstPlane { data: &mut want, stride: dw }, BlockRect { x: bx, y: by, w, h: w }, (mvx, mvy), filters);
+            predict_inter(&reference, DstPlane { data: &mut got, stride: dw, top: 0 }, BlockRect { x: bx, y: by, w, h: w }, (mvx, mvy), filters);
+            predict_inter_window(&reference, DstPlane { data: &mut want, stride: dw, top: 0 }, BlockRect { x: bx, y: by, w, h: w }, (mvx, mvy), filters);
             let (x0, y0) = (bx as i32 + (mvx >> 3), by as i32 + (mvy >> 3));
             inside += usize::from(x0 >= 2 && y0 >= 2 && x0 + w as i32 + 3 <= rw as i32 && y0 + w as i32 + 3 <= rh as i32);
             assert_eq!(got, want, "case {case} {w}x{w} at ({bx}, {by}) mv ({mvx}, {mvy})");
