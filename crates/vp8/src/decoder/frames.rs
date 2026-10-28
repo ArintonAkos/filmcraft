@@ -216,6 +216,11 @@ fn give_back<T>(spare: &Mutex<Vec<T>>, v: T) {
     }
 }
 
+/// Frames in flight at most: enough for the token readers to read ahead (each frame is read on
+/// one of them), about 3 MB per 1080p frame. A caller pairing the pictures of two decoders (the
+/// WebM alpha layer) holds more than this many.
+pub(crate) const MAX_IN_FLIGHT: usize = 12;
+
 /// Token readers besides the 4 threads of the planes: those left, but at least half of
 /// `threads` (each reads a whole frame, the slowest stage of all).
 fn readers(threads: usize) -> usize {
@@ -290,11 +295,10 @@ impl Pipeline {
     }
 
     /// The pictures of the frames at the front that are finished (`all`: of every frame in
-    /// flight). Beyond a few frames in flight (as many as the VP9 decoder keeps: a caller pairing
-    /// two decoders' pictures, as the WebM alpha layer does, holds only so many), the oldest is
-    /// waited for.
+    /// flight). Beyond [`MAX_IN_FLIGHT`] frames in flight (fewer with fewer threads), the oldest
+    /// is waited for.
     pub(super) fn drain(&mut self, all: bool) -> Vec<Picture> {
-        let max_in_flight = (self.threads / 2).clamp(2, 6);
+        let max_in_flight = (self.threads + 1).clamp(2, MAX_IN_FLIGHT);
         let mut pictures = Vec::new();
         while !self.in_flight.is_empty() {
             let next = if all || self.in_flight.len() > max_in_flight {
