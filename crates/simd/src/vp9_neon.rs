@@ -19,18 +19,13 @@ fn fits(len: usize, stride: usize, cols: usize, rows: usize) -> bool {
 
 /// See [`crate::vp9_predict`]; false when the window is too small for the vector loads (one
 /// sample past each row's w + 7) or `dst` too small: the scalar version then runs.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn predict(
-    src: &[u16],
-    ss: usize,
-    fh: Option<&[i16; 8]>,
-    fv: Option<&[i16; 8]>,
-    w: usize,
-    h: usize,
+    (src, ss): (&[u16], usize),
+    (fh, fv): (Option<&[i16; 8]>, Option<&[i16; 8]>),
+    (w, h): (usize, usize),
     max: u16,
     wrap: bool,
-    dst: &mut [u16],
-    ds: usize,
+    (dst, ds): (&mut [u16], usize),
     out: Vp9Out,
 ) -> bool {
     if !matches!(w, 4 | 8 | 16 | 32 | 64) || !(1..=64).contains(&h) || !fits(src.len(), ss, w + 8, h + 7) || !fits(dst.len(), ds, w, h) {

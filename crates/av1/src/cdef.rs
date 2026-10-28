@@ -135,7 +135,7 @@ fn filter_band(fs: &FrameState, band: &mut [RowBand; 3], (start, end): (usize, u
         while c < mi_cols {
             let idx = fs.cdef_idx(r & !15, c & !15);
             if idx >= 0 {
-                cdef_block(fs, band, edges, &mut pending, &mut tails, &ends, r, c, idx as usize);
+                cdef_block(fs, band, edges, (&mut pending, &mut tails), &ends, (r, c), idx as usize);
             }
             c += 2;
         }
@@ -158,16 +158,13 @@ fn filter_band(fs: &FrameState, band: &mut [RowBand; 3], (start, end): (usize, u
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn cdef_block(
     fs: &FrameState,
     band: &mut [RowBand; 3],
     edges: &[BandEdges; 3],
-    pending: &mut [Option<Pending>; 3],
-    tails: &mut [Vec<Tail>; 3],
+    (pending, tails): (&mut [Option<Pending>; 3], &mut [Vec<Tail>; 3]),
     ends: &[usize; 3],
-    r: usize,
-    c: usize,
+    (r, c): (usize, usize),
     idx: usize,
 ) {
     let cp = &fs.fh.cdef;

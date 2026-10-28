@@ -127,7 +127,7 @@ fn vector_filter(kind: Kind, prm: &Params) -> (Vp8Filter, Vp8Limits) {
 /// one call of the vector kernel when it runs.
 pub fn filter_edge_uv(u: &mut [u8], v: &mut [u8], stride: usize, start: usize, vertical: bool, kind: Kind, prm: &Params) {
     let (f, limits) = vector_filter(kind, prm);
-    if filmcraft_simd::vp8_loop_filter_uv(u, v, start, stride, vertical, f, &limits) {
+    if filmcraft_simd::vp8_loop_filter_uv(u, v, (start, stride), vertical, f, &limits) {
         return;
     }
     filter_edge::<8>(u, stride, start, vertical, kind, prm);
@@ -249,7 +249,7 @@ mod tests {
                     assert_eq!(got, y0, "nothing written when declined");
                 }
                 let (mut gu, mut gv) = (u0.clone(), v0.clone());
-                if filmcraft_simd::vp8_loop_filter_uv_at(level, &mut gu, &mut gv, start, w, vertical, f, &limits) {
+                if filmcraft_simd::vp8_loop_filter_uv_at(level, &mut gu, &mut gv, (start, w), vertical, f, &limits) {
                     assert_eq!((gu, gv), (wu.clone(), wv.clone()), "{level:?} chroma case {case} vertical {vertical} {f:?} {prm:?}");
                 }
             }

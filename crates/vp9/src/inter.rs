@@ -71,7 +71,7 @@ pub fn predict_unscaled(r: &RefPlane, blk: &McBlock, dst: &mut [u16], ds: usize,
         }
     };
     let (fh, fv) = ((fx != 0).then(|| taps(filter, fx)), (fy != 0).then(|| taps(filter, fy)));
-    filmcraft_simd::vp9_predict(src, ss, fh, fv, w, h, ((1u32 << bit_depth) - 1) as u16, dst, ds, out);
+    filmcraft_simd::vp9_predict((src, ss), (fh, fv), (w, h), ((1u32 << bit_depth) - 1) as u16, (dst, ds), out);
 }
 
 /// `dst[..n] = src[..n]` with a fixed-length copy for the block widths (and window widths,

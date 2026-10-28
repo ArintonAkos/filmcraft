@@ -167,14 +167,14 @@ fn edge_line(fs: &FrameState, band: &mut RowBand, mut above: Option<&mut RowBand
             (Some((_, n, g)), Some(f)) if *g == f => *n += 1,
             _ => {
                 if let Some((first, n, g)) = run {
-                    filter_run(fs, band, above.as_deref_mut(), plane, pass, first, n, g);
+                    filter_run(fs, band, above.as_deref_mut(), (plane, pass), first, n, g);
                 }
                 run = f.map(|f| (at, 1, f));
             }
         }
     }
     if let Some((first, n, g)) = run {
-        filter_run(fs, band, above, plane, pass, first, n, g);
+        filter_run(fs, band, above, (plane, pass), first, n, g);
     }
 }
 
@@ -238,16 +238,14 @@ fn edge_filter(fs: &FrameState, plane: usize, pass: usize, row: usize, col: usiz
     Some(EdgeFilter { size: LfSize::new(filter_size, plane > 0), limit, blimit, thresh })
 }
 
-/// `edges` neighbouring loop filter edges with filter `f` from mode info position `first`
-/// (row, col): 4 lines of samples across each. `above` holds the rows above `band` for
+/// `edges` neighbouring loop filter edges of `plane` in `pass` with filter `f` from mode info
+/// position `first` (row, col): 4 lines of samples across each. `above` holds the rows above `band` for
 /// horizontal edges on the band's top row.
-#[allow(clippy::too_many_arguments)]
 fn filter_run(
     fs: &FrameState,
     band: &mut RowBand,
     above: Option<&mut RowBand>,
-    plane: usize,
-    pass: usize,
+    (plane, pass): (usize, usize),
     (row, col): (usize, usize),
     edges: usize,
     f: EdgeFilter,

@@ -249,7 +249,6 @@ pub struct SliceDecoder<'a> {
 /// written as `out` says (luma, Cb, Cr). Blocks whose reference samples (with the interpolation
 /// filters' reach) lie inside a finished reference picture are read in place; otherwise from
 /// windows copied out with the picture's edge samples repeated.
-#[allow(clippy::too_many_arguments)]
 #[inline]
 fn predict_block(
     f: &Frame,
@@ -257,8 +256,7 @@ fn predict_block(
     (px, py): (usize, usize),
     (bw, bh): (usize, usize),
     y: (&mut [u8], usize),
-    c: [&mut [u8]; 2],
-    cs: usize,
+    (c, cs): ([&mut [u8]; 2], usize),
     out: [H264Out; 3],
 ) {
     const LW: usize = 24;
@@ -269,10 +267,10 @@ fn predict_block(
     let planes = f.planes();
     // The 6-tap filter reads 2 samples before and 3 after the block in each direction.
     match planes.and_then(|p| inside(ix - 2, iy - 2, bw + 5, bh + 5, p.width, p.height).map(|o| (p, o))) {
-        Some((p, o)) => filmcraft_simd::h264_luma(&p.y[o..], p.width, lfx, lfy, bw, bh, y.0, y.1, out[0]),
+        Some((p, o)) => filmcraft_simd::h264_luma((&p.y[o..], p.width), (lfx, lfy), (bw, bh), y, out[0]),
         None => {
             f.luma_window((ix - 2, iy - 2), bw + 5, bh + 5, &mut win, LW);
-            filmcraft_simd::h264_luma(&win, LW, lfx, lfy, bw, bh, y.0, y.1, out[0]);
+            filmcraft_simd::h264_luma((&win, LW), (lfx, lfy), (bw, bh), y, out[0]);
         }
     }
     let cx = (px / 2) as i32 + (mv[0] as i32 >> 3);
@@ -284,23 +282,23 @@ fn predict_block(
     if out[1] == out[2] {
         // Cb and Cr written alike: both in one pass
         match direct {
-            Some((p, o)) => filmcraft_simd::h264_chroma_pair([&p.cb[o..], &p.cr[o..]], p.cwidth, fx, fy, cw, ch, c, cs, out[1]),
+            Some((p, o)) => filmcraft_simd::h264_chroma_pair(([&p.cb[o..], &p.cr[o..]], p.cwidth), (fx, fy), (cw, ch), (c, cs), out[1]),
             None => {
                 let (mut wb, mut wr) = ([0u8; 16 * 9], [0u8; 16 * 9]);
                 f.chroma_window(0, (cx, cy), cw + 1, ch + 1, &mut wb, 16);
                 f.chroma_window(1, (cx, cy), cw + 1, ch + 1, &mut wr, 16);
-                filmcraft_simd::h264_chroma_pair([&wb, &wr], 16, fx, fy, cw, ch, c, cs, out[1]);
+                filmcraft_simd::h264_chroma_pair(([&wb, &wr], 16), (fx, fy), (cw, ch), (c, cs), out[1]);
             }
         }
         return;
     }
     for (comp, (dst, out)) in c.into_iter().zip([out[1], out[2]]).enumerate() {
         match direct {
-            Some((p, o)) => filmcraft_simd::h264_chroma(&[&p.cb, &p.cr][comp][o..], p.cwidth, fx, fy, cw, ch, dst, cs, out),
+            Some((p, o)) => filmcraft_simd::h264_chroma((&[&p.cb, &p.cr][comp][o..], p.cwidth), (fx, fy), (cw, ch), (dst, cs), out),
             None => {
                 let mut w = [0u8; 16 * 9];
                 f.chroma_window(comp, (cx, cy), cw + 1, ch + 1, &mut w, 16);
-                filmcraft_simd::h264_chroma(&w, 16, fx, fy, cw, ch, dst, cs, out);
+                filmcraft_simd::h264_chroma((&w, 16), (fx, fy), (cw, ch), (dst, cs), out);
             }
         }
     }
@@ -837,7 +835,7 @@ impl<'a> SliceDecoder<'a> {
             });
             let planes = &mut self.pic.planes;
             let y = (&mut planes.y[py * ys + px..], ys);
-            predict_block(&rp.frame, mvs[l], (px, py), (bw, bh), y, [&mut planes.cb[cy * cs + cx..], &mut planes.cr[cy * cs + cx..]], cs, out);
+            predict_block(&rp.frame, mvs[l], (px, py), (bw, bh), y, ([&mut planes.cb[cy * cs + cx..], &mut planes.cr[cy * cs + cx..]], cs), out);
             first = false;
         }
     }
@@ -1555,7 +1553,7 @@ mod tests {
         let predict = |f: &Frame, mv: [i16; 2], px: usize, py: usize, bw: usize, bh: usize| {
             let (mut y, mut cb, mut cr) = (vec![0u8; w * mb_h * 16], vec![0u8; cw * mb_h * 8], vec![0u8; cw * mb_h * 8]);
             let c = py / 2 * cw + px / 2;
-            predict_block(f, mv, (px, py), (bw, bh), (&mut y[py * w + px..], w), [&mut cb[c..], &mut cr[c..]], cw, [H264Out::Put; 3]);
+            predict_block(f, mv, (px, py), (bw, bh), (&mut y[py * w + px..], w), ([&mut cb[c..], &mut cr[c..]], cw), [H264Out::Put; 3]);
             (y, cb, cr)
         };
         for (bw, bh) in [(16, 16), (16, 8), (8, 16), (8, 8), (8, 4), (4, 8), (4, 4)] {

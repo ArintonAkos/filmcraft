@@ -93,7 +93,7 @@ pub fn mc_luma(p: PlaneRef, x: i32, y: i32, blk: McBlock, out: &mut [u8], os: us
 #[cfg(test)]
 pub fn mc_luma_win(src: &[u8], ss: usize, blk: McBlock, out: &mut [u8], os: usize) {
     let McBlock { fx, fy, bw, bh } = blk;
-    filmcraft_simd::h264_luma(src, ss, fx, fy, bw, bh, out, os, filmcraft_simd::H264Out::Put);
+    filmcraft_simd::h264_luma((src, ss), (fx, fy), (bw, bh), (out, os), filmcraft_simd::H264Out::Put);
 }
 
 /// Chroma sample interpolation (8.4.2.2.2) for a bw x bh block at integer position (x, y) with
@@ -124,7 +124,7 @@ pub fn mc_chroma(p: PlaneRef, x: i32, y: i32, blk: McBlock, out: &mut [u8], os: 
 #[cfg(test)]
 pub fn mc_chroma_win(src: &[u8], ss: usize, blk: McBlock, out: &mut [u8], os: usize) {
     let McBlock { fx, fy, bw, bh } = blk;
-    filmcraft_simd::h264_chroma(src, ss, fx, fy, bw, bh, out, os, filmcraft_simd::H264Out::Put);
+    filmcraft_simd::h264_chroma((src, ss), (fx, fy), (bw, bh), (out, os), filmcraft_simd::H264Out::Put);
 }
 
 /// Fractional offset and size of one motion-compensated block.

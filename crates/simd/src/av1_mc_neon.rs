@@ -28,8 +28,14 @@ enum HPass {
 }
 
 /// See [`crate::av1_mc_at`]; `wrap` says the 16-bit horizontal pass is exact.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn mc(src: &[u16], ss: usize, hf: &[i16; 8], vf: &[i16; 8], w: usize, h: usize, wrap: bool, r0: u32, r1: u32, out: Av1McOut) -> bool {
+pub(crate) fn mc(
+    (src, ss): (&[u16], usize),
+    (hf, vf): (&[i16; 8], &[i16; 8]),
+    (w, h): (usize, usize),
+    wrap: bool,
+    (r0, r1): (u32, u32),
+    out: Av1McOut,
+) -> bool {
     if !matches!(w, 4 | 8 | 16 | 32 | 64 | 128) || !(1..=128).contains(&h) || r0 > 7 || !(1..=16).contains(&r1) {
         return false;
     }
@@ -55,7 +61,7 @@ pub(crate) fn mc(src: &[u16], ss: usize, hf: &[i16; 8], vf: &[i16; 8], w: usize,
     };
     let v_copy = identity(vf);
     // SAFETY: NEON is part of the aarch64 baseline: every core this build runs on has it.
-    unsafe { block(src, ss, hf, vf, w, h, hp, v_copy, r0, r1, out) };
+    unsafe { block((src, ss), (hf, vf), (w, h), hp, v_copy, (r0, r1), out) };
     true
 }
 
@@ -194,21 +200,36 @@ macro_rules! dispatch {
     };
 }
 
+/// What the strips of a block share: the source `s` (rows `ss` apart), the filters (the
+/// horizontal one also broadcast, `kh`), the block height, the passes, and the rounding (`sh0`
+/// and `sh1` the shifts by -InterRound0 and -InterRound1, `up` the one by 7 - InterRound0).
+#[derive(Clone, Copy)]
+struct Kernel<'a> {
+    s: &'a [u16],
+    ss: usize,
+    kh: [int16x8_t; 8],
+    hf: &'a [i16; 8],
+    vf: &'a [i16; 8],
+    h: usize,
+    hp: HPass,
+    v_copy: bool,
+    sh0: int32x4_t,
+    sh1: int32x4_t,
+    up: int16x8_t,
+}
+
 #[target_feature(enable = "neon")]
-#[allow(clippy::too_many_arguments)]
-fn block(s: &[u16], ss: usize, hf: &[i16; 8], vf: &[i16; 8], w: usize, h: usize, hp: HPass, v_copy: bool, r0: u32, r1: u32, mut out: Av1McOut) {
-    let kh = taps(hf);
-    let sh0 = vdupq_n_s32(-(r0 as i32));
-    let sh1 = vdupq_n_s32(-(r1 as i32));
-    let up = vdupq_n_s16(7 - r0 as i16);
+fn block((s, ss): (&[u16], usize), (hf, vf): (&[i16; 8], &[i16; 8]), (w, h): (usize, usize), hp: HPass, v_copy: bool, (r0, r1): (u32, u32), mut out: Av1McOut) {
+    let k =
+        Kernel { s, ss, kh: taps(hf), hf, vf, h, hp, v_copy, sh0: vdupq_n_s32(-(r0 as i32)), sh1: vdupq_n_s32(-(r1 as i32)), up: vdupq_n_s16(7 - r0 as i16) };
     // The identity filter's one tap is 3, in every span.
     let (hs, vs) = (if hp == HPass::Copy { (2, 6) } else { span(hf) }, if v_copy { (2, 6) } else { span(vf) });
     let mut j = 0;
     while j < w {
         if w == 4 {
-            dispatch!(4, hs, vs, (s, ss, &kh, hf, vf, h, j, hp, v_copy, sh0, sh1, up, &mut out));
+            dispatch!(4, hs, vs, (&k, j, &mut out));
         } else {
-            dispatch!(8, hs, vs, (s, ss, &kh, hf, vf, h, j, hp, v_copy, sh0, sh1, up, &mut out));
+            dispatch!(8, hs, vs, (&k, j, &mut out));
         }
         j += 8;
     }
@@ -218,22 +239,8 @@ fn block(s: &[u16], ss: usize, hf: &[i16; 8], vf: &[i16; 8], w: usize, h: usize,
 /// VS..VE (the others are zero): output row r reads intermediate rows r + VS .. r + VE.
 #[inline]
 #[target_feature(enable = "neon")]
-#[allow(clippy::too_many_arguments)]
-fn strip<const N: usize, const HS: usize, const HE: usize, const VS: usize, const VE: usize>(
-    s: &[u16],
-    ss: usize,
-    kh: &[int16x8_t; 8],
-    hf: &[i16; 8],
-    vf: &[i16; 8],
-    h: usize,
-    j: usize,
-    hp: HPass,
-    v_copy: bool,
-    sh0: int32x4_t,
-    sh1: int32x4_t,
-    up: int16x8_t,
-    out: &mut Av1McOut,
-) {
+fn strip<const N: usize, const HS: usize, const HE: usize, const VS: usize, const VE: usize>(k: &Kernel, j: usize, out: &mut Av1McOut) {
+    let &Kernel { s, ss, ref kh, hf, vf, h, hp, v_copy, sh0, sh1, up } = k;
     let row = |r: usize| hrow::<HS, HE>(s, r * ss + j, kh, hf, hp, sh0, up);
     if v_copy {
         // Only intermediate row r + 3 has a non-zero tap.

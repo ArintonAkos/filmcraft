@@ -203,7 +203,7 @@ fn every_level_matches_the_scalar_vp9_loop_filter_per_line() {
         }
         for &level in levels() {
             let mut got = pic.clone();
-            vp9_deblock_at(level, &mut got, base, 32, vertical, n, on, size, &t);
+            vp9_deblock_at(level, &mut got, base, 32, vertical, (n, on), (size, &t));
             assert_eq!(got, want, "{level:?} {size:?} vertical {vertical} {n} lines on {on:#04x} {t:?}");
         }
     }
@@ -378,19 +378,19 @@ fn every_level_matches_the_scalar_h264_prediction() {
         let (w, h) = [(16, 16), (16, 8), (8, 16), (8, 8), (8, 4), (4, 8), (4, 4)][case % 7];
         let (fx, fy) = (next() % 4, next() % 4);
         let mut want = dst0.clone();
-        h264_luma_at(Level::Scalar, &win, ws, fx, fy, w, h, &mut want, 20, out);
+        h264_luma_at(Level::Scalar, (&win, ws), (fx, fy), (w, h), (&mut want, 20), out);
         for &level in levels() {
             let mut got = dst0.clone();
-            h264_luma_at(level, &win, ws, fx, fy, w, h, &mut got, 20, out);
+            h264_luma_at(level, (&win, ws), (fx, fy), (w, h), (&mut got, 20), out);
             assert_eq!(got, want, "{level:?} luma {w}x{h} frac {fx},{fy} {out:?} window {ws} x {}", win.len());
         }
         let (cw, ch) = [(8, 8), (8, 4), (4, 8), (4, 4), (4, 2), (2, 4), (2, 2)][case % 7];
         let (cx, cy) = (next() % 8, next() % 8);
         let mut want = dst0.clone();
-        h264_chroma_at(Level::Scalar, &win, ws, cx, cy, cw, ch, &mut want, 20, out);
+        h264_chroma_at(Level::Scalar, (&win, ws), (cx, cy), (cw, ch), (&mut want, 20), out);
         for &level in levels() {
             let mut got = dst0.clone();
-            h264_chroma_at(level, &win, ws, cx, cy, cw, ch, &mut got, 20, out);
+            h264_chroma_at(level, (&win, ws), (cx, cy), (cw, ch), (&mut got, 20), out);
             assert_eq!(got, want, "{level:?} chroma {cw}x{ch} frac {cx},{cy} {out:?}");
         }
     }
@@ -430,11 +430,11 @@ fn every_level_predicts_a_chroma_pair_as_two_blocks() {
         let mut dst = || -> Vec<u8> { (0..20 * 8).map(|_| sample(next())).collect() };
         let (db, dr) = (dst(), dst());
         let (mut want_b, mut want_r) = (db.clone(), dr.clone());
-        h264_chroma_at(Level::Scalar, &wb, ws, fx, fy, cw, ch, &mut want_b, 20, out);
-        h264_chroma_at(Level::Scalar, &wr, ws, fx, fy, cw, ch, &mut want_r, 20, out);
+        h264_chroma_at(Level::Scalar, (&wb, ws), (fx, fy), (cw, ch), (&mut want_b, 20), out);
+        h264_chroma_at(Level::Scalar, (&wr, ws), (fx, fy), (cw, ch), (&mut want_r, 20), out);
         for &level in levels() {
             let (mut got_b, mut got_r) = (db.clone(), dr.clone());
-            h264_chroma_pair_at(level, [&wb, &wr], ws, fx, fy, cw, ch, [&mut got_b, &mut got_r], 20, out);
+            h264_chroma_pair_at(level, ([&wb, &wr], ws), (fx, fy), (cw, ch), ([&mut got_b, &mut got_r], 20), out);
             assert_eq!((&got_b, &got_r), (&want_b, &want_r), "{level:?} {cw}x{ch} frac {fx},{fy} {out:?} window {ws} x {}", wb.len());
             ran += (level != Level::Scalar && got_b != db) as usize;
         }
@@ -468,10 +468,10 @@ fn every_level_matches_the_scalar_h264_deblocking() {
         let (vertical, chroma) = (case % 2 == 0, case % 3 == 0);
         let (x, y) = (4 + (next() % 16) as usize, 4 + (next() % 16) as usize);
         let mut want = pix.clone();
-        h264_deblock_at(Level::Scalar, &mut want, w, x, y, vertical, chroma, &e);
+        h264_deblock_at(Level::Scalar, &mut want, w, (x, y), vertical, chroma, &e);
         for &level in levels() {
             let mut got = pix.clone();
-            h264_deblock_at(level, &mut got, w, x, y, vertical, chroma, &e);
+            h264_deblock_at(level, &mut got, w, (x, y), vertical, chroma, &e);
             assert_eq!(got, want, "{level:?} vertical {vertical} chroma {chroma} at ({x}, {y}) {e:?}");
         }
     }
@@ -500,11 +500,11 @@ fn every_level_deblocks_a_chroma_pair_as_two_edges() {
         // some edges too close to the plane's start or end for the vector loads
         let (x, y) = ((next() % 20) as usize, (next() % 20) as usize);
         let (mut want_b, mut want_r) = (cb.clone(), cr.clone());
-        h264_deblock_at(Level::Scalar, &mut want_b, w, x, y, vertical, true, &e);
-        h264_deblock_at(Level::Scalar, &mut want_r, w, x, y, vertical, true, &e);
+        h264_deblock_at(Level::Scalar, &mut want_b, w, (x, y), vertical, true, &e);
+        h264_deblock_at(Level::Scalar, &mut want_r, w, (x, y), vertical, true, &e);
         for &level in levels() {
             let (mut got_b, mut got_r) = (cb.clone(), cr.clone());
-            h264_deblock_chroma_pair_at(level, &mut got_b, &mut got_r, w, x, y, vertical, &e);
+            h264_deblock_chroma_pair_at(level, &mut got_b, &mut got_r, w, (x, y), vertical, &e);
             assert_eq!((&got_b, &got_r), (&want_b, &want_r), "{level:?} vertical {vertical} at ({x}, {y}) {e:?}");
             ran += (level != Level::Scalar && got_b != cb) as usize;
         }
@@ -513,17 +513,12 @@ fn every_level_deblocks_a_chroma_pair_as_two_edges() {
 }
 
 /// 8.5.2.4 with a step of 16 as the spec writes it: 32-bit sums, Round2(sum, 7) clipped per pass.
-#[allow(clippy::too_many_arguments)]
 fn spec_vp9_predict(
-    src: &[u16],
-    ss: usize,
-    fh: Option<&[i16; 8]>,
-    fv: Option<&[i16; 8]>,
-    w: usize,
-    h: usize,
+    (src, ss): (&[u16], usize),
+    (fh, fv): (Option<&[i16; 8]>, Option<&[i16; 8]>),
+    (w, h): (usize, usize),
     max: u16,
-    dst: &mut [u16],
-    ds: usize,
+    (dst, ds): (&mut [u16], usize),
     out: Vp9Out,
 ) {
     let id = [0, 0, 0, 128, 0, 0, 0, 0];
@@ -589,10 +584,10 @@ fn every_level_matches_the_spec_vp9_prediction() {
             exact += 1;
         }
         let mut want = dst0.clone();
-        spec_vp9_predict(&src, ss, fh.as_ref(), fv.as_ref(), w, h, max, &mut want, ds, out);
+        spec_vp9_predict((&src, ss), (fh.as_ref(), fv.as_ref()), (w, h), max, (&mut want, ds), out);
         for &level in levels() {
             let mut got = dst0.clone();
-            vp9_predict_at(level, &src, ss, fh.as_ref(), fv.as_ref(), w, h, max, &mut got, ds, out);
+            vp9_predict_at(level, (&src, ss), (fh.as_ref(), fv.as_ref()), (w, h), max, (&mut got, ds), out);
             assert_eq!(got, want, "{level:?} {w}x{h} max {max} taps {fh:?} {fv:?} {out:?} window {ss} x {len}");
         }
     }
@@ -714,8 +709,7 @@ fn hevc_predict8_matches_the_formulas() {
 
 /// 7.11.3.4 sample by sample: the intermediate rows rounded by InterRound0, then the output
 /// rounded by InterRound1.
-#[allow(clippy::too_many_arguments)]
-fn spec_av1_mc(src: &[u16], ss: usize, hf: &[i16; 8], vf: &[i16; 8], w: usize, h: usize, r0: u32, r1: u32) -> Vec<i32> {
+fn spec_av1_mc((src, ss): (&[u16], usize), (hf, vf): (&[i16; 8], &[i16; 8]), (w, h): (usize, usize), (r0, r1): (u32, u32)) -> Vec<i32> {
     let round2 = |x: i32, n: u32| (x + (1 << n >> 1)) >> n;
     let mut tmp = vec![0i32; (h + 7) * w];
     for r in 0..h + 7 {
@@ -798,7 +792,7 @@ fn every_level_matches_the_spec_av1_inter_prediction() {
                                 _ => (next() % (max + 1)) as u16,
                             })
                             .collect();
-                        let want = spec_av1_mc(&src, ss, &hf, &vf, w, h, r0, r1);
+                        let want = spec_av1_mc((&src, ss), (&hf, &vf), (w, h), (r0, r1));
                         let ctx = format!("{level:?} bd {bd} compound {compound} {w}x{h} hf {hf:?} vf {vf:?}");
                         let ds = w + 3;
                         if compound && next().is_multiple_of(2) {
@@ -807,7 +801,7 @@ fn every_level_matches_the_spec_av1_inter_prediction() {
                             let first: Vec<i32> = (0..ds * h).map(|_| (next() % 40000) as i32 - 8000).collect();
                             let mut got = vec![7u16; ds * h];
                             let out = Av1McOut::Avg { first: &first, fs: ds, dst: &mut got, ds, max: max as u16, shift };
-                            if !av1_mc_at(level, &src, ss, &hf, &vf, w, h, bd, r0, r1, out) {
+                            if !av1_mc_at(level, (&src, ss), (&hf, &vf), (w, h), bd, (r0, r1), out) {
                                 assert!(got.iter().all(|&v| v == 7), "{ctx}");
                                 assert!(level != Level::Neon || w == 2, "{ctx}");
                                 continue;
@@ -820,7 +814,7 @@ fn every_level_matches_the_spec_av1_inter_prediction() {
                             }
                         } else if compound {
                             let mut got = vec![7i32; ds * h];
-                            let done = av1_mc_at(level, &src, ss, &hf, &vf, w, h, bd, r0, r1, Av1McOut::Pred { out: &mut got, os: ds });
+                            let done = av1_mc_at(level, (&src, ss), (&hf, &vf), (w, h), bd, (r0, r1), Av1McOut::Pred { out: &mut got, os: ds });
                             if !done {
                                 assert!(got.iter().all(|&v| v == 7), "{ctx}");
                                 assert!(level != Level::Neon || w == 2, "{ctx}");
@@ -832,7 +826,7 @@ fn every_level_matches_the_spec_av1_inter_prediction() {
                             }
                         } else {
                             let mut got = vec![7u16; ds * h];
-                            let done = av1_mc_at(level, &src, ss, &hf, &vf, w, h, bd, r0, r1, Av1McOut::Put { dst: &mut got, ds, max: max as u16 });
+                            let done = av1_mc_at(level, (&src, ss), (&hf, &vf), (w, h), bd, (r0, r1), Av1McOut::Put { dst: &mut got, ds, max: max as u16 });
                             if !done {
                                 assert!(got.iter().all(|&v| v == 7), "{ctx}");
                                 assert!(level != Level::Neon || w == 2, "{ctx}");
@@ -861,12 +855,12 @@ fn av1_inter_prediction_declines_blocks_whose_loads_leave_the_source() {
         // One sample short of the last row's 16-sample load.
         let src = vec![100u16; (h + 6) * ss + (w - 8) + 15];
         let mut dst = vec![7u16; w * h];
-        assert!(!av1_mc_at(level, &src, ss, &taps, &taps, w, h, 8, 3, 11, Av1McOut::Put { dst: &mut dst, ds: w, max: 255 }));
+        assert!(!av1_mc_at(level, (&src, ss), (&taps, &taps), (w, h), 8, (3, 11), Av1McOut::Put { dst: &mut dst, ds: w, max: 255 }));
         assert!(dst.iter().all(|&v| v == 7));
         // A destination one sample short.
         let src = vec![100u16; (h + 6) * ss + w + 8];
         let mut dst = vec![7u16; w * h - 1];
-        assert!(!av1_mc_at(level, &src, ss, &taps, &taps, w, h, 8, 3, 11, Av1McOut::Put { dst: &mut dst, ds: w, max: 255 }));
+        assert!(!av1_mc_at(level, (&src, ss), (&taps, &taps), (w, h), 8, (3, 11), Av1McOut::Put { dst: &mut dst, ds: w, max: 255 }));
         assert!(dst.iter().all(|&v| v == 7));
     }
 }
@@ -1092,7 +1086,7 @@ fn every_level_matches_the_spec_vp8_prediction() {
                     let ds = w + 3;
                     let mut dst = vec![7u8; ds * h];
                     let ctx = format!("{level:?} {w}x{h} fh {fh:?} fv {fv:?}");
-                    let done = vp8_predict_at(level, &src, ss, fh, fv, w, h, &mut dst, ds);
+                    let done = vp8_predict_at(level, (&src, ss), (fh, fv), (w, h), (&mut dst, ds));
                     if level != Level::Neon {
                         assert!(!done && dst.iter().all(|&v| v == 7), "{ctx}");
                         continue;
@@ -1122,7 +1116,7 @@ fn vp8_prediction_declines_what_it_cannot_take() {
             [(&full[..full.len() - 1], w, w * h, f), (&full, w, w * h - 1, f), (&full, 32, 32 * h, f), (&full, w, w * h, [0, 0, 200, -72, 0, 0])];
         for (src, w, dlen, taps) in cases {
             let mut dst = vec![7u8; dlen];
-            assert!(!vp8_predict_at(level, src, ss.max(w + 8), Some(&taps), Some(&taps), w, h, &mut dst, w), "{level:?} w {w}");
+            assert!(!vp8_predict_at(level, (src, ss.max(w + 8)), (Some(&taps), Some(&taps)), (w, h), (&mut dst, w)), "{level:?} w {w}");
             assert!(dst.iter().all(|&v| v == 7), "{level:?} w {w}");
         }
     }
@@ -1147,9 +1141,9 @@ fn vp8_loop_filters_decline_edges_whose_lines_leave_the_buffer() {
                         if lines == 16 {
                             vp8_loop_filter_at(level, d, start, stride, vertical, f, &l)
                         } else if which == 0 {
-                            vp8_loop_filter_uv_at(level, d, e, start, stride, vertical, f, &l)
+                            vp8_loop_filter_uv_at(level, d, e, (start, stride), vertical, f, &l)
                         } else {
-                            vp8_loop_filter_uv_at(level, e, d, start, stride, vertical, f, &l)
+                            vp8_loop_filter_uv_at(level, e, d, (start, stride), vertical, f, &l)
                         }
                     };
                     // `which`: the plane that is short (chroma only; luma has one).

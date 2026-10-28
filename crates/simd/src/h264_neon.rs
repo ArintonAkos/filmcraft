@@ -50,7 +50,7 @@ fn dst_fits(dst: &[u8], ds: usize, w: usize, h: usize) -> bool {
 /// See [`crate::h264_luma`]; false when the window is too small for the vector loads (16
 /// samples, 8 for blocks up to 8 wide, from up to 5 past each row's start), `dst` too small, or
 /// the weights out of range: the scalar version then runs.
-pub(crate) fn luma(win: &[u8], ws: usize, fx: u32, fy: u32, w: usize, h: usize, dst: &mut [u8], ds: usize, out: H264Out) -> bool {
+pub(crate) fn luma((win, ws): (&[u8], usize), (fx, fy): (u32, u32), (w, h): (usize, usize), (dst, ds): (&mut [u8], usize), out: H264Out) -> bool {
     let lanes = if w == 16 { 16 } else { 8 };
     let Some((m, wt)) = mode(out) else {
         return false;
@@ -65,14 +65,14 @@ pub(crate) fn luma(win: &[u8], ws: usize, fx: u32, fy: u32, w: usize, h: usize, 
     // SAFETY: NEON is part of the aarch64 baseline: every core this build runs on has it (every arm).
     unsafe {
         match (w == 16, m) {
-            (true, PUT) => luma16::<PUT>(win, ws, fx, fy, h, dst, ds, wt),
-            (true, AVG) => luma16::<AVG>(win, ws, fx, fy, h, dst, ds, wt),
-            (true, WEIGHT) => luma16::<WEIGHT>(win, ws, fx, fy, h, dst, ds, wt),
-            (true, _) => luma16::<WEIGHT_BI>(win, ws, fx, fy, h, dst, ds, wt),
-            (false, PUT) => luma8::<PUT>(win, ws, fx, fy, w, h, dst, ds, wt),
-            (false, AVG) => luma8::<AVG>(win, ws, fx, fy, w, h, dst, ds, wt),
-            (false, WEIGHT) => luma8::<WEIGHT>(win, ws, fx, fy, w, h, dst, ds, wt),
-            (false, _) => luma8::<WEIGHT_BI>(win, ws, fx, fy, w, h, dst, ds, wt),
+            (true, PUT) => luma16::<PUT>((win, ws), (fx, fy), h, (dst, ds), wt),
+            (true, AVG) => luma16::<AVG>((win, ws), (fx, fy), h, (dst, ds), wt),
+            (true, WEIGHT) => luma16::<WEIGHT>((win, ws), (fx, fy), h, (dst, ds), wt),
+            (true, _) => luma16::<WEIGHT_BI>((win, ws), (fx, fy), h, (dst, ds), wt),
+            (false, PUT) => luma8::<PUT>((win, ws), (fx, fy), w, h, (dst, ds), wt),
+            (false, AVG) => luma8::<AVG>((win, ws), (fx, fy), w, h, (dst, ds), wt),
+            (false, WEIGHT) => luma8::<WEIGHT>((win, ws), (fx, fy), w, h, (dst, ds), wt),
+            (false, _) => luma8::<WEIGHT_BI>((win, ws), (fx, fy), w, h, (dst, ds), wt),
         }
     }
     true
@@ -228,7 +228,7 @@ fn out16<const M: u8>(dst: &mut [u8], o: usize, p: uint8x16_t, wt: Wt) {
 macro_rules! luma_kernel {
     ($name:ident, $ld:ident, $tap6:ident, $half:ident, $centre:ident, $avg:ident, $zero:expr, ($($w:ident: $wt:ty),*), $out:ident $(, $outw:ident)?) => {
         #[target_feature(enable = "neon")]
-        fn $name<const M: u8>(win: &[u8], ws: usize, fx: u32, fy: u32, $($w: $wt,)* h: usize, dst: &mut [u8], ds: usize, wt: Wt) {
+        fn $name<const M: u8>((win, ws): (&[u8], usize), (fx, fy): (u32, u32), $($w: $wt,)* h: usize, (dst, ds): (&mut [u8], usize), wt: Wt) {
             let ld = |r: usize, c: usize| $ld(win, r * ws + c);
             let tap_h = |r: usize| $tap6([ld(r, 0), ld(r, 1), ld(r, 2), ld(r, 3), ld(r, 4), ld(r, 5)]);
             let tap_v = |r: usize, c: usize| $tap6([ld(r, c), ld(r + 1, c), ld(r + 2, c), ld(r + 3, c), ld(r + 4, c), ld(r + 5, c)]);
@@ -300,7 +300,7 @@ luma_kernel!(luma8, ld8, tap6_8, half8, centre8, vrhadd_u8, vdupq_n_s16(0), (w: 
 
 /// See [`crate::h264_chroma`]; false when the window is too small (9 samples are loaded from
 /// each row's start), `dst` too small or the weights out of range.
-pub(crate) fn chroma(win: &[u8], ws: usize, fx: u32, fy: u32, w: usize, h: usize, dst: &mut [u8], ds: usize, out: H264Out) -> bool {
+pub(crate) fn chroma((win, ws): (&[u8], usize), (fx, fy): (u32, u32), (w, h): (usize, usize), (dst, ds): (&mut [u8], usize), out: H264Out) -> bool {
     let Some((m, wt)) = mode(out) else {
         return false;
     };
@@ -316,17 +316,17 @@ pub(crate) fn chroma(win: &[u8], ws: usize, fx: u32, fy: u32, w: usize, h: usize
     // SAFETY: NEON is part of the aarch64 baseline: every core this build runs on has it (every arm).
     unsafe {
         match m {
-            PUT => chroma_neon::<PUT>(win, ws, fx, fy, w, h, dst, ds, wt),
-            AVG => chroma_neon::<AVG>(win, ws, fx, fy, w, h, dst, ds, wt),
-            WEIGHT => chroma_neon::<WEIGHT>(win, ws, fx, fy, w, h, dst, ds, wt),
-            _ => chroma_neon::<WEIGHT_BI>(win, ws, fx, fy, w, h, dst, ds, wt),
+            PUT => chroma_neon::<PUT>((win, ws), (fx, fy), (w, h), (dst, ds), wt),
+            AVG => chroma_neon::<AVG>((win, ws), (fx, fy), (w, h), (dst, ds), wt),
+            WEIGHT => chroma_neon::<WEIGHT>((win, ws), (fx, fy), (w, h), (dst, ds), wt),
+            _ => chroma_neon::<WEIGHT_BI>((win, ws), (fx, fy), (w, h), (dst, ds), wt),
         }
     }
     true
 }
 
 #[target_feature(enable = "neon")]
-fn chroma_neon<const M: u8>(win: &[u8], ws: usize, fx: u32, fy: u32, w: usize, h: usize, dst: &mut [u8], ds: usize, wt: Wt) {
+fn chroma_neon<const M: u8>((win, ws): (&[u8], usize), (fx, fy): (u32, u32), (w, h): (usize, usize), (dst, ds): (&mut [u8], usize), wt: Wt) {
     // Weights at most 64: the sums stay below 2^14.
     let [a, b, c, d] = [(8 - fx) * (8 - fy), fx * (8 - fy), (8 - fx) * fy, fx * fy].map(|v| vdup_n_u8(v as u8));
     for r in 0..h {
@@ -337,7 +337,13 @@ fn chroma_neon<const M: u8>(win: &[u8], ws: usize, fx: u32, fy: u32, w: usize, h
 }
 
 /// See [`crate::h264_chroma_pair`]; false as [`chroma`] for either plane.
-pub(crate) fn chroma_pair(win: [&[u8]; 2], ws: usize, fx: u32, fy: u32, w: usize, h: usize, dst: [&mut [u8]; 2], ds: usize, out: H264Out) -> bool {
+pub(crate) fn chroma_pair(
+    (win, ws): ([&[u8]; 2], usize),
+    (fx, fy): (u32, u32),
+    (w, h): (usize, usize),
+    (dst, ds): ([&mut [u8]; 2], usize),
+    out: H264Out,
+) -> bool {
     let Some((m, wt)) = mode(out) else {
         return false;
     };
@@ -353,10 +359,10 @@ pub(crate) fn chroma_pair(win: [&[u8]; 2], ws: usize, fx: u32, fy: u32, w: usize
     // SAFETY: NEON is part of the aarch64 baseline: every core this build runs on has it (every arm).
     unsafe {
         match m {
-            PUT => chroma_pair_neon::<PUT>(win, ws, fx, fy, w, h, dst, ds, wt),
-            AVG => chroma_pair_neon::<AVG>(win, ws, fx, fy, w, h, dst, ds, wt),
-            WEIGHT => chroma_pair_neon::<WEIGHT>(win, ws, fx, fy, w, h, dst, ds, wt),
-            _ => chroma_pair_neon::<WEIGHT_BI>(win, ws, fx, fy, w, h, dst, ds, wt),
+            PUT => chroma_pair_neon::<PUT>((win, ws), (fx, fy), (w, h), (dst, ds), wt),
+            AVG => chroma_pair_neon::<AVG>((win, ws), (fx, fy), (w, h), (dst, ds), wt),
+            WEIGHT => chroma_pair_neon::<WEIGHT>((win, ws), (fx, fy), (w, h), (dst, ds), wt),
+            _ => chroma_pair_neon::<WEIGHT_BI>((win, ws), (fx, fy), (w, h), (dst, ds), wt),
         }
     }
     true
@@ -365,8 +371,7 @@ pub(crate) fn chroma_pair(win: [&[u8]; 2], ws: usize, fx: u32, fy: u32, w: usize
 /// [`chroma_neon`] of Cb (lanes 0..8) and Cr (lanes 8..16) at once; each window row is loaded
 /// once, as the bottom row of one output row and the top row of the next.
 #[target_feature(enable = "neon")]
-#[allow(clippy::too_many_arguments)]
-fn chroma_pair_neon<const M: u8>(win: [&[u8]; 2], ws: usize, fx: u32, fy: u32, w: usize, h: usize, dst: [&mut [u8]; 2], ds: usize, wt: Wt) {
+fn chroma_pair_neon<const M: u8>((win, ws): ([&[u8]; 2], usize), (fx, fy): (u32, u32), (w, h): (usize, usize), (dst, ds): ([&mut [u8]; 2], usize), wt: Wt) {
     let [a, b, c, d] = [(8 - fx) * (8 - fy), fx * (8 - fy), (8 - fx) * fy, fx * fy].map(|v| vdupq_n_u8(v as u8));
     let [wb, wr] = win;
     let [db, dr] = dst;

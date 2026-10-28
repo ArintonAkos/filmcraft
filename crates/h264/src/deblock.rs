@@ -425,9 +425,9 @@ fn filter_luma_edges(planes: &mut Planes, m: &MbEdges) {
                 continue;
             }
             if dir == 0 {
-                filmcraft_simd::h264_deblock(&mut planes.y, width, m.mx * 16 + e * 4, m.my * 16, true, false, &ep);
+                filmcraft_simd::h264_deblock(&mut planes.y, width, (m.mx * 16 + e * 4, m.my * 16), true, false, &ep);
             } else {
-                filmcraft_simd::h264_deblock(&mut planes.y, width, m.mx * 16, m.my * 16 + e * 4, false, false, &ep);
+                filmcraft_simd::h264_deblock(&mut planes.y, width, (m.mx * 16, m.my * 16 + e * 4), false, false, &ep);
             }
         }
     }
@@ -450,7 +450,7 @@ fn filter_chroma_edges(planes: &mut Planes, m: &MbEdges) {
             if qpp[0] == qpp[1] && qpq[0] == qpq[1] {
                 let ep = edge_params(qpp[0], qpq[0], m.bs[dir][e], m.offsets);
                 if ep.alpha != 0 && ep.beta != 0 {
-                    filmcraft_simd::h264_deblock_chroma_pair(&mut planes.cb, &mut planes.cr, cwidth, x, y, dir == 0, &ep);
+                    filmcraft_simd::h264_deblock_chroma_pair(&mut planes.cb, &mut planes.cr, cwidth, (x, y), dir == 0, &ep);
                 }
                 continue;
             }
@@ -460,7 +460,7 @@ fn filter_chroma_edges(planes: &mut Planes, m: &MbEdges) {
                     continue;
                 }
                 let plane = if c == 0 { &mut planes.cb } else { &mut planes.cr };
-                filmcraft_simd::h264_deblock(plane, cwidth, x, y, dir == 0, true, &ep);
+                filmcraft_simd::h264_deblock(plane, cwidth, (x, y), dir == 0, true, &ep);
             }
         }
     }

@@ -58,22 +58,22 @@ fn vtap_row(rows: [&[u8]; 6], out: &mut [i32], n: usize) {
 
 /// See [`crate::h264_luma`]: interpolated straight into `dst` (put), or into a block that is
 /// then written out.
-pub(crate) fn luma_out(win: &[u8], ws: usize, fx: u32, fy: u32, w: usize, h: usize, dst: &mut [u8], ds: usize, out: H264Out) {
+pub(crate) fn luma_out((win, ws): (&[u8], usize), (fx, fy): (u32, u32), (w, h): (usize, usize), (dst, ds): (&mut [u8], usize), out: H264Out) {
     if out == H264Out::Put {
-        return luma(win, ws, fx, fy, w, h, dst, ds);
+        return luma((win, ws), (fx, fy), (w, h), (dst, ds));
     }
     let mut pred = [0u8; 16 * 16];
-    luma(win, ws, fx, fy, w, h, &mut pred, 16);
+    luma((win, ws), (fx, fy), (w, h), (&mut pred, 16));
     write_out(dst, ds, &pred, 16, w, h, out);
 }
 
 /// See [`crate::h264_chroma`].
-pub(crate) fn chroma_out(win: &[u8], ws: usize, fx: u32, fy: u32, w: usize, h: usize, dst: &mut [u8], ds: usize, out: H264Out) {
+pub(crate) fn chroma_out((win, ws): (&[u8], usize), (fx, fy): (u32, u32), (w, h): (usize, usize), (dst, ds): (&mut [u8], usize), out: H264Out) {
     if out == H264Out::Put {
-        return chroma(win, ws, fx, fy, w, h, dst, ds);
+        return chroma((win, ws), (fx, fy), (w, h), (dst, ds));
     }
     let mut pred = [0u8; 8 * 8];
-    chroma(win, ws, fx, fy, w, h, &mut pred, 8);
+    chroma((win, ws), (fx, fy), (w, h), (&mut pred, 8));
     write_out(dst, ds, &pred, 8, w, h, out);
 }
 
@@ -100,8 +100,7 @@ fn write_out(dst: &mut [u8], ds: usize, pred: &[u8], ps: usize, w: usize, h: usi
 
 /// Luma interpolation from a prepared window: `src[0]` is the sample at (x - 2, y - 2) and `ss` the
 /// window stride; the window covers (bw + 5) x (bh + 5) samples.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn luma(src: &[u8], ss: usize, fx: u32, fy: u32, bw: usize, bh: usize, out: &mut [u8], os: usize) {
+pub(crate) fn luma((src, ss): (&[u8], usize), (fx, fy): (u32, u32), (bw, bh): (usize, usize), (out, os): (&mut [u8], usize)) {
     // window row r (0..bh+5) starts at src[r * ss]; sample G of block (r, c) is at window (r + 2, c + 2)
     let wrow = |r: usize| &src[r * ss..r * ss + bw + 5];
     let mut t = [0i32; 16];
@@ -208,8 +207,7 @@ pub(crate) fn luma(src: &[u8], ss: usize, fx: u32, fy: u32, bw: usize, bh: usize
 
 /// Chroma interpolation from a prepared (bw + 1) x (bh + 1) window whose first sample is the integer
 /// position of the block.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn chroma(src: &[u8], ss: usize, fx: u32, fy: u32, bw: usize, bh: usize, out: &mut [u8], os: usize) {
+pub(crate) fn chroma((src, ss): (&[u8], usize), (fx, fy): (u32, u32), (bw, bh): (usize, usize), (out, os): (&mut [u8], usize)) {
     let (fx, fy) = (fx as u16, fy as u16);
     let (w00, w10, w01, w11) = ((8 - fx) * (8 - fy), fx * (8 - fy), (8 - fx) * fy, fx * fy);
     if fx == 0 && fy == 0 {

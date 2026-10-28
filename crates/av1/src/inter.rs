@@ -539,7 +539,7 @@ impl TileDecoder<'_, '_> {
             Direct::Avg(first) => filmcraft_simd::Av1McOut::Avg { first, fs: PRED_STRIDE, dst, ds, max, shift: 1 + rnd.2 },
             _ => filmcraft_simd::Av1McOut::Put { dst, ds, max },
         };
-        filmcraft_simd::av1_mc(window, ss, hf, vf, w, h, bd, rnd.0, rnd.1, out)
+        filmcraft_simd::av1_mc((window, ss), (hf, vf), (w, h), bd, (rnd.0, rnd.1), out)
     }
 
     /// Wedge compound mask (7.11.3.11) for the luma block.
@@ -796,13 +796,13 @@ pub(crate) fn copy_whole_samples(
     }
     let x0 = x0 as usize;
     match w {
-        2 => copy_rows::<2>(refp, last_y, x0, y0, h, dst, dx, dy),
-        4 => copy_rows::<4>(refp, last_y, x0, y0, h, dst, dx, dy),
-        8 => copy_rows::<8>(refp, last_y, x0, y0, h, dst, dx, dy),
-        16 => copy_rows::<16>(refp, last_y, x0, y0, h, dst, dx, dy),
-        32 => copy_rows::<32>(refp, last_y, x0, y0, h, dst, dx, dy),
-        64 => copy_rows::<64>(refp, last_y, x0, y0, h, dst, dx, dy),
-        128 => copy_rows::<128>(refp, last_y, x0, y0, h, dst, dx, dy),
+        2 => copy_rows::<2>(refp, last_y, (x0, y0), h, dst, (dx, dy)),
+        4 => copy_rows::<4>(refp, last_y, (x0, y0), h, dst, (dx, dy)),
+        8 => copy_rows::<8>(refp, last_y, (x0, y0), h, dst, (dx, dy)),
+        16 => copy_rows::<16>(refp, last_y, (x0, y0), h, dst, (dx, dy)),
+        32 => copy_rows::<32>(refp, last_y, (x0, y0), h, dst, (dx, dy)),
+        64 => copy_rows::<64>(refp, last_y, (x0, y0), h, dst, (dx, dy)),
+        128 => copy_rows::<128>(refp, last_y, (x0, y0), h, dst, (dx, dy)),
         _ => {
             for r in 0..h {
                 let row = refp.row((y0 + r as i32).clamp(0, last_y) as usize);
@@ -814,8 +814,7 @@ pub(crate) fn copy_whole_samples(
 
 /// [`copy_whole_samples`] of `W`-wide rows inside the reference: copies of a fixed length (a
 /// call to memmove per row otherwise).
-#[allow(clippy::too_many_arguments)]
-fn copy_rows<const W: usize>(refp: &Plane, last_y: i32, x0: usize, y0: i32, h: usize, dst: &mut Plane, dx: usize, dy: usize) {
+fn copy_rows<const W: usize>(refp: &Plane, last_y: i32, (x0, y0): (usize, i32), h: usize, dst: &mut Plane, (dx, dy): (usize, usize)) {
     for r in 0..h {
         let src = refp.row((y0 + r as i32).clamp(0, last_y) as usize).get(x0..).and_then(|s| s.first_chunk::<W>());
         if let (Some(src), Some(d)) = (src, dst.row_from_mut(dy + r, dx).first_chunk_mut::<W>()) {
@@ -862,7 +861,7 @@ fn mc_unscaled(
 ) {
     let McBlock { x, y, w, h, bd } = blk;
     if let Some(src) = filter_window(refp, last_x, last_y, x, y, w, h)
-        && filmcraft_simd::av1_mc(src, refp.stride, hf, vf, w, h, bd, rnd.0, rnd.1, filmcraft_simd::Av1McOut::Pred { out: pred, os: PRED_STRIDE })
+        && filmcraft_simd::av1_mc((src, refp.stride), (hf, vf), (w, h), bd, (rnd.0, rnd.1), filmcraft_simd::Av1McOut::Pred { out: pred, os: PRED_STRIDE })
     {
         return;
     }

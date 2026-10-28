@@ -457,7 +457,7 @@ mod tests {
         assert!(row.y.iter().all(|&v| v == 128));
         assert!(row.mv[0].iter().all(|&m| m == [0, 0]));
         let mut out = vec![0u8; 8 * 8];
-        f.luma_window(4, 20, 8, 8, &mut out, 8);
+        f.luma_window((4, 20), 8, 8, &mut out, 8);
         assert!(out.iter().all(|&v| v == 128));
     }
 }

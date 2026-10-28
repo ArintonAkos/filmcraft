@@ -201,7 +201,7 @@ mod tests {
                     let done = if dc_only {
                         filmcraft_simd::hevc_dc_add8_at(level, inverse_dc(c[0].clamp(-32768, 32767), 12), n, &mut got, ds)
                     } else {
-                        filmcraft_simd::hevc_idct_add8_at(level, &c, n, dst, max_x, max_y, &mut got, ds)
+                        filmcraft_simd::hevc_idct_add8_at(level, &c, n, dst, (max_x, max_y), &mut got, ds)
                     };
                     if !done {
                         assert_eq!(got, pred, "nothing written when declined");

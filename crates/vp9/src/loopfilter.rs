@@ -254,7 +254,7 @@ fn filter_sb_plane(v: &mut PlaneView, mi: &MiGrid, f: &LfFrame, plane: usize, ro
 fn filter_group(v: &mut PlaneView, pos: usize, pass: usize, n: usize, filter_size: u8, lvl: u8, f: &LfFrame) {
     let on = ((1u16 << n) - 1) as u8;
     if f.vector {
-        filmcraft_simd::vp9_deblock(v.data, pos, v.stride, pass == 0, n, on, lf_size(filter_size), &f.thresh[lvl as usize]);
+        filmcraft_simd::vp9_deblock(v.data, pos, v.stride, pass == 0, (n, on), (lf_size(filter_size), &f.thresh[lvl as usize]));
         return;
     }
     let (limit, blimit, thresh) = f.limits[lvl as usize];
@@ -585,7 +585,7 @@ mod tests {
     fn reference_group_simd(d: &mut [u16], pos: usize, stride: usize, vertical: bool, n: usize, g: &Limits) {
         let on = g.apply.iter().enumerate().fold(0u8, |m, (l, &a)| m | ((a as u8) << l));
         let t = LfThresh::new(g.limit, g.blimit, g.thresh, g.bit_depth as u32);
-        filmcraft_simd::vp9_deblock(d, pos, stride, vertical, n, on, lf_size(g.filter_size), &t);
+        filmcraft_simd::vp9_deblock(d, pos, stride, vertical, (n, on), (lf_size(g.filter_size), &t));
     }
 
     /// The vector kernels filter every group as the group filter does: all filter sizes, bit
@@ -642,7 +642,7 @@ mod tests {
             let t = LfThresh::new(g.limit, g.blimit, g.thresh, bit_depth as u32);
             for &level in filmcraft_simd::levels() {
                 let mut got = data.clone();
-                filmcraft_simd::vp9_deblock_at(level, &mut got, pos, stride, pass == 0, n, on, lf_size(filter_size), &t);
+                filmcraft_simd::vp9_deblock_at(level, &mut got, pos, stride, pass == 0, (n, on), (lf_size(filter_size), &t));
                 assert_eq!(got, want, "{level:?} case {case} bd {bit_depth} size {filter_size} pass {pass} n {n} apply {apply:?}");
             }
         }

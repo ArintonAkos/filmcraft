@@ -165,7 +165,7 @@ fn deblock_row<S: Sample>(pic: &mut PicState<S>, r: usize) {
                 if bs == 0 {
                     continue;
                 }
-                segment(&mut edge, k, &pic.blk[qi - 1], &pic.blk[qi], bs, tc_off, beta_off, bd);
+                segment(&mut edge, k, (&pic.blk[qi - 1], &pic.blk[qi]), bs, tc_off, beta_off, bd);
             }
             if edge.on != [false; 2] {
                 luma_edge(&mut pic.planes[0], by0 * 4 * w + bx * 4, 1, w, &edge, bd);
@@ -212,7 +212,7 @@ fn deblock_row<S: Sample>(pic: &mut PicState<S>, r: usize) {
                 if bs == 0 {
                     continue;
                 }
-                segment(&mut edge, k, &pic.blk[pi], &pic.blk[qi], bs, tc_off, beta_off, bd);
+                segment(&mut edge, k, (&pic.blk[pi], &pic.blk[qi]), bs, tc_off, beta_off, bd);
             }
             if edge.on != [false; 2] {
                 luma_edge(&mut pic.planes[0], by * 4 * w + bx0 * 4, w, 1, &edge, bd);
@@ -262,8 +262,7 @@ fn edge_columns(bits: &[u64], ww: usize, r0: usize, r1: usize) -> impl Iterator<
 
 /// Segment `k` of an 8-line luma edge between blocks `p` and `q` with boundary strength `bs`
 /// (> 0): its tC and beta (8.7.2.5.3) and the sides left unfiltered.
-#[allow(clippy::too_many_arguments)]
-fn segment(edge: &mut HevcLumaEdge, k: usize, p: &Blk, q: &Blk, bs: i32, tc_off: i32, beta_off: i32, bd: u32) {
+fn segment(edge: &mut HevcLumaEdge, k: usize, (p, q): (&Blk, &Blk), bs: i32, tc_off: i32, beta_off: i32, bd: u32) {
     let qpl = (p.qp as i32 + q.qp as i32 + 1) >> 1;
     let (tc, beta) = tc_beta(qpl, bs, tc_off, beta_off, bd);
     edge.on[k] = true;

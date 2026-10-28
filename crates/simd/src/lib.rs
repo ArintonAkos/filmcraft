@@ -191,14 +191,12 @@ pub fn deblock_horizontal_at(level: Level, d: &mut [u16], base: usize, stride: u
 /// (`size` one of the `Vp9` ones): `d[base]` is q0 of the first line, the next lines follow it
 /// (`vertical`: one `stride` below each other; otherwise one sample apart, rows `stride` apart),
 /// and line l is filtered where bit l of `on` is set.
-#[allow(clippy::too_many_arguments)]
-pub fn vp9_deblock(d: &mut [u16], base: usize, stride: usize, vertical: bool, n: usize, on: u8, size: LfSize, t: &LfThresh) {
-    vp9_deblock_at(level(), d, base, stride, vertical, n, on, size, t);
+pub fn vp9_deblock(d: &mut [u16], base: usize, stride: usize, vertical: bool, (n, on): (usize, u8), (size, t): (LfSize, &LfThresh)) {
+    vp9_deblock_at(level(), d, base, stride, vertical, (n, on), (size, t));
 }
 
 /// [`vp9_deblock`] on a given level.
-#[allow(clippy::too_many_arguments)]
-pub fn vp9_deblock_at(level: Level, d: &mut [u16], base: usize, stride: usize, vertical: bool, n: usize, on: u8, size: LfSize, t: &LfThresh) {
+pub fn vp9_deblock_at(level: Level, d: &mut [u16], base: usize, stride: usize, vertical: bool, (n, on): (usize, u8), (size, t): (LfSize, &LfThresh)) {
     let n = if n >= 8 { 8 } else { 4 };
     let done = match (level, vertical) {
         #[cfg(target_arch = "aarch64")]
@@ -346,38 +344,33 @@ pub enum Av1McOut<'a> {
 }
 
 /// AV1 block inter prediction without reference scaling (7.11.3.4) of a `w` x `h` block (`w` 4
-/// to 128, a power of two; `h` 1 to 128) of `bit_depth` samples: the horizontal filter `hf`
-/// rounded by InterRound0 = `r0` (<= 7), then the vertical filter `vf` rounded by InterRound1 =
-/// `r1`, written as `out` says. `src` is the reference from (x - 3, y - 3), rows `ss` apart, every
+/// to 128, a power of two; `h` 1 to 128; `size` (`w`, `h`)) of `bit_depth` samples: the
+/// horizontal filter `hf` rounded by InterRound0 = `r0` (<= 7), then the vertical filter `vf`
+/// rounded by InterRound1 = `r1` (`filters` (`hf`, `vf`), `rnd` (`r0`, `r1`)), written as `out`
+/// says. `src` is (the reference from (x - 3, y - 3), its row stride `ss`), every
 /// sample the filters read inside the reference (no edge clamping). The vector version reads 16
 /// samples from each strip of 8 columns (one of 4 for 4-wide blocks), h + 7 rows, so it needs
 /// `(h + 6) * ss + w + 8` samples (`+ 12` for 4-wide). Returns false, writing nothing, when no
 /// vector version runs (on the scalar level, for other sizes, or when the loads or stores do not
 /// fit); the caller then runs its scalar version.
-#[allow(clippy::too_many_arguments)]
-pub fn av1_mc(src: &[u16], ss: usize, hf: &[i16; 8], vf: &[i16; 8], w: usize, h: usize, bit_depth: u32, r0: u32, r1: u32, out: Av1McOut) -> bool {
-    av1_mc_at(level(), src, ss, hf, vf, w, h, bit_depth, r0, r1, out)
+pub fn av1_mc(src: (&[u16], usize), filters: (&[i16; 8], &[i16; 8]), size: (usize, usize), bit_depth: u32, rnd: (u32, u32), out: Av1McOut) -> bool {
+    av1_mc_at(level(), src, filters, size, bit_depth, rnd, out)
 }
 
 /// [`av1_mc`] on a given level.
-#[allow(clippy::too_many_arguments)]
 pub fn av1_mc_at(
     level: Level,
-    src: &[u16],
-    ss: usize,
-    hf: &[i16; 8],
-    vf: &[i16; 8],
-    w: usize,
-    h: usize,
+    (src, ss): (&[u16], usize),
+    (hf, vf): (&[i16; 8], &[i16; 8]),
+    (w, h): (usize, usize),
     bit_depth: u32,
-    r0: u32,
-    r1: u32,
+    (r0, r1): (u32, u32),
     out: Av1McOut,
 ) -> bool {
     let wrap = bit_depth == 8 && r0 == 3 && vp9_wraps(hf);
     match level {
         #[cfg(target_arch = "aarch64")]
-        Level::Neon => av1_mc_neon::mc(src, ss, hf, vf, w, h, wrap, r0, r1, out),
+        Level::Neon => av1_mc_neon::mc((src, ss), (hf, vf), (w, h), wrap, (r0, r1), out),
         _ => {
             let _ = (src, ss, vf, w, h, r1, out, wrap);
             false
@@ -476,7 +469,7 @@ pub enum H264Out {
 
 /// Whether a `ww` x `wh` window (rows `ws` apart) fits `win` and the `w` x `h` block (rows `ds`
 /// apart) fits `dst`.
-fn block_fits<T>(win: &[T], ws: usize, ww: usize, wh: usize, dst: &[T], ds: usize, w: usize, h: usize) -> bool {
+fn block_fits<T>((win, ws): (&[T], usize), (ww, wh): (usize, usize), (dst, ds): (&[T], usize), (w, h): (usize, usize)) -> bool {
     let need = |len: usize, stride: usize, cols: usize, rows: usize| {
         rows == 0 || (rows - 1).checked_mul(stride).and_then(|n| n.checked_add(cols)).is_some_and(|n| n <= len)
     };
@@ -489,22 +482,22 @@ fn block_fits<T>(win: &[T], ws: usize, ww: usize, wh: usize, dst: &[T], ds: usiz
 /// fraction. The vector version reads 16 (8 for blocks up to 8 wide) samples from up to 5 past
 /// each window row's start, so it needs `(h + 4) * ws + 21` (`+ 13`) of them and otherwise the
 /// scalar one runs. Blocks that do not fit leave `dst` unchanged.
-pub fn h264_luma(win: &[u8], ws: usize, fx: u32, fy: u32, w: usize, h: usize, dst: &mut [u8], ds: usize, out: H264Out) {
-    h264_luma_at(level(), win, ws, fx, fy, w, h, dst, ds, out);
+pub fn h264_luma((win, ws): (&[u8], usize), (fx, fy): (u32, u32), (w, h): (usize, usize), (dst, ds): (&mut [u8], usize), out: H264Out) {
+    h264_luma_at(level(), (win, ws), (fx, fy), (w, h), (dst, ds), out);
 }
 
 /// [`h264_luma`] on a given level.
-pub fn h264_luma_at(level: Level, win: &[u8], ws: usize, fx: u32, fy: u32, w: usize, h: usize, dst: &mut [u8], ds: usize, out: H264Out) {
-    if !matches!(w, 4 | 8 | 16) || !matches!(h, 4 | 8 | 16) || fx > 3 || fy > 3 || !block_fits(win, ws, w + 5, h + 5, dst, ds, w, h) {
+pub fn h264_luma_at(level: Level, (win, ws): (&[u8], usize), (fx, fy): (u32, u32), (w, h): (usize, usize), (dst, ds): (&mut [u8], usize), out: H264Out) {
+    if !matches!(w, 4 | 8 | 16) || !matches!(h, 4 | 8 | 16) || fx > 3 || fy > 3 || !block_fits((win, ws), (w + 5, h + 5), (&*dst, ds), (w, h)) {
         return;
     }
     let done = match level {
         #[cfg(target_arch = "aarch64")]
-        Level::Neon => h264_neon::luma(win, ws, fx, fy, w, h, dst, ds, out),
+        Level::Neon => h264_neon::luma((win, ws), (fx, fy), (w, h), (dst, ds), out),
         _ => false,
     };
     if !done {
-        h264::luma_out(win, ws, fx, fy, w, h, dst, ds, out);
+        h264::luma_out((win, ws), (fx, fy), (w, h), (dst, ds), out);
     }
 }
 
@@ -512,22 +505,22 @@ pub fn h264_luma_at(level: Level, win: &[u8], ws: usize, fx: u32, fy: u32, w: us
 /// into `dst` as `out` says. `win` holds the (w + 1) x (h + 1) window from the block's integer
 /// position, rows `ws` apart (the vector version reads 9 samples from each row's start: it needs
 /// `h * ws + 9`); (`fx`, `fy`) is the eighth-sample fraction.
-pub fn h264_chroma(win: &[u8], ws: usize, fx: u32, fy: u32, w: usize, h: usize, dst: &mut [u8], ds: usize, out: H264Out) {
-    h264_chroma_at(level(), win, ws, fx, fy, w, h, dst, ds, out);
+pub fn h264_chroma((win, ws): (&[u8], usize), (fx, fy): (u32, u32), (w, h): (usize, usize), (dst, ds): (&mut [u8], usize), out: H264Out) {
+    h264_chroma_at(level(), (win, ws), (fx, fy), (w, h), (dst, ds), out);
 }
 
 /// [`h264_chroma`] on a given level.
-pub fn h264_chroma_at(level: Level, win: &[u8], ws: usize, fx: u32, fy: u32, w: usize, h: usize, dst: &mut [u8], ds: usize, out: H264Out) {
-    if !matches!(w, 2 | 4 | 8) || !matches!(h, 2 | 4 | 8) || fx > 7 || fy > 7 || !block_fits(win, ws, w + 1, h + 1, dst, ds, w, h) {
+pub fn h264_chroma_at(level: Level, (win, ws): (&[u8], usize), (fx, fy): (u32, u32), (w, h): (usize, usize), (dst, ds): (&mut [u8], usize), out: H264Out) {
+    if !matches!(w, 2 | 4 | 8) || !matches!(h, 2 | 4 | 8) || fx > 7 || fy > 7 || !block_fits((win, ws), (w + 1, h + 1), (&*dst, ds), (w, h)) {
         return;
     }
     let done = match level {
         #[cfg(target_arch = "aarch64")]
-        Level::Neon => h264_neon::chroma(win, ws, fx, fy, w, h, dst, ds, out),
+        Level::Neon => h264_neon::chroma((win, ws), (fx, fy), (w, h), (dst, ds), out),
         _ => false,
     };
     if !done {
-        h264::chroma_out(win, ws, fx, fy, w, h, dst, ds, out);
+        h264::chroma_out((win, ws), (fx, fy), (w, h), (dst, ds), out);
     }
 }
 
@@ -544,27 +537,32 @@ pub struct H264Edge {
 /// [`h264_chroma`] of the same block of both chroma planes, which share the motion vector, so the
 /// fraction, window stride and destination stride: `win[0]` / `dst[0]` Cb, `win[1]` / `dst[1]`
 /// Cr, both written as `out` (the vector version runs them as one).
-#[allow(clippy::too_many_arguments)]
-pub fn h264_chroma_pair(win: [&[u8]; 2], ws: usize, fx: u32, fy: u32, w: usize, h: usize, dst: [&mut [u8]; 2], ds: usize, out: H264Out) {
-    h264_chroma_pair_at(level(), win, ws, fx, fy, w, h, dst, ds, out);
+pub fn h264_chroma_pair((win, ws): ([&[u8]; 2], usize), (fx, fy): (u32, u32), (w, h): (usize, usize), (dst, ds): ([&mut [u8]; 2], usize), out: H264Out) {
+    h264_chroma_pair_at(level(), (win, ws), (fx, fy), (w, h), (dst, ds), out);
 }
 
 /// [`h264_chroma_pair`] on a given level.
-#[allow(clippy::too_many_arguments)]
-pub fn h264_chroma_pair_at(level: Level, win: [&[u8]; 2], ws: usize, fx: u32, fy: u32, w: usize, h: usize, dst: [&mut [u8]; 2], ds: usize, out: H264Out) {
+pub fn h264_chroma_pair_at(
+    level: Level,
+    (win, ws): ([&[u8]; 2], usize),
+    (fx, fy): (u32, u32),
+    (w, h): (usize, usize),
+    (dst, ds): ([&mut [u8]; 2], usize),
+    out: H264Out,
+) {
     let [db, dr] = dst;
-    let fit = |win: &[u8], dst: &[u8]| block_fits(win, ws, w + 1, h + 1, dst, ds, w, h);
+    let fit = |win: &[u8], dst: &[u8]| block_fits((win, ws), (w + 1, h + 1), (dst, ds), (w, h));
     if !matches!(w, 2 | 4 | 8) || !matches!(h, 2 | 4 | 8) || fx > 7 || fy > 7 || !fit(win[0], db) || !fit(win[1], dr) {
         return;
     }
     let done = match level {
         #[cfg(target_arch = "aarch64")]
-        Level::Neon => h264_neon::chroma_pair(win, ws, fx, fy, w, h, [&mut *db, &mut *dr], ds, out),
+        Level::Neon => h264_neon::chroma_pair((win, ws), (fx, fy), (w, h), ([&mut *db, &mut *dr], ds), out),
         _ => false,
     };
     if !done {
-        h264::chroma_out(win[0], ws, fx, fy, w, h, db, ds, out);
-        h264::chroma_out(win[1], ws, fx, fy, w, h, dr, ds, out);
+        h264::chroma_out((win[0], ws), (fx, fy), (w, h), (db, ds), out);
+        h264::chroma_out((win[1], ws), (fx, fy), (w, h), (dr, ds), out);
     }
 }
 
@@ -572,12 +570,12 @@ pub fn h264_chroma_pair_at(level: Level, win: [&[u8]; 2], ws: usize, fx: u32, fy
 /// plane `pix` (rows `stride` apart): a vertical edge (`vertical`) whose q0 column is `x`, for
 /// the lines from row `y`, or a horizontal edge whose q0 row is `y`, for the columns from `x`.
 /// Edges whose samples do not fit `pix` are left unchanged.
-pub fn h264_deblock(pix: &mut [u8], stride: usize, x: usize, y: usize, vertical: bool, chroma: bool, e: &H264Edge) {
-    h264_deblock_at(level(), pix, stride, x, y, vertical, chroma, e);
+pub fn h264_deblock(pix: &mut [u8], stride: usize, (x, y): (usize, usize), vertical: bool, chroma: bool, e: &H264Edge) {
+    h264_deblock_at(level(), pix, stride, (x, y), vertical, chroma, e);
 }
 
 /// [`h264_deblock`] on a given level.
-pub fn h264_deblock_at(level: Level, pix: &mut [u8], stride: usize, x: usize, y: usize, vertical: bool, chroma: bool, e: &H264Edge) {
+pub fn h264_deblock_at(level: Level, pix: &mut [u8], stride: usize, (x, y): (usize, usize), vertical: bool, chroma: bool, e: &H264Edge) {
     let done = match level {
         #[cfg(target_arch = "aarch64")]
         Level::Neon => h264_neon::deblock(pix, stride, x, y, vertical, chroma, e),
@@ -597,21 +595,20 @@ pub fn h264_deblock_at(level: Level, pix: &mut [u8], stride: usize, x: usize, y:
 /// [`h264_deblock`] of the same chroma edge of the Cb plane `cb` and the Cr plane `cr`, which
 /// share `stride` and the edge parameters `e` (their chroma QPs are equal): one vector pass for
 /// both.
-pub fn h264_deblock_chroma_pair(cb: &mut [u8], cr: &mut [u8], stride: usize, x: usize, y: usize, vertical: bool, e: &H264Edge) {
-    h264_deblock_chroma_pair_at(level(), cb, cr, stride, x, y, vertical, e);
+pub fn h264_deblock_chroma_pair(cb: &mut [u8], cr: &mut [u8], stride: usize, (x, y): (usize, usize), vertical: bool, e: &H264Edge) {
+    h264_deblock_chroma_pair_at(level(), cb, cr, stride, (x, y), vertical, e);
 }
 
 /// [`h264_deblock_chroma_pair`] on a given level.
-#[allow(clippy::too_many_arguments)]
-pub fn h264_deblock_chroma_pair_at(level: Level, cb: &mut [u8], cr: &mut [u8], stride: usize, x: usize, y: usize, vertical: bool, e: &H264Edge) {
+pub fn h264_deblock_chroma_pair_at(level: Level, cb: &mut [u8], cr: &mut [u8], stride: usize, (x, y): (usize, usize), vertical: bool, e: &H264Edge) {
     let done = match level {
         #[cfg(target_arch = "aarch64")]
         Level::Neon => h264_neon::deblock_pair(cb, cr, stride, x, y, vertical, e),
         _ => false,
     };
     if !done {
-        h264_deblock_at(level, cb, stride, x, y, vertical, true, e);
-        h264_deblock_at(level, cr, stride, x, y, vertical, true, e);
+        h264_deblock_at(level, cb, stride, (x, y), vertical, true, e);
+        h264_deblock_at(level, cr, stride, (x, y), vertical, true, e);
     }
 }
 
@@ -756,38 +753,33 @@ pub fn vp8_idct_add_at(level: Level, coefs: &[i16; 16], dst: &mut [u8], pos: usi
     }
 }
 
-/// VP8 inter prediction (18.3) of a `w` x `h` block (`w` 16, 8 or 4, `h` 1..=16) of 8-bit pixels
-/// into `dst` (rows `ds` apart). `src` is the reference window from (x - 2, y - 2), rows `ss`
-/// apart (the reference itself, read in place); `fh` and `fv` are the six-tap (or bilinear, as six
-/// taps) filters of the horizontal and vertical fractions (None at whole pixels). Each pass is
+/// VP8 inter prediction (18.3) of a `w` x `h` block (`size`; `w` 16, 8 or 4, `h` 1..=16) of 8-bit
+/// pixels into `dst` (`dst`, rows `ds` apart). `src` is (`src`, `ss`): the reference window from
+/// (x - 2, y - 2), rows `ss` apart (the reference itself, read in place); `filters` (`fh`, `fv`)
+/// are the six-tap (or bilinear, as six taps) filters of the horizontal and vertical fractions
+/// (None at whole pixels). Each pass is
 /// (sum + 64) >> 7 clipped to 0..=255. Returns false, writing nothing, when no vector version runs:
 /// on the scalar level, for filters whose sums could leave 16 bits ([`vp8_wraps`]), or when the
 /// vector loads (16 pixels from each strip of 8 columns, h + 5 rows) do not fit `src`; the caller
 /// then runs its scalar version.
-#[allow(clippy::too_many_arguments)]
-pub fn vp8_predict(src: &[u8], ss: usize, fh: Option<&[i16; 6]>, fv: Option<&[i16; 6]>, w: usize, h: usize, dst: &mut [u8], ds: usize) -> bool {
-    vp8_predict_at(level(), src, ss, fh, fv, w, h, dst, ds)
+pub fn vp8_predict(src: (&[u8], usize), filters: (Option<&[i16; 6]>, Option<&[i16; 6]>), size: (usize, usize), dst: (&mut [u8], usize)) -> bool {
+    vp8_predict_at(level(), src, filters, size, dst)
 }
 
 /// [`vp8_predict`] on a given level.
-#[allow(clippy::too_many_arguments)]
 pub fn vp8_predict_at(
     level: Level,
-    src: &[u8],
-    ss: usize,
-    fh: Option<&[i16; 6]>,
-    fv: Option<&[i16; 6]>,
-    w: usize,
-    h: usize,
-    dst: &mut [u8],
-    ds: usize,
+    (src, ss): (&[u8], usize),
+    (fh, fv): (Option<&[i16; 6]>, Option<&[i16; 6]>),
+    (w, h): (usize, usize),
+    (dst, ds): (&mut [u8], usize),
 ) -> bool {
     if !fh.is_none_or(vp8_wraps) || !fv.is_none_or(vp8_wraps) {
         return false;
     }
     match level {
         #[cfg(target_arch = "aarch64")]
-        Level::Neon => vp8_mc_neon::predict(src, ss, fh, fv, w, h, dst, ds),
+        Level::Neon => vp8_mc_neon::predict((src, ss), (fh, fv), (w, h), (dst, ds)),
         _ => {
             let _ = (src, ss, w, h, dst, ds);
             false
@@ -847,13 +839,12 @@ pub fn vp8_loop_filter_at(level: Level, d: &mut [u8], start: usize, stride: usiz
 
 /// [`vp8_loop_filter`] of the same 8-line edge of both chroma planes `u` and `v` (same layout,
 /// same limits: VP8 filters them alike).
-pub fn vp8_loop_filter_uv(u: &mut [u8], v: &mut [u8], start: usize, stride: usize, vertical: bool, f: Vp8Filter, l: &Vp8Limits) -> bool {
-    vp8_loop_filter_uv_at(level(), u, v, start, stride, vertical, f, l)
+pub fn vp8_loop_filter_uv(u: &mut [u8], v: &mut [u8], (start, stride): (usize, usize), vertical: bool, f: Vp8Filter, l: &Vp8Limits) -> bool {
+    vp8_loop_filter_uv_at(level(), u, v, (start, stride), vertical, f, l)
 }
 
 /// [`vp8_loop_filter_uv`] on a given level.
-#[allow(clippy::too_many_arguments)]
-pub fn vp8_loop_filter_uv_at(level: Level, u: &mut [u8], v: &mut [u8], start: usize, stride: usize, vertical: bool, f: Vp8Filter, l: &Vp8Limits) -> bool {
+pub fn vp8_loop_filter_uv_at(level: Level, u: &mut [u8], v: &mut [u8], (start, stride): (usize, usize), vertical: bool, f: Vp8Filter, l: &Vp8Limits) -> bool {
     match level {
         #[cfg(target_arch = "aarch64")]
         Level::Neon => vp8_lf_neon::chroma(u, v, start, stride, vertical, f, l),
@@ -868,16 +859,16 @@ pub fn vp8_loop_filter_uv_at(level: Level, u: &mut [u8], v: &mut [u8], start: us
 /// 4x4 DST-VII) of scaled coefficients `coefs` (`coefs[y * n + x]`, within 16 bits; larger
 /// values saturate, as the scaling process clips them), added to the 8-bit prediction samples
 /// in `dst` (rows `ds` apart) with Clip1 (8.6.7). Only coefficient rows up to `max_y` and columns
-/// up to `max_x` rounded up to a multiple of 8 (of 4 for 4x4 blocks) are read: the others must be
+/// up to `max_x` (`max` (`max_x`, `max_y`)) rounded up to a multiple of 8 (of 4 for 4x4 blocks) are read: the others must be
 /// zero, as must those read past `max_x`. Returns false, writing nothing, when no vector version
 /// runs (on the scalar level, or for arguments that do not fit); the caller then runs its scalar
 /// version.
-pub fn hevc_idct_add8(coefs: &[i32], n: usize, dst_type: bool, max_x: usize, max_y: usize, dst: &mut [u8], ds: usize) -> bool {
-    hevc_idct_add8_at(level(), coefs, n, dst_type, max_x, max_y, dst, ds)
+pub fn hevc_idct_add8(coefs: &[i32], n: usize, dst_type: bool, max: (usize, usize), dst: &mut [u8], ds: usize) -> bool {
+    hevc_idct_add8_at(level(), coefs, n, dst_type, max, dst, ds)
 }
 
 /// [`hevc_idct_add8`] on a given level.
-pub fn hevc_idct_add8_at(level: Level, coefs: &[i32], n: usize, dst_type: bool, max_x: usize, max_y: usize, dst: &mut [u8], ds: usize) -> bool {
+pub fn hevc_idct_add8_at(level: Level, coefs: &[i32], n: usize, dst_type: bool, (max_x, max_y): (usize, usize), dst: &mut [u8], ds: usize) -> bool {
     match level {
         #[cfg(target_arch = "aarch64")]
         Level::Neon => hevc_itx_neon::idct_add(coefs, n, dst_type, max_x, max_y, dst, ds),
@@ -934,56 +925,46 @@ pub enum Vp9Out {
     Avg,
 }
 
-/// VP9 inter prediction of a `w` x `h` block from an unscaled reference (8.5.2.4 with steps of
-/// 16; `w` 4, 8, 16, 32 or 64, `h` 1..=64), written into `dst` (rows `ds` apart) as `out` says.
-/// `src` holds the (w + 7) x (h + 7) reference window from (x - 3, y - 3), rows `ss` apart; `fh`
-/// and `fv` are the 8-tap filters of the horizontal and vertical sub-sample positions (None at
+/// VP9 inter prediction of a `w` x `h` block (`size`) from an unscaled reference (8.5.2.4 with
+/// steps of 16; `w` 4, 8, 16, 32 or 64, `h` 1..=64), written into `dst` (`dst`, rows `ds` apart)
+/// as `out` says. `src` (`src`, `ss`) holds the (w + 7) x (h + 7) reference window from
+/// (x - 3, y - 3), rows `ss` apart; `filters` (`fh`, `fv`) are the 8-tap filters of the horizontal and vertical sub-sample positions (None at
 /// whole-sample positions), and samples are at most `max` (255, 1023 or 4095). Each pass is
 /// Round2(sum, 7) clipped to 0..=max. The vector version loads one sample past each window row,
 /// so it needs `(h + 6) * ss + w + 8` samples in `src` and otherwise the scalar one runs. Blocks
 /// that do not fit leave `dst` unchanged.
-#[allow(clippy::too_many_arguments)]
 pub fn vp9_predict(
-    src: &[u16],
-    ss: usize,
-    fh: Option<&[i16; 8]>,
-    fv: Option<&[i16; 8]>,
-    w: usize,
-    h: usize,
+    src: (&[u16], usize),
+    filters: (Option<&[i16; 8]>, Option<&[i16; 8]>),
+    size: (usize, usize),
     max: u16,
-    dst: &mut [u16],
-    ds: usize,
+    dst: (&mut [u16], usize),
     out: Vp9Out,
 ) {
-    vp9_predict_at(level(), src, ss, fh, fv, w, h, max, dst, ds, out);
+    vp9_predict_at(level(), src, filters, size, max, dst, out);
 }
 
 /// [`vp9_predict`] on a given level.
-#[allow(clippy::too_many_arguments)]
 pub fn vp9_predict_at(
     level: Level,
-    src: &[u16],
-    ss: usize,
-    fh: Option<&[i16; 8]>,
-    fv: Option<&[i16; 8]>,
-    w: usize,
-    h: usize,
+    (src, ss): (&[u16], usize),
+    (fh, fv): (Option<&[i16; 8]>, Option<&[i16; 8]>),
+    (w, h): (usize, usize),
     max: u16,
-    dst: &mut [u16],
-    ds: usize,
+    (dst, ds): (&mut [u16], usize),
     out: Vp9Out,
 ) {
-    if !matches!(w, 4 | 8 | 16 | 32 | 64) || !(1..=64).contains(&h) || !block_fits(src, ss, w + 7, h + 7, dst, ds, w, h) {
+    if !matches!(w, 4 | 8 | 16 | 32 | 64) || !(1..=64).contains(&h) || !block_fits((src, ss), (w + 7, h + 7), (&*dst, ds), (w, h)) {
         return;
     }
     let wrap = max == 255 && fh.is_none_or(vp9_wraps) && fv.is_none_or(vp9_wraps);
     let done = match level {
         #[cfg(target_arch = "aarch64")]
-        Level::Neon => vp9_neon::predict(src, ss, fh, fv, w, h, max, wrap, dst, ds, out),
+        Level::Neon => vp9_neon::predict((src, ss), (fh, fv), (w, h), max, wrap, (&mut *dst, ds), out),
         _ => false,
     };
     if !done {
-        vp9::predict(src, ss, fh, fv, w, h, max, wrap, dst, ds, out);
+        vp9::predict((src, ss), (fh, fv), (w, h), max, wrap, (dst, ds), out);
     }
 }
 

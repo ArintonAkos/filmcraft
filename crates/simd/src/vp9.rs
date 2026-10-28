@@ -6,46 +6,37 @@ use crate::Vp9Out;
 
 /// See [`crate::vp9_predict`]; the caller checked the arguments, the window and the block fit.
 /// `wrap`: 8-bit samples and taps for which [`narrow8`] is exact.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn predict(
-    src: &[u16],
-    ss: usize,
-    fh: Option<&[i16; 8]>,
-    fv: Option<&[i16; 8]>,
-    w: usize,
-    h: usize,
+    (src, ss): (&[u16], usize),
+    (fh, fv): (Option<&[i16; 8]>, Option<&[i16; 8]>),
+    (w, h): (usize, usize),
     max: u16,
     wrap: bool,
-    dst: &mut [u16],
-    ds: usize,
+    (dst, ds): (&mut [u16], usize),
     out: Vp9Out,
 ) {
     match (w, out) {
-        (4, Vp9Out::Put) => predict_w::<4, false>(src, ss, fh, fv, h, max, wrap, dst, ds),
-        (8, Vp9Out::Put) => predict_w::<8, false>(src, ss, fh, fv, h, max, wrap, dst, ds),
-        (16, Vp9Out::Put) => predict_w::<16, false>(src, ss, fh, fv, h, max, wrap, dst, ds),
-        (32, Vp9Out::Put) => predict_w::<32, false>(src, ss, fh, fv, h, max, wrap, dst, ds),
-        (_, Vp9Out::Put) => predict_w::<64, false>(src, ss, fh, fv, h, max, wrap, dst, ds),
-        (4, Vp9Out::Avg) => predict_w::<4, true>(src, ss, fh, fv, h, max, wrap, dst, ds),
-        (8, Vp9Out::Avg) => predict_w::<8, true>(src, ss, fh, fv, h, max, wrap, dst, ds),
-        (16, Vp9Out::Avg) => predict_w::<16, true>(src, ss, fh, fv, h, max, wrap, dst, ds),
-        (32, Vp9Out::Avg) => predict_w::<32, true>(src, ss, fh, fv, h, max, wrap, dst, ds),
-        (_, Vp9Out::Avg) => predict_w::<64, true>(src, ss, fh, fv, h, max, wrap, dst, ds),
+        (4, Vp9Out::Put) => predict_w::<4, false>((src, ss), (fh, fv), h, max, wrap, (dst, ds)),
+        (8, Vp9Out::Put) => predict_w::<8, false>((src, ss), (fh, fv), h, max, wrap, (dst, ds)),
+        (16, Vp9Out::Put) => predict_w::<16, false>((src, ss), (fh, fv), h, max, wrap, (dst, ds)),
+        (32, Vp9Out::Put) => predict_w::<32, false>((src, ss), (fh, fv), h, max, wrap, (dst, ds)),
+        (_, Vp9Out::Put) => predict_w::<64, false>((src, ss), (fh, fv), h, max, wrap, (dst, ds)),
+        (4, Vp9Out::Avg) => predict_w::<4, true>((src, ss), (fh, fv), h, max, wrap, (dst, ds)),
+        (8, Vp9Out::Avg) => predict_w::<8, true>((src, ss), (fh, fv), h, max, wrap, (dst, ds)),
+        (16, Vp9Out::Avg) => predict_w::<16, true>((src, ss), (fh, fv), h, max, wrap, (dst, ds)),
+        (32, Vp9Out::Avg) => predict_w::<32, true>((src, ss), (fh, fv), h, max, wrap, (dst, ds)),
+        (_, Vp9Out::Avg) => predict_w::<64, true>((src, ss), (fh, fv), h, max, wrap, (dst, ds)),
     }
 }
 
 /// The prediction of a block `W` wide (`AVG`: averaged into `dst`).
-#[allow(clippy::too_many_arguments)]
 fn predict_w<const W: usize, const AVG: bool>(
-    src: &[u16],
-    ss: usize,
-    fh: Option<&[i16; 8]>,
-    fv: Option<&[i16; 8]>,
+    (src, ss): (&[u16], usize),
+    (fh, fv): (Option<&[i16; 8]>, Option<&[i16; 8]>),
     h: usize,
     max: u16,
     wrap: bool,
-    dst: &mut [u16],
-    ds: usize,
+    (dst, ds): (&mut [u16], usize),
 ) {
     let mut p = [0u16; W];
     match (fh, fv) {

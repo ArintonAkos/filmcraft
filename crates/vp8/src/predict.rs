@@ -295,28 +295,19 @@ pub fn predict_inter(reference: &RefPlane, dst: DstPlane, rect: BlockRect, (mvx,
         let tap6 = |f: usize| -> [i16; 6] { std::array::from_fn(|k| filters.get(f * 6 + k).map_or(0, |&t| t as i16)) };
         let (hf, vf) = (tap6(fx), tap6(fy));
         let (fh, fv) = ((fx != 0).then_some(&hf), (fy != 0).then_some(&vf));
-        if filmcraft_simd::vp8_predict(win, reference.stride, fh, fv, w, h, out, dst_stride) {
+        if filmcraft_simd::vp8_predict((win, reference.stride), (fh, fv), (w, h), (out, dst_stride)) {
             return;
         }
     }
-    predict_inter_window(reference, dst, dst_stride, bx, by, w, h, mvx, mvy, filters);
+    predict_inter_window(reference, DstPlane { data: dst, stride: dst_stride }, rect, (mvx, mvy), filters);
 }
 
 /// [`predict_inter`] from a copy of the source window (edges replicated where it leaves the
 /// reference), by the scalar filters.
-#[allow(clippy::too_many_arguments)]
-fn predict_inter_window(
-    reference: &RefPlane,
-    dst: &mut [u8],
-    dst_stride: usize,
-    bx: usize,
-    by: usize,
-    w: usize,
-    h: usize,
-    mvx: i32,
-    mvy: i32,
-    filters: &[i32; 48],
-) {
+#[inline(never)]
+fn predict_inter_window(reference: &RefPlane, dst: DstPlane, rect: BlockRect, (mvx, mvy): (i32, i32), filters: &[i32; 48]) {
+    let DstPlane { data: dst, stride: dst_stride } = dst;
+    let BlockRect { x: bx, y: by, w, h } = rect;
     let x0 = bx as isize + (mvx >> 3) as isize;
     let y0 = by as isize + (mvy >> 3) as isize;
     let (fx, fy) = ((mvx & 7) as usize, (mvy & 7) as usize);
@@ -442,7 +433,7 @@ mod tests {
             let mut got = vec![9u8; dw * dh];
             let mut want = got.clone();
             predict_inter(&reference, DstPlane { data: &mut got, stride: dw }, BlockRect { x: bx, y: by, w, h: w }, (mvx, mvy), filters);
-            predict_inter_window(&reference, &mut want, dw, bx, by, w, w, mvx, mvy, filters);
+            predict_inter_window(&reference, DstPlane { data: &mut want, stride: dw }, BlockRect { x: bx, y: by, w, h: w }, (mvx, mvy), filters);
             let (x0, y0) = (bx as i32 + (mvx >> 3), by as i32 + (mvy >> 3));
             inside += usize::from(x0 >= 2 && y0 >= 2 && x0 + w as i32 + 3 <= rw as i32 && y0 + w as i32 + 3 <= rh as i32);
             assert_eq!(got, want, "case {case} {w}x{w} at ({bx}, {by}) mv ({mvx}, {mvy})");

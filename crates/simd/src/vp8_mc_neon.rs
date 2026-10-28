@@ -13,7 +13,12 @@
 use core::arch::aarch64::*;
 
 /// See [`crate::vp8_predict`].
-pub(crate) fn predict(src: &[u8], ss: usize, fh: Option<&[i16; 6]>, fv: Option<&[i16; 6]>, w: usize, h: usize, dst: &mut [u8], ds: usize) -> bool {
+pub(crate) fn predict(
+    (src, ss): (&[u8], usize),
+    (fh, fv): (Option<&[i16; 6]>, Option<&[i16; 6]>),
+    (w, h): (usize, usize),
+    (dst, ds): (&mut [u8], usize),
+) -> bool {
     if !matches!(w, 4 | 8 | 16) || !(1..=16).contains(&h) {
         return false;
     }
@@ -29,9 +34,9 @@ pub(crate) fn predict(src: &[u8], ss: usize, fh: Option<&[i16; 6]>, fv: Option<&
         let mut x = 0;
         while x < w {
             if w == 4 {
-                strip::<4>(src, ss, fh, fv, h, x, dst, ds);
+                strip::<4>((src, ss), (fh, fv), h, x, (dst, ds));
             } else {
-                strip::<8>(src, ss, fh, fv, h, x, dst, ds);
+                strip::<8>((src, ss), (fh, fv), h, x, (dst, ds));
             }
             x += 8;
         }
@@ -111,8 +116,7 @@ fn store<const N: usize>(d: &mut [u8], o: usize, v: uint16x8_t) {
 
 /// The columns `x..x + N` of the block (8 lanes computed, the first N written).
 #[target_feature(enable = "neon")]
-#[allow(clippy::too_many_arguments)]
-fn strip<const N: usize>(s: &[u8], ss: usize, fh: Option<&[i16; 6]>, fv: Option<&[i16; 6]>, h: usize, x: usize, d: &mut [u8], ds: usize) {
+fn strip<const N: usize>((s, ss): (&[u8], usize), (fh, fv): (Option<&[i16; 6]>, Option<&[i16; 6]>), h: usize, x: usize, (d, ds): (&mut [u8], usize)) {
     let kh = fh.map(|f| taps(f));
     let kh = kh.as_ref();
     match fv {

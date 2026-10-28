@@ -510,7 +510,7 @@ impl<'a, S: Sample> SliceDecoder<'a, S> {
                     let done = if dc_only {
                         filmcraft_simd::hevc_dc_add8(transform::inverse_dc(coeffs[0], bd_shift), n, p, stride)
                     } else {
-                        filmcraft_simd::hevc_idct_add8(coeffs, n, dst, max_x, max_y, p, stride)
+                        filmcraft_simd::hevc_idct_add8(coeffs, n, dst, (max_x, max_y), p, stride)
                     };
                     if done {
                         return Ok(());
