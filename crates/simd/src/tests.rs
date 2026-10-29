@@ -1,5 +1,17 @@
 use super::*;
 
+/// 1 when the NEON kernel call `$call` ran (returned true), 0 when it declined and on other
+/// targets, where it is not compiled: for asserting that the vector path of a test ran.
+macro_rules! neon_ran {
+    ($call:expr) => {{
+        #[cfg(target_arch = "aarch64")]
+        let ran = $call;
+        #[cfg(not(target_arch = "aarch64"))]
+        let ran = false;
+        ran as usize
+    }};
+}
+
 /// 7.15.2 as the spec writes it: one sample at a time into the line sums, then the costs.
 fn spec_direction(rows: &[&[u16; 8]; 8], shift: u32) -> (usize, i32) {
     const DIV: [i32; 9] = [0, 840, 420, 280, 210, 168, 140, 120, 105];
@@ -356,6 +368,7 @@ fn every_level_matches_the_scalar_h264_prediction() {
         seed ^= seed << 5;
         seed
     };
+    let (mut luma_ran, mut chroma_ran) = (0, 0);
     for case in 0..12_000 {
         // Windows of extremes as well as random samples, so clipping and saturation are hit.
         let sample = |n: u32| match n % 4 {
@@ -384,6 +397,12 @@ fn every_level_matches_the_scalar_h264_prediction() {
             h264_luma_at(level, (&win, ws), (fx, fy), (w, h), (&mut got, 20), out);
             assert_eq!(got, want, "{level:?} luma {w}x{h} frac {fx},{fy} {out:?} window {ws} x {}", win.len());
         }
+        luma_ran += neon_ran!({
+            let mut got = dst0.clone();
+            let done = h264_neon::luma((&win, ws), (fx, fy), (w, h), (&mut got, 20), out);
+            assert!(!done || got == want, "NEON luma {w}x{h} frac {fx},{fy} {out:?}");
+            done
+        });
         let (cw, ch) = [(8, 8), (8, 4), (4, 8), (4, 4), (4, 2), (2, 4), (2, 2)][case % 7];
         let (cx, cy) = (next() % 8, next() % 8);
         let mut want = dst0.clone();
@@ -393,7 +412,41 @@ fn every_level_matches_the_scalar_h264_prediction() {
             h264_chroma_at(level, (&win, ws), (cx, cy), (cw, ch), (&mut got, 20), out);
             assert_eq!(got, want, "{level:?} chroma {cw}x{ch} frac {cx},{cy} {out:?}");
         }
+        chroma_ran += neon_ran!({
+            let mut got = dst0.clone();
+            let done = h264_neon::chroma((&win, ws), (cx, cy), (cw, ch), (&mut got, 20), out);
+            assert!(!done || got == want, "NEON chroma {cw}x{ch} frac {cx},{cy} {out:?}");
+            done
+        });
     }
+    assert!(luma_ran > 0 || !cfg!(target_arch = "aarch64"));
+    assert!(chroma_ran > 0 || !cfg!(target_arch = "aarch64"));
+}
+
+#[test]
+fn h264_prediction_leaves_dst_alone_for_weights_out_of_range() {
+    let win = vec![100u8; 32 * 21];
+    for out in [
+        H264Out::Weight { w: 1, o: 0, log_wd: 40 },
+        H264Out::Weight { w: i32::MAX, o: 0, log_wd: 0 },
+        H264Out::Weight { w: 1, o: 128, log_wd: 0 },
+        H264Out::WeightBi { w0: 129, w1: 1, o: 0, log_wd: 1 },
+        H264Out::WeightBi { w0: 1, w1: 1, o: i32::MIN, log_wd: 1 },
+        H264Out::WeightBi { w0: 1, w1: 1, o: 0, log_wd: u32::MAX },
+    ] {
+        for &level in levels() {
+            let mut dst = vec![7u8; 16 * 20];
+            h264_luma_at(level, (&win, 32), (1, 2), (16, 16), (&mut dst, 20), out);
+            h264_chroma_at(level, (&win, 32), (3, 5), (8, 8), (&mut dst, 20), out);
+            let mut cr = vec![7u8; 16 * 20];
+            h264_chroma_pair_at(level, ([&win, &win], 32), (3, 5), (8, 8), ([&mut dst, &mut cr], 20), out);
+            assert!(dst.iter().chain(&cr).all(|&v| v == 7), "{level:?} {out:?}");
+        }
+    }
+    // The extreme weights H.264 does use still run: 128 (implicit, and the default for logWD 7).
+    let mut dst = vec![7u8; 16 * 20];
+    h264_luma_at(Level::Scalar, (&win, 32), (0, 0), (16, 16), (&mut dst, 20), H264Out::Weight { w: 128, o: 0, log_wd: 7 });
+    assert!(dst.iter().step_by(20).all(|&v| v == 100));
 }
 
 #[test]
@@ -452,6 +505,7 @@ fn every_level_matches_the_scalar_h264_deblocking() {
         seed
     };
     let (w, h) = (40usize, 40usize);
+    let mut ran = 0;
     for case in 0..20_000 {
         // Smooth planes with small steps, so that every filter branch is taken, and some extremes.
         let base = (next() % 256) as i32;
@@ -474,7 +528,14 @@ fn every_level_matches_the_scalar_h264_deblocking() {
             h264_deblock_at(level, &mut got, w, (x, y), vertical, chroma, &e);
             assert_eq!(got, want, "{level:?} vertical {vertical} chroma {chroma} at ({x}, {y}) {e:?}");
         }
+        ran += neon_ran!({
+            let mut got = pix.clone();
+            let done = h264_neon::deblock(&mut got, w, x, y, vertical, chroma, &e);
+            assert!(!done || got == want, "NEON vertical {vertical} chroma {chroma} at ({x}, {y}) {e:?}");
+            done
+        });
     }
+    assert!(ran > 0 || !cfg!(target_arch = "aarch64"));
 }
 
 #[test]
@@ -545,7 +606,7 @@ fn every_level_matches_the_spec_vp9_prediction() {
     };
     // Two of VP9's filters (regular and sharp, at their extremes) besides random ones.
     let vp9 = [[0i16, 1, -5, 126, 8, -3, 1, 0], [-2, 5, -10, 79, 79, -10, 5, -2], [-1, 3, -7, 127, 8, -3, 1, 0], [-4, 11, -23, 80, 80, -23, 11, -4]];
-    let (mut wrapped, mut exact) = (0, 0);
+    let (mut wrapped, mut exact, mut ran) = (0, 0, 0);
     for case in 0..8_000 {
         let max = [255u16, 255, 1023, 4095][case % 4];
         let sample = |n: u32| match n % 5 {
@@ -578,7 +639,8 @@ fn every_level_matches_the_spec_vp9_prediction() {
         let ds = w + [0, 5][next() as usize % 2];
         let dst0: Vec<u16> = (0..(h - 1) * ds + w).map(|_| sample(next())).collect();
         let out = if next() % 2 == 0 { Vp9Out::Put } else { Vp9Out::Avg };
-        if max == 255 && fh.as_ref().is_none_or(vp9_wraps) && fv.as_ref().is_none_or(vp9_wraps) {
+        let wrap = max == 255 && fh.as_ref().is_none_or(vp9_wraps) && fv.as_ref().is_none_or(vp9_wraps);
+        if wrap {
             wrapped += 1;
         } else {
             exact += 1;
@@ -590,8 +652,15 @@ fn every_level_matches_the_spec_vp9_prediction() {
             vp9_predict_at(level, (&src, ss), (fh.as_ref(), fv.as_ref()), (w, h), max, (&mut got, ds), out);
             assert_eq!(got, want, "{level:?} {w}x{h} max {max} taps {fh:?} {fv:?} {out:?} window {ss} x {len}");
         }
+        ran += neon_ran!({
+            let mut got = dst0.clone();
+            let done = vp9_neon::predict((&src, ss), (fh.as_ref(), fv.as_ref()), (w, h), max, wrap, (&mut got, ds), out);
+            assert!(!done || got == want, "NEON {w}x{h} max {max} taps {fh:?} {fv:?} {out:?} window {ss} x {len}");
+            done
+        });
     }
     assert!(wrapped > 1000 && exact > 1000, "{wrapped} {exact}");
+    assert!(ran > 0 || !cfg!(target_arch = "aarch64"));
 }
 
 #[test]

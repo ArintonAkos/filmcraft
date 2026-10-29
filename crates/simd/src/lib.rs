@@ -451,8 +451,9 @@ fn cdef_pick(cost: &[i32; 8]) -> (usize, i32) {
     (dir, (best - cost[(dir + 4) & 7]) >> 10)
 }
 
-/// How an H.264 prediction is written into the picture (8.4.2.3), for 8-bit video: weights and
-/// offsets -128..=127, `log_wd` (logWD) up to 7.
+/// How an H.264 prediction is written into the picture (8.4.2.3), for 8-bit video: weights
+/// -128..=128 (128 is the default weight for logWD 7 and an implicit one), offsets -128..=127,
+/// `log_wd` (logWD) up to 7. The prediction functions leave `dst` unchanged for other values.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum H264Out {
     /// `dst = p`.
@@ -465,6 +466,17 @@ pub enum H264Out {
     /// Weighted bi-prediction, `dst` holding the first prediction:
     /// `Clip1(((dst * w0 + p * w1 + 2^log_wd) >> (log_wd + 1)) + o)`, `o` = (o0 + o1 + 1) >> 1.
     WeightBi { w0: i32, w1: i32, o: i32, log_wd: u32 },
+}
+
+/// Whether `out`'s weights, offset and `log_wd` are in 8-bit H.264's range (see [`H264Out`]).
+fn h264_out_valid(out: H264Out) -> bool {
+    let weight = |v: i32| (-128..=128).contains(&v);
+    let offset = |v: i32| (-128..=127).contains(&v);
+    match out {
+        H264Out::Put | H264Out::Avg => true,
+        H264Out::Weight { w, o, log_wd } => weight(w) && offset(o) && log_wd <= 7,
+        H264Out::WeightBi { w0, w1, o, log_wd } => weight(w0) && weight(w1) && offset(o) && log_wd <= 7,
+    }
 }
 
 /// Whether a `ww` x `wh` window (rows `ws` apart) fits `win` and the `w` x `h` block (rows `ds`
@@ -488,7 +500,7 @@ pub fn h264_luma((win, ws): (&[u8], usize), (fx, fy): (u32, u32), (w, h): (usize
 
 /// [`h264_luma`] on a given level.
 pub fn h264_luma_at(level: Level, (win, ws): (&[u8], usize), (fx, fy): (u32, u32), (w, h): (usize, usize), (dst, ds): (&mut [u8], usize), out: H264Out) {
-    if !matches!(w, 4 | 8 | 16) || !matches!(h, 4 | 8 | 16) || fx > 3 || fy > 3 || !block_fits((win, ws), (w + 5, h + 5), (&*dst, ds), (w, h)) {
+    if !h264_out_valid(out) || !matches!(w, 4 | 8 | 16) || !matches!(h, 4 | 8 | 16) || fx > 3 || fy > 3 || !block_fits((win, ws), (w + 5, h + 5), (&*dst, ds), (w, h)) {
         return;
     }
     let done = match level {
@@ -511,7 +523,7 @@ pub fn h264_chroma((win, ws): (&[u8], usize), (fx, fy): (u32, u32), (w, h): (usi
 
 /// [`h264_chroma`] on a given level.
 pub fn h264_chroma_at(level: Level, (win, ws): (&[u8], usize), (fx, fy): (u32, u32), (w, h): (usize, usize), (dst, ds): (&mut [u8], usize), out: H264Out) {
-    if !matches!(w, 2 | 4 | 8) || !matches!(h, 2 | 4 | 8) || fx > 7 || fy > 7 || !block_fits((win, ws), (w + 1, h + 1), (&*dst, ds), (w, h)) {
+    if !h264_out_valid(out) || !matches!(w, 2 | 4 | 8) || !matches!(h, 2 | 4 | 8) || fx > 7 || fy > 7 || !block_fits((win, ws), (w + 1, h + 1), (&*dst, ds), (w, h)) {
         return;
     }
     let done = match level {
@@ -552,7 +564,7 @@ pub fn h264_chroma_pair_at(
 ) {
     let [db, dr] = dst;
     let fit = |win: &[u8], dst: &[u8]| block_fits((win, ws), (w + 1, h + 1), (dst, ds), (w, h));
-    if !matches!(w, 2 | 4 | 8) || !matches!(h, 2 | 4 | 8) || fx > 7 || fy > 7 || !fit(win[0], db) || !fit(win[1], dr) {
+    if !h264_out_valid(out) || !matches!(w, 2 | 4 | 8) || !matches!(h, 2 | 4 | 8) || fx > 7 || fy > 7 || !fit(win[0], db) || !fit(win[1], dr) {
         return;
     }
     let done = match level {

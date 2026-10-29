@@ -208,7 +208,7 @@ mod tests {
             seed
         };
         let (w, h) = (40usize, 40usize);
-        let mut ran = 0;
+        let (mut ran, mut chroma_ran) = (0, 0);
         for case in 0..6000 {
             let vertical = case % 2 == 0;
             let kind = [Kind::Simple, Kind::SimpleInner, Kind::NormalMb, Kind::NormalSub][(next() % 4) as usize];
@@ -250,11 +250,13 @@ mod tests {
                 }
                 let (mut gu, mut gv) = (u0.clone(), v0.clone());
                 if filmcraft_simd::vp8_loop_filter_uv_at(level, &mut gu, &mut gv, (start, w), vertical, f, &limits) {
+                    chroma_ran += 1;
                     assert_eq!((gu, gv), (wu.clone(), wv.clone()), "{level:?} chroma case {case} vertical {vertical} {f:?} {prm:?}");
                 }
             }
         }
         // (only aarch64 has a vector version so far)
         assert!(ran > 0 || !cfg!(target_arch = "aarch64"));
+        assert!(chroma_ran > 0 || !cfg!(target_arch = "aarch64"));
     }
 }
