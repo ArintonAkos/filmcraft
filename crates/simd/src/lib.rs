@@ -144,7 +144,8 @@ pub fn deblock_vertical(d: &mut [u16], base: usize, stride: usize, lines: usize,
 /// [`deblock_vertical`] on a given level.
 pub fn deblock_vertical_at(level: Level, d: &mut [u16], base: usize, stride: usize, lines: usize, size: LfSize, t: &LfThresh) {
     deblock_lines(lines, |first, n| {
-        let at = base + first * stride;
+        // An offset past `usize` is no line of `d`: nothing to filter.
+        let Some(at) = first.checked_mul(stride).and_then(|o| base.checked_add(o)) else { return };
         let done = match level {
             #[cfg(target_arch = "aarch64")]
             Level::Neon => neon::deblock_vertical(d, at, stride, n, 0xFF, size, t),
@@ -154,8 +155,8 @@ pub fn deblock_vertical_at(level: Level, d: &mut [u16], base: usize, stride: usi
         };
         // Scalar, or a vector kernel's 8-sample rows don't all fit in `d`.
         if !done {
-            for i in 0..n {
-                scalar::deblock_line(d, at + i * stride, 1, size, t);
+            for line in (0..n).filter_map(|i| i.checked_mul(stride).and_then(|o| at.checked_add(o))) {
+                scalar::deblock_line(d, line, 1, size, t);
             }
         }
     });
@@ -171,7 +172,7 @@ pub fn deblock_horizontal(d: &mut [u16], base: usize, stride: usize, lines: usiz
 /// [`deblock_horizontal`] on a given level.
 pub fn deblock_horizontal_at(level: Level, d: &mut [u16], base: usize, stride: usize, lines: usize, size: LfSize, t: &LfThresh) {
     deblock_lines(lines, |first, n| {
-        let at = base + first;
+        let Some(at) = base.checked_add(first) else { return };
         let done = match level {
             #[cfg(target_arch = "aarch64")]
             Level::Neon => neon::deblock_horizontal(d, at, stride, n, 0xFF, size, t),
@@ -180,8 +181,8 @@ pub fn deblock_horizontal_at(level: Level, d: &mut [u16], base: usize, stride: u
             _ => false,
         };
         if !done {
-            for i in 0..n {
-                scalar::deblock_line(d, at + i, stride, size, t);
+            for line in (0..n).filter_map(|i| at.checked_add(i)) {
+                scalar::deblock_line(d, line, stride, size, t);
             }
         }
     });
@@ -197,7 +198,7 @@ pub fn vp9_deblock(d: &mut [u16], base: usize, stride: usize, vertical: bool, (n
 
 /// [`vp9_deblock`] on a given level.
 pub fn vp9_deblock_at(level: Level, d: &mut [u16], base: usize, stride: usize, vertical: bool, (n, on): (usize, u8), (size, t): (LfSize, &LfThresh)) {
-    let n = if n >= 8 { 8 } else { 4 };
+    let n: usize = if n >= 8 { 8 } else { 4 };
     let done = match (level, vertical) {
         #[cfg(target_arch = "aarch64")]
         (Level::Neon, true) => neon::deblock_vertical(d, base, stride, n, on, size, t),
@@ -211,8 +212,8 @@ pub fn vp9_deblock_at(level: Level, d: &mut [u16], base: usize, stride: usize, v
     };
     if !done {
         let (along, across) = if vertical { (stride, 1) } else { (1, stride) };
-        for l in (0..n).filter(|l| on >> l & 1 == 1) {
-            scalar::deblock_line(d, base + l * along, across, size, t);
+        for line in (0..n).filter(|l| on >> l & 1 == 1).filter_map(|l| l.checked_mul(along).and_then(|o| base.checked_add(o))) {
+            scalar::deblock_line(d, line, across, size, t);
         }
     }
 }

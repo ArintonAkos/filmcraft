@@ -1250,6 +1250,20 @@ fn kernels_decline_offsets_whose_reach_overflows() {
         assert!(!vp8_loop_filter_at(level, &mut d, 4, usize::MAX / 2, true, Vp8Filter::Macroblock, &l));
     }
     assert!(d.iter().all(|&v| v == 0));
+    // The AV1 and VP9 loop filter entry points: line offsets past `usize` are skipped, not
+    // computed (they panicked with overflow checks on).
+    let t = lf_thresh(63, 0, 8);
+    let mut w = vec![0u16; 256];
+    for &level in levels() {
+        for (base, stride) in [(usize::MAX - 3, 16), (usize::MAX, 1), (4, usize::MAX / 2), (4, usize::MAX)] {
+            deblock_vertical_at(level, &mut w, base, stride, 16, LfSize::Eight, &t);
+            deblock_horizontal_at(level, &mut w, base, stride, 16, LfSize::Eight, &t);
+            for vertical in [false, true] {
+                vp9_deblock_at(level, &mut w, base, stride, vertical, (8, 0xFF), (LfSize::Vp9Eight, &t));
+            }
+        }
+    }
+    assert!(w.iter().all(|&v| v == 0));
 }
 
 #[test]
