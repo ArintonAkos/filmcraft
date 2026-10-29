@@ -16,8 +16,13 @@
 //!
 //! [`Decoder::decode`] crops the finished frames into pictures. The frames only meet as
 //! finished, shared reference frames: no stage writes what another reads.
+//!
+//! A stage that panics on a frame abandons that frame (it comes out with no picture, as a frame
+//! that fails to decode does) and goes on with the next: no other stage is left waiting for its
+//! rows. A thread that ends anyway closes its channels, so the caller never waits for it.
 
 use std::collections::VecDeque;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread::JoinHandle;
@@ -265,11 +270,20 @@ impl Pipeline {
         let (refs_uv, refs_rx_uv) = channel::<Refs>();
         let (to_luma, luma_rx) = channel::<ToFilter>();
         let (to_chroma, chroma_rx) = channel::<ToFilter>();
-        let (chroma_tx, chroma_done) = channel::<(Vec<u8>, Vec<u8>)>();
+        let (chroma_tx, chroma_done) = channel::<(Vec<u8>, Vec<u8>, bool)>();
         let (out_tx, out) = channel::<Finished>();
         let spare = Arc::new(Spare::default());
         let mut handles = Vec::new();
-        let spawn = |name: String, f: Box<dyn FnOnce() + Send>| std::thread::Builder::new().name(name).spawn(f).ok();
+        // A thread that panics outside the frame it works on just ends: its channels close, and
+        // the stages after it, then the caller, see that instead of waiting.
+        let spawn = |name: String, f: Box<dyn FnOnce() + Send>| {
+            std::thread::Builder::new()
+                .name(name)
+                .spawn(move || {
+                    let _ = catch_unwind(AssertUnwindSafe(f));
+                })
+                .ok()
+        };
         for i in 0..readers(threads) {
             let jobs = jobs.clone();
             handles.push(spawn(
@@ -278,7 +292,9 @@ impl Pipeline {
                     loop {
                         let work = jobs.lock().unwrap_or_else(PoisonError::into_inner).recv();
                         let Ok(work) = work else { return };
-                        read_tokens(&work);
+                        if catch_unwind(AssertUnwindSafe(|| read_tokens(&work))).is_err() {
+                            work.abandon();
+                        }
                     }
                 }),
             )?);
@@ -365,6 +381,8 @@ fn read_tokens(work: &Work) {
             work.abandon();
             return;
         };
+        #[cfg(test)]
+        fault::hit(fault::Stage::Read, job.pts, mb_y);
         let mut left_nz = [0u8; 9];
         let mut rows = PLANE_BLOCKS.map(|_| PackedRow::with_capacity(recs.len()));
         for (rec, an) in recs.iter().zip(above_nz.iter_mut()) {
@@ -386,7 +404,15 @@ fn reconstruct_frames<const LUMA: bool>(frames: &Receiver<Arc<Work>>, refs: &Rec
         if to_filter.send(ToFilter::Start(work.clone())).is_err() {
             return;
         }
-        let whole = reconstruct_rows::<LUMA>(&work, refs, to_filter, spare, &mut res).is_ok();
+        let whole = match catch_unwind(AssertUnwindSafe(|| reconstruct_rows::<LUMA>(&work, refs, to_filter, spare, &mut res))) {
+            Ok(r) => r.is_ok(),
+            Err(_) => {
+                // Its rows may be left half unpacked; the other planes' stages stop too.
+                res = MbResidual::default();
+                work.abandon();
+                false
+            }
+        };
         res.clear();
         if to_filter.send(ToFilter::End(whole)).is_err() {
             return;
@@ -421,6 +447,8 @@ fn reconstruct_rows<const LUMA: bool>(work: &Work, refs: Refs, to_filter: &Sende
             copy_lines(&mut buf.u, 7 * cw, &above.1, 0, above.1.len());
             copy_lines(&mut buf.v, 7 * cw, &above.2, 0, above.2.len());
         }
+        #[cfg(test)]
+        fault::hit(fault::Stage::Recon(LUMA), job.pts, mb_y);
         let top = mb_y * 16 - first;
         let mut lf = Vec::with_capacity(mb_w);
         let mut next = 0;
@@ -448,29 +476,33 @@ fn reconstruct_rows<const LUMA: bool>(work: &Work, refs: Refs, to_filter: &Sende
 }
 
 /// What a loop filter thread does with each frame: `plane` the rows into its plane(s) as they
-/// come, each filtered (`hdr`, key frame) at once; the frame's planes and whether it is whole at
-/// its end.
+/// come, each filtered at once; the frame's planes and whether it is whole at its end. A row
+/// that panics leaves the frame broken: not whole at its end.
 fn filter_rows<P>(rows: &Receiver<ToFilter>, mut plane: P, mut end: impl FnMut(Arc<Work>, Frame, bool) -> bool)
 where
-    P: FnMut(&mut Frame, usize, PlaneRow, &FrameHeader, bool),
+    P: FnMut(&mut Frame, usize, PlaneRow, &Job),
 {
-    let mut cur: Option<(Arc<Work>, Frame, usize)> = None;
+    // The frame, its next row, and whether a row of it broke.
+    let mut cur: Option<(Arc<Work>, Frame, usize, bool)> = None;
     while let Ok(msg) = rows.recv() {
         match msg {
             ToFilter::Start(work) => {
                 let (mb_w, mb_h) = work.job.mb;
-                cur = Some((work, Frame { y: Vec::new(), u: Vec::new(), v: Vec::new(), w: mb_w * 16, h: mb_h * 16 }, 0));
+                cur = Some((work, Frame { y: Vec::new(), u: Vec::new(), v: Vec::new(), w: mb_w * 16, h: mb_h * 16 }, 0, false));
             }
             ToFilter::Rows(rows) => {
-                let Some((work, frame, mb_y)) = &mut cur else { continue };
+                let Some((work, frame, mb_y, broken)) = &mut cur else { continue };
                 for row in rows {
-                    plane(frame, *mb_y, row, &work.job.f.hdr, work.job.f.key_frame);
+                    if !*broken && catch_unwind(AssertUnwindSafe(|| plane(frame, *mb_y, row, &work.job))).is_err() {
+                        *broken = true;
+                        work.abandon();
+                    }
                     *mb_y += 1;
                 }
             }
             ToFilter::End(whole) => {
-                let Some((work, frame, _)) = cur.take() else { continue };
-                if !end(work, frame, whole) {
+                let Some((work, frame, _, broken)) = cur.take() else { continue };
+                if !end(work, frame, whole && !broken) {
                     return;
                 }
             }
@@ -480,14 +512,17 @@ where
 
 /// The luma loop filter thread, which also finishes the frames: their chroma planes from the
 /// other loop filter, the reference frames for the next frame, the finished frame out.
-fn filter_luma(rows: &Receiver<ToFilter>, chroma: &Receiver<(Vec<u8>, Vec<u8>)>, refs_tx: [&Sender<Refs>; 2], out: &Sender<Finished>, spare: &Spare) {
+fn filter_luma(rows: &Receiver<ToFilter>, chroma: &Receiver<(Vec<u8>, Vec<u8>, bool)>, refs_tx: [&Sender<Refs>; 2], out: &Sender<Finished>, spare: &Spare) {
     let mut refs: Refs = [None, None, None];
     let send_refs = |refs: &Refs| refs_tx.iter().all(|t| t.send(refs.clone()).is_ok());
     if !send_refs(&refs) {
         return;
     }
     let mut upper = None;
-    let plane = |frame: &mut Frame, mb_y: usize, row: PlaneRow, hdr: &FrameHeader, key_frame: bool| {
+    let plane = |frame: &mut Frame, mb_y: usize, row: PlaneRow, job: &Job| {
+        #[cfg(test)]
+        fault::hit(fault::Stage::Filter(true), job.pts, mb_y);
+        let (hdr, key_frame) = (&job.f.hdr, job.f.key_frame);
         let w = frame.w;
         if frame.y.is_empty() {
             frame.y = reuse(&spare.frames_y, w * frame.h);
@@ -499,10 +534,15 @@ fn filter_luma(rows: &Receiver<ToFilter>, chroma: &Receiver<(Vec<u8>, Vec<u8>)>,
         }
     };
     let end = |work: Arc<Work>, mut frame: Frame, whole: bool| {
-        let Ok((u, v)) = chroma.recv() else { return false };
+        let Ok((u, v, chroma_whole)) = chroma.recv() else { return false };
         (frame.u, frame.v) = (u, v);
+        let whole = whole && chroma_whole;
         let job = &work.job;
-        let frame = whole.then(|| {
+        // Whatever happens here, the references and the frame's outcome go out: the
+        // reconstruction waits for the one, the caller for the other.
+        let finish = || {
+            #[cfg(test)]
+            fault::hit(fault::Stage::Finish, job.pts, 0);
             let frame = Arc::new(frame);
             let new = updated_refs(&refs, &job.f.hdr, &frame);
             let old = std::mem::replace(&mut refs, new);
@@ -512,17 +552,22 @@ fn filter_luma(rows: &Receiver<ToFilter>, chroma: &Receiver<(Vec<u8>, Vec<u8>)>,
                 give_back(&spare.frames_uv, (f.u, f.v));
             }
             frame
-        });
+        };
+        let frame = if whole { catch_unwind(AssertUnwindSafe(finish)).ok() } else { None };
         let done = Finished { frame: frame.filter(|_| job.show), size: job.size, pts: job.pts, key: job.f.key_frame, color_space: job.f.hdr.color_space };
         send_refs(&refs) && out.send(done).is_ok()
     };
     filter_rows(rows, plane, end);
 }
 
-/// The chroma loop filter thread: its planes of each frame to the luma one at the end.
-fn filter_chroma(rows: &Receiver<ToFilter>, done: &Sender<(Vec<u8>, Vec<u8>)>, spare: &Spare) {
+/// The chroma loop filter thread: its planes of each frame, and whether they are whole, to the
+/// luma one at the end.
+fn filter_chroma(rows: &Receiver<ToFilter>, done: &Sender<(Vec<u8>, Vec<u8>, bool)>, spare: &Spare) {
     let mut upper = None;
-    let plane = |frame: &mut Frame, mb_y: usize, row: PlaneRow, hdr: &FrameHeader, key_frame: bool| {
+    let plane = |frame: &mut Frame, mb_y: usize, row: PlaneRow, job: &Job| {
+        #[cfg(test)]
+        fault::hit(fault::Stage::Filter(false), job.pts, mb_y);
+        let (hdr, key_frame) = (&job.f.hdr, job.f.key_frame);
         let cw = frame.w / 2;
         if frame.u.is_empty() {
             (frame.u, frame.v) = reuse2(&spare.frames_uv, cw * frame.h / 2);
@@ -534,7 +579,7 @@ fn filter_chroma(rows: &Receiver<ToFilter>, done: &Sender<(Vec<u8>, Vec<u8>)>, s
             filter_in_pairs::<false, true>(frame, (mb_y, row.lf), &mut upper, hdr, key_frame);
         }
     };
-    filter_rows(rows, plane, |_, frame, _| done.send((frame.u, frame.v)).is_ok());
+    filter_rows(rows, plane, |_, frame, whole| done.send((frame.u, frame.v, whole)).is_ok());
 }
 
 /// The loop filter of the rows of a frame as they arrive, two at a time ([`loop_filter_rows`]):
@@ -561,9 +606,46 @@ fn copy_lines(dst: &mut [u8], d: usize, src: &[u8], s: usize, n: usize) {
     }
 }
 
+/// Panics on purpose, at a stage of the frames (by pts) a test chose, for the panic tests.
+#[cfg(test)]
+pub(super) mod fault {
+    use std::sync::{Mutex, PoisonError};
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum Stage {
+        Read,
+        /// The luma reconstruction (true) or the chroma one.
+        Recon(bool),
+        /// The luma loop filter (true) or the chroma one.
+        Filter(bool),
+        /// The luma loop filter finishing the frame.
+        Finish,
+    }
+
+    static ARMED: Mutex<Vec<(Stage, i64)>> = Mutex::new(Vec::new());
+
+    /// Panic at `stage` of the frame decoded with `pts`.
+    pub(crate) fn arm(stage: Stage, pts: i64) {
+        ARMED.lock().unwrap_or_else(PoisonError::into_inner).push((stage, pts));
+    }
+
+    /// Panics when `stage` of the frame with `pts` was armed, at its second row (`mb_y` 1), or
+    /// at once for a stage without rows.
+    pub(crate) fn hit(stage: Stage, pts: i64, mb_y: usize) {
+        let row = if stage == Stage::Finish { 0 } else { 1 };
+        if mb_y == row && ARMED.lock().unwrap_or_else(PoisonError::into_inner).contains(&(stage, pts)) {
+            panic!("a panic injected at {stage:?} of the frame at {pts}");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::Rows;
+    use super::fault::{Stage, arm};
+    use crate::{Decoder, Picture};
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
 
     /// A stage waiting for a row returns once the frame is abandoned instead of waiting forever.
     #[test]
@@ -576,5 +658,91 @@ mod tests {
             assert_eq!(waiting.join().unwrap(), None);
         });
         assert_eq!(rows.take(1), Some(7), "rows put before still come out");
+    }
+
+    /// A 160 x 96 clip of 12 frames, key frames at 0 and 6, in 4 token partitions, encoded by
+    /// ffmpeg's libvpx; None without them.
+    fn stream() -> Option<Vec<Vec<u8>>> {
+        let ff = ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/usr/bin/ffmpeg"].into_iter().map(PathBuf::from).find(|p| p.exists())?;
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/fixtures/vp8-unit");
+        std::fs::create_dir_all(&dir).ok()?;
+        let ivf = dir.join("faults.ivf");
+        if !ivf.exists() {
+            let tmp = dir.join(format!("faults.{}.ivf", std::process::id()));
+            let ok = Command::new(ff)
+                .args(["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i", "testsrc=size=160x96:rate=25,format=yuv420p"])
+                .args(["-frames:v", "12", "-c:v", "libvpx", "-g", "6", "-slices", "4", "-b:v", "400k", "-f", "ivf"])
+                .arg(&tmp)
+                .status()
+                .is_ok_and(|s| s.success());
+            if !ok || (std::fs::rename(&tmp, &ivf).is_err() && !ivf.exists()) {
+                return None;
+            }
+        }
+        let data = std::fs::read(&ivf).ok()?;
+        let mut pos = usize::from(u16::from_le_bytes([data[6], data[7]]));
+        let mut frames = Vec::new();
+        while pos + 12 <= data.len() {
+            let size = u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
+            pos += 12;
+            frames.push(data[pos..(pos + size).min(data.len())].to_vec());
+            pos += size;
+        }
+        Some(frames)
+    }
+
+    /// Every frame of `frames` from pts `base` on, then flushed.
+    fn decode(dec: &mut Decoder, frames: &[Vec<u8>], base: i64) -> Vec<Picture> {
+        let mut out = Vec::new();
+        for (i, f) in frames.iter().enumerate() {
+            out.extend(dec.decode(f, base + i as i64).unwrap_or_default());
+        }
+        out.extend(dec.flush());
+        out
+    }
+
+    fn same(a: &Picture, b: &Picture) -> bool {
+        (a.width, a.height, &a.y, &a.u, &a.v) == (b.width, b.height, &b.y, &b.u, &b.v)
+    }
+
+    /// A stage that panics costs its frame's picture, and nothing waits for it: the frames before
+    /// it and from the next key frame on are the serial decoder's, and the decoder goes on.
+    #[test]
+    fn a_panicking_stage_costs_its_frame_and_nothing_else() {
+        let Some(frames) = stream() else {
+            eprintln!("skipping: no ffmpeg with libvpx");
+            return;
+        };
+        assert_eq!(frames.len(), 12);
+        let want = decode(&mut Decoder::with_threads(1), &frames, 0);
+        assert_eq!(want.len(), 12);
+        let stages = [Stage::Read, Stage::Recon(true), Stage::Recon(false), Stage::Filter(true), Stage::Filter(false), Stage::Finish];
+        for (k, stage) in stages.into_iter().enumerate() {
+            // pts no other test uses: the panics are armed for the whole process
+            let base = (1i64 << 40) + 1000 * k as i64;
+            let bad = 2;
+            arm(stage, base + bad);
+            let (tx, rx) = std::sync::mpsc::channel();
+            let input = frames.clone();
+            std::thread::spawn(move || {
+                let mut dec = Decoder::with_threads(4);
+                let got = decode(&mut dec, &input, base);
+                // still usable: the stream again
+                let again = decode(&mut dec, &input, 0);
+                drop(dec);
+                let _ = tx.send((got, again));
+            });
+            let (got, again) = rx.recv_timeout(std::time::Duration::from_secs(60)).unwrap_or_else(|_| panic!("{stage:?}: the decoder hung"));
+            assert_eq!(got.len(), 11, "{stage:?}: all pictures but the broken frame's");
+            assert!(got.iter().all(|p| p.pts != base + bad), "{stage:?}");
+            for p in &got {
+                let i = (p.pts - base) as usize;
+                if i < bad as usize || i >= 6 {
+                    assert!(same(p, &want[i]), "{stage:?}: frame {i} differs from the serial decode");
+                }
+            }
+            assert_eq!(again.len(), 12, "{stage:?}");
+            assert!(again.iter().zip(&want).all(|(a, b)| same(a, b)), "{stage:?}: the decoder after the panic");
+        }
     }
 }

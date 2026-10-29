@@ -124,7 +124,8 @@ pub struct Decoder {
     frames: Option<frames::Pipeline>,
 }
 
-fn default_threads() -> usize {
+/// Threads of [`Decoder::new`]: the available cores up to 16 with the `threads` feature, else 1.
+pub fn default_threads() -> usize {
     #[cfg(all(feature = "threads", not(target_arch = "wasm32")))]
     {
         std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(16)
@@ -147,10 +148,11 @@ impl Decoder {
         Self::with_threads(default_threads())
     }
 
-    /// A decoder using `threads` threads (1: everything on the calling thread, each picture
-    /// returned by the [`Decoder::decode`] call of its frame). With more, the frames go through
-    /// worker threads and a picture may come out of a later call or [`Decoder::flush`]. The
-    /// pictures are the same for every thread count.
+    /// A decoder for `threads` threads (1: everything on the calling thread, each picture
+    /// returned by the [`Decoder::decode`] call of its frame). With more, the frames go through a
+    /// pipeline of worker threads: a token reader per frame read at once (`threads - 4`, at least
+    /// half of `threads`) and 4 for the planes, so at least 5, and a picture may come out of a
+    /// later call or [`Decoder::flush`]. The pictures are the same for every thread count.
     pub fn with_threads(threads: usize) -> Decoder {
         #[cfg(all(feature = "threads", not(target_arch = "wasm32")))]
         let frames = (threads > 1).then(|| frames::Pipeline::new(threads)).flatten();
